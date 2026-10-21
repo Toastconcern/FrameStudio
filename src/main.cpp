@@ -424,10 +424,22 @@ struct Publisher {
 
 void sleepUntilNs(uint64_t t) {
     if (t <= envshare::nowNs()) return;
+#ifdef _WIN32
+    // (nowNs is steady_clock here: a high-resolution timer to within half a millisecond of it, then a short spin)
+    static const HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+    const uint64_t now = envshare::nowNs();
+    if (timer && t > now + 600000) {
+        LARGE_INTEGER due;
+        due.QuadPart = -static_cast<LONGLONG>((t - now - 500000) / 100);   // relative, in 100 ns
+        if (SetWaitableTimerEx(timer, &due, 0, nullptr, nullptr, nullptr, 0)) WaitForSingleObject(timer, INFINITE);
+    }
+    while (envshare::nowNs() < t) std::this_thread::yield();
+#else
     timespec ts;
     ts.tv_sec = static_cast<time_t>(t / 1000000000ull);
     ts.tv_nsec = static_cast<long>(t % 1000000000ull);
     while (clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &ts, nullptr) == EINTR) {}
+#endif
 }
 
 // ── Headless snapshot (no SteamVR) ──────────────────────────────────────────────────────────────
@@ -1076,15 +1088,16 @@ int runVr(const std::vector<std::string>& apks, bool system = false) {
         for (const auto& p : h) s += p + "|" + stamp(p) + "\n";
         return s;
     };
-    float fade = 0, fadeTarget = 1;                  // system mode: switching homes fades through black
-    std::chrono::steady_clock::time_point texturesUntil{};   // system mode: black until the home's textures are in (or then)
+    float fade = 0, fadeTarget = 1;                  // switching homes fades through black (a scene app: SteamVR's fade)
+    float sceneFadeSent = -1;                        // the fade target last given SteamVR's compositor (scene mode)
+    std::chrono::steady_clock::time_point texturesUntil{};   // black until the home's textures are in (8 s at most)
     bool uploading = false, uploadDone = false;      // the parsed home going to the GPU between frames
     auto uploadStart = std::chrono::steady_clock::now();
     auto startLoad = [&](const std::vector<std::string>& home) {
         if (worker.joinable()) worker.join();
         pendingHome = home;
         loadState = 1;
-        if (system) { fadeTarget = 0; }
+        fadeTarget = 0;
         LOG("loading %s%s", home.front().c_str(), home.size() > 1 ? " + vista" : "");
         worker = std::thread([&, home] {
             const auto began = std::chrono::steady_clock::now();
@@ -1203,6 +1216,25 @@ int runVr(const std::vector<std::string>& apks, bool system = false) {
         r.resize(scaled(baseW), scaled(baseH));
         if (!env.createImages(r)) { LOG("no frame images for the compositor at all: Aurora shows until Frame Home restarts"); exportLost = true; }
     };
+    // Auto resolution remembers where each home settled (autoscale.txt: "<scale> <home>" lines), so switching to a
+    // heavy home starts at its size instead of the light one's before it (seconds of missed frames otherwise).
+    std::map<std::string, float> autoScales;
+    {
+        std::ifstream in(rootDir() / "autoscale.txt");
+        float v;
+        for (std::string key; in >> v && std::getline(in >> std::ws, key);) if (v > 0) autoScales[key] = v;
+    }
+    auto homeKey = [&] { std::string k; for (const auto& f : shown) k += fs::path(f).filename().string() + "+"; return k; };
+    auto rememberScale = [&] {
+        if (shown.empty()) return;
+        autoScales[homeKey()] = scale;
+        if (FILE* f = homeos::openFile(rootDir() / "autoscale.txt.part", "w")) {
+            for (const auto& [k, v] : autoScales) std::fprintf(f, "%.2f %s\n", v, k.c_str());
+            std::fclose(f);
+            std::error_code ec;
+            fs::rename(rootDir() / "autoscale.txt.part", rootDir() / "autoscale.txt", ec);
+        }
+    };
     // New settings (settings.json changed, or the shown world's own): resolution and foveation apply now, the rest by
     // starting again (the renderer is built for them). fovWas: the foveation strength before.
     std::string worldStamp;
@@ -1239,7 +1271,9 @@ int runVr(const std::vector<std::string>& apks, bool system = false) {
     Window gpuWindow;                                // auto resolution: this window's GPU times
     auto lastStats = std::chrono::steady_clock::now();   // stats.json: written every 2 s from these
     double statGpu = 0, statCpu = 0;
-    int statGpuN = 0, statFrames = 0;
+    int statGpuN = 0, statFrames = 0, statHitchShown = 0;
+    int smoothFrames = 0;                            // frames in a row on time, the textures in (before fading a home in)
+    double lastLoopMs = 0;
     std::vector<GuideVertex> overlayVerts;            // the debug world overlay (built per home)
     float vignetteAmt = 0;                           // comfort vignette, 0..1, eased
     float lastRig[16] = {}, lastRigYaw = 0;
@@ -1253,10 +1287,15 @@ int runVr(const std::vector<std::string>& apks, bool system = false) {
         while (vr::VRSystem()->PollNextEvent(&ev, sizeof(ev)))
             if (ev.eventType == vr::VREvent_Quit) { vr::VRSystem()->AcknowledgeQuit_Exiting(); running = false; quitAsked = true; }
         if (!running) break;
+        if (!system) {   // a scene app (a PC): SteamVR's compositor fades the view, and `fade` follows it over the same 0.3 s
+            const float dtFade = 1.0f / hz / 0.3f;
+            fade = fadeTarget > fade ? std::min(fadeTarget, fade + dtFade) : std::max(fadeTarget, fade - dtFade);
+            if (fadeTarget != sceneFadeSent) { sceneFadeSent = fadeTarget; vr::VRCompositor()->FadeToColor(0.3f, 0, 0, 0, 1.0f - fadeTarget); }
+        }
 
-        // A parsed home goes to the GPU a few milliseconds a frame (system mode: once faded to black), so frames keep
-        // flowing at the display rate while it uploads.
-        if ((loadState == 2 || loadState == 3) && !uploading && (!system || !scene || fade <= 0.01f)) {
+        // A parsed home goes to the GPU a few milliseconds a frame (once faded to black), so frames keep flowing at the
+        // display rate while it uploads.
+        if ((loadState == 2 || loadState == 3) && !uploading && (!scene || fade <= 0.01f)) {
             worker.join();
             if (loadState == 2) {
                 r.setDynamicMeshes(pending->animatedMeshes);   // Clay / glTF animation: re-uploaded each frame
@@ -1269,13 +1308,17 @@ int runVr(const std::vector<std::string>& apks, bool system = false) {
         // Nothing of the home on screen (faded to black for the switch, or nobody looking): it goes up in big steps
         // (a long frame shows nobody anything), not the few milliseconds a shown frame can spare. Idle (a frame a
         // second) that took a home 13 s.
-        const bool unseen = system && (fade <= 0.01f || env.sinceSampled() > 1.0);
+        const bool unseen = fade <= 0.01f || (system && env.sinceSampled() > 1.0);
         r.setUploadsUnseen(unseen);
-        if (uploading && r.loadStep(system ? (unseen ? 40.0 : std::max(1.0, 1000.0 / hz * 0.45)) : 6.0)) uploading = false, uploadDone = true;
+        if (uploading && r.loadStep(unseen ? 40.0 : system ? std::max(1.0, 1000.0 / hz * 0.45) : 6.0)) uploading = false, uploadDone = true;
+        // Its textures in isn't yet smooth: the first frames with them still stall (Windows makes new GPU memory
+        // resident on first use, drivers finish shaders on first draw: 100 ms frames for a second or two). Black
+        // until 45 frames in a row are on time as well (8 s at most).
+        smoothFrames = r.texturesPending() == 0 && lastLoopMs < 1.2 * 1000.0 / hz ? smoothFrames + 1 : 0;
         if (texturesUntil != std::chrono::steady_clock::time_point{} && loadState == 0) {
             const bool late = std::chrono::steady_clock::now() > texturesUntil;
-            if (r.texturesPending() == 0 || late) {
-                if (late) LOG("textures still loading after 8 s: showing the home anyway");
+            if ((r.texturesPending() == 0 && smoothFrames >= 45) || late) {
+                if (late) LOG("textures still loading (or frames still slow) after 8 s: showing the home anyway");
                 texturesUntil = {};
                 fadeTarget = 1;
             } else {
@@ -1294,7 +1337,7 @@ int runVr(const std::vector<std::string>& apks, bool system = false) {
                 // Every texture now, not as things come into view: turning round never waits on one (no pop-in, no
                 // decode in the middle of looking around). System mode stays black until they're in (8 s at most).
                 r.requestAllTextures();
-                if (system && r.texturesPending() > 0) { fadeTarget = 0; texturesUntil = std::chrono::steady_clock::now() + std::chrono::seconds(8); }
+                if (r.texturesPending() > 0) { fadeTarget = 0; texturesUntil = std::chrono::steady_clock::now() + std::chrono::seconds(8); }
                 // The home's ambience (Clay's _BACKGROUND_LOOP.ogg, or an HSL home's FMOD bed), a background sound
                 // added in Frame Studio, and the animation clock.
                 if (soundJob.joinable()) soundJob.join();       // (the last home's: never played over this one)
@@ -1321,6 +1364,11 @@ int runVr(const std::vector<std::string>& apks, bool system = false) {
                     }
                 }
                 applyEdits(r, *scene, shown.front());
+                if (perf.autoResolution) {   // where this home settled last time, else 100%
+                    const auto it = autoScales.find(homeKey());
+                    const float start = it != autoScales.end() ? it->second : 1.0f;
+                    if (std::abs(start - scale) > 1e-3f) { LOG("auto resolution: %.0f%% for this home", start * 100); rescale(start); }
+                }
                 loco.setWorld(std::move(pendingWalk));
                 pendingWalk = HomeWorld();
                 overlayDirty = true;
@@ -1440,7 +1488,7 @@ int runVr(const std::vector<std::string>& apks, bool system = false) {
                         settleUntil = now + std::chrono::seconds(2);
                     } else {
                         next = std::min(scale - 0.05f, static_cast<float>(scale * std::sqrt(budget * mid / std::max(avg, p95 * 0.8))));
-                        next = std::max(next, scale * 0.8f);
+                        next = std::max(next, scale * (avg > budget * 1.3 ? 0.6f : 0.8f));   // far over: further at once
                     }
                 } else if (avg < budget * lo && ++calmWindows >= 2 && now - lastDown > std::chrono::seconds(45)) {
                     calmWindows = 0;
@@ -1459,6 +1507,7 @@ int runVr(const std::vector<std::string>& apks, bool system = false) {
                 if (std::abs(next - scale) > 1e-3f) {
                     LOG("auto resolution: GPU %.2f ms (p95 %.2f) of %.2f: %.0f%% -> %.0f%%", avg, p95, budget, scale * 100, next * 100);
                     rescale(next);
+                    rememberScale();
                     settleUntil = now + std::chrono::seconds(2);
                 }
             } else if (!perf.autoResolution && r.foveationActive() && avg > 0 && now > settleUntil) {
@@ -1521,6 +1570,9 @@ int runVr(const std::vector<std::string>& apks, bool system = false) {
             j += b;
             j += HomeReport::q(shown.empty() ? std::string() : fs::path(shown.front()).filename().string());
             j += ",\"world\":" + HomeReport::q(world.describe()) + ",\"fovStrength\":" + std::to_string(r.foveationStrength());
+            j += ",\"fade\":" + std::to_string(fade);   // 0 black (loading, or waiting for its textures) .. 1 shown
+            j += ",\"hitchesShown\":" + std::to_string(statHitchShown);   // since the last stats: late frames while fully shown
+            statHitchShown = 0;
             if (r.debugView() == HslRenderer::kViewCost && scene) {   // the costliest meshes, for the Debug page
                 j += ",\"costly\":[";
                 const auto top = r.costliest(8);
@@ -1792,7 +1844,10 @@ int runVr(const std::vector<std::string>& apks, bool system = false) {
         if (gpuNew) { gpuSeen = r.gpuResults(); gpuSum += r.lastGpuMs(); ++gpuN; gpuWindow.add(r.lastGpuMs()); statGpu += r.lastGpuMs(); ++statGpuN; }
         {
             const auto le = std::chrono::steady_clock::now();
-            prof.frame(r, std::chrono::duration<double, std::milli>(le - loopStart).count(), animMs, r.lastGpuMs(), gpuNew);
+            const double loopMs = std::chrono::duration<double, std::milli>(le - loopStart).count();
+            lastLoopMs = loopMs;
+            if (fade >= 0.99f && loopMs > 1.5 * 1000.0 / hz) ++statHitchShown;   // a frame you could see, late (stuttered)
+            prof.frame(r, loopMs, animMs, r.lastGpuMs(), gpuNew);
             loopStart = le;
             prof.report(system ? (uploading ? "system(loading)" : "system") : "scene");
         }

@@ -90,6 +90,11 @@ add_library(imgui STATIC
     ${STUDIO_IMGUI_BACKEND} "${TP}/imgui/backends/imgui_impl_vulkan.cpp"
     "${TP}/imguizmo/ImGuizmo.cpp")
 target_include_directories(imgui PUBLIC "${TP}/imgui" "${TP}/imguizmo")
+# ImGuizmo reads matrix rows through casts to other types (*(vec_t*)&m[i] and the like): fine for MSVC, but GCC and
+# Clang may optimize assuming no such aliasing, and Clang for x64 then turned gizmo drags into NaN transforms.
+if(NOT MSVC)
+    set_source_files_properties("${TP}/imguizmo/ImGuizmo.cpp" PROPERTIES COMPILE_OPTIONS "-fno-strict-aliasing")
+endif()
 target_compile_definitions(imgui PUBLIC IMGUI_IMPL_VULKAN_USE_VOLK GLFW_INCLUDE_NONE)
 target_link_libraries(imgui PUBLIC volk)
 if(NOT WIN32)

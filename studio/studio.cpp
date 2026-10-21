@@ -4180,7 +4180,9 @@ struct Studio {
         const float pad = 8 * scale, bw = h - 2 * pad + 18 * scale;
         ImGui::SetCursorScreenPos(ImVec2(a.x + pad, a.y + pad * 0.6f));
         ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(6 * scale, 3 * scale));
-        if (ImGui::Button(animPlaying ? "\u275a\u275a  Pause###play" : "\u25b6  Play###play", ImVec2(bw + 20 * scale, 0))) animPlaying = !animPlaying;
+        // as wide as its wider label in the font in use (not a fixed width: Linux's fonts run wider than Segoe UI)
+        const float playW = std::max(bw + 20 * scale, ImGui::CalcTextSize("\u275a\u275a  Pause").x + ImGui::GetStyle().FramePadding.x * 2 + 4 * scale);
+        if (ImGui::Button(animPlaying ? "\u275a\u275a  Pause###play" : "\u25b6  Play###play", ImVec2(playW, 0))) animPlaying = !animPlaying;
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", animPlaying ? "Pause the home's animations" : "Play the home's animations");
         ImGui::SameLine(0, pad);
         const float right = 150 * scale;
@@ -6581,9 +6583,13 @@ struct SelfTest {
         if (stage >= stages.size()) return;
         if (std::chrono::steady_clock::now() - started > std::chrono::minutes(6)) { check(false, "finished in time"); stage = stages.size(); finish(); return; }
         const int w = stages[stage]();
-        if (w < 0) {   // still waiting: up to a minute (frames come fast while a load runs, so not a frame count)
+        if (w < 0) {   // still waiting: a minute, but at least 3000 frames (a software GPU draws ~30 a second, and a gizmo
+                       // probe takes a frame a step); 5 minutes at most whatever the frame rate
             if (polls++ == 0) pollStart = std::chrono::steady_clock::now();
-            if (std::chrono::steady_clock::now() - pollStart > std::chrono::seconds(60)) { check(false, "a stage timed out", std::to_string(stage)); polls = 0; ++stage; }
+            const auto waited = std::chrono::steady_clock::now() - pollStart;
+            if ((waited > std::chrono::seconds(60) && polls > 3000) || waited > std::chrono::minutes(5)) {
+                check(false, "a stage timed out", std::to_string(stage)); polls = 0; ++stage;
+            }
             return;
         }
         polls = 0;
@@ -7652,6 +7658,7 @@ public:
     virtual ~StudioWindow() = default;
     virtual void* nativeHandle() = 0;                    // dialogs' owner (HWND on Windows)
     virtual float uiScale() = 0;                         // the display's scale for the UI (1 = 96 dpi)
+    virtual float pixelDensity() { return 1.0f; }        // pixels per UI unit (2 on a Mac's Retina display)
     virtual std::vector<std::string> vulkanInstanceExtensions() = 0;
     virtual VkSurfaceKHR createSurface(VkInstance instance) = 0;
     virtual void pixelSize(int& width, int& height) = 0; // the swapchain's size
@@ -7680,12 +7687,18 @@ FontFiles fontFiles() {
             {"/System/Library/Fonts/Supplemental/Arial Bold.ttf", "/Library/Fonts/Arial Bold.ttf"},
             {"/System/Library/Fonts/Supplemental/Arial Unicode.ttf", "/Library/Fonts/Arial Unicode.ttf"}};
 #else
+    // Noto Sans (most desktops), else Liberation Sans (Arial's metrics), else DejaVu Sans (wide, but everywhere). Ubuntu's
+    // own fonts ship as variable fonts only, which draw at one weight here.
     return {{"/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf", "/usr/share/fonts/noto/NotoSans-Regular.ttf",
-             "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", "/usr/share/fonts/TTF/DejaVuSans.ttf",
-             "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf"},
+             "/usr/share/fonts/google-noto/NotoSans-Regular.ttf",
+             "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf", "/usr/share/fonts/liberation-sans/LiberationSans-Regular.ttf",
+             "/usr/share/fonts/TTF/LiberationSans-Regular.ttf",
+             "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", "/usr/share/fonts/TTF/DejaVuSans.ttf"},
             {"/usr/share/fonts/truetype/noto/NotoSans-SemiBold.ttf", "/usr/share/fonts/noto/NotoSans-SemiBold.ttf",
-             "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf",
-             "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf"},
+             "/usr/share/fonts/google-noto/NotoSans-SemiBold.ttf",
+             "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf", "/usr/share/fonts/liberation-sans/LiberationSans-Bold.ttf",
+             "/usr/share/fonts/TTF/LiberationSans-Bold.ttf",
+             "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf"},
             {"/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", "/usr/share/fonts/TTF/DejaVuSans.ttf",
              "/usr/share/fonts/truetype/noto/NotoSansSymbols2-Regular.ttf"}};
 #endif
@@ -7696,8 +7709,12 @@ const char* firstExisting(const std::vector<const char*>& files) {
     return nullptr;
 }
 
-void loadFonts(float scale) {
+// `density`: pixels per UI unit. Fonts are made at that many pixels and drawn back at UI size, so text stays sharp
+// on a Retina display.
+void loadFonts(float scale, float density) {
     ImGuiIO& io = ImGui::GetIO();
+    scale *= density;
+    io.FontGlobalScale = 1.0f / density;
     const FontFiles files = fontFiles();
     const char* font = firstExisting(files.regular);
     const char* bold = firstExisting(files.bold);
@@ -7796,7 +7813,7 @@ int runStudio(StudioWindow& window, const std::vector<std::string>& args) {
     static std::string ini = narrow((data / L"layout.ini").wstring());
     io.IniFilename = ini.c_str();
     applyTheme(scale);
-    loadFonts(scale);
+    loadFonts(scale, window.pixelDensity());
     window.initImGui();
     ImGui_ImplVulkan_InitInfo ii = {};
     ii.Instance = r.instance();
@@ -8180,6 +8197,13 @@ public:
         return 1.0f;   // macOS works in points and draws them at the display's density itself
 #else
         return contentScale(glfwGetPrimaryMonitor());
+#endif
+    }
+    float pixelDensity() override {
+#ifdef __APPLE__
+        return contentScale(glfwGetPrimaryMonitor());   // 2 on Retina
+#else
+        return 1.0f;
 #endif
     }
     std::vector<std::string> vulkanInstanceExtensions() override {

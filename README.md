@@ -1,63 +1,100 @@
 # Frame Studio and Frame Home
 
-**Frame Home** makes your homes the Steam Frame's environment: Meta Quest homes (HSL, Clay `.opa`, glTF) and models,
-converted into Frame-native `.fenv` environments and drawn in SteamVR's compositor in place of its own.
+**Frame Home** makes your homes the Steam Frame's environment. Meta Quest homes (HSL, Clay `.opa`, glTF) and models
+become Frame-native `.fenv` environments, drawn in SteamVR's compositor in place of its own environment: at boot,
+behind the Steam menu and while games load. **Frame Studio** is the desktop editor for them, on Windows, Linux and
+macOS. It opens Meta homes, `.fenv` environments and models (glTF, FBX, OBJ), shows them with the same renderer the
+headset runs, and lets you edit, save and send them to the headset.
 
-**Frame Studio** is the desktop editor for them. It opens Meta homes, `.fenv` environments and models (glTF, FBX,
-OBJ), shows them with the same renderer the headset runs, and lets you move, hide and delete objects, shape the walkable
-area, add sounds and pictures, save environments and install them on the headset.
+## Quick start
+
+1. **Download** Frame Studio for your computer from the Releases page (**Latest build**, or a version release) and
+   unpack it. See [Getting started](docs/getting-started.md).
+2. **Prepare the headset** once: developer mode, SSH and a key. See [Preparing the Steam Frame](docs/headset-setup.md).
+3. **Install Frame Home**: in Studio, **Frame > Install on Steam Frame...**, then **Install**.
+   See [Installing Frame Home](docs/install-frame-home.md).
+4. **Open a home**: **File > Open Home...** and pick a Meta home `.apk`, a `.fenv` or a model.
+5. **Send it**: **Frame > Send to Frame**. Put the headset on: you are standing in it.
 
 ## Downloads
 
-Every push builds everything (Actions → the run → Artifacts). The newest build of `main` is always on the Releases
-page as **Latest build**; tagged versions (`git tag v1.0 && git push --tags`) get their own release.
+Every push builds everything. The newest build of `main` is always on the Releases page as **Latest build**; tagged
+versions (`v1.0`, ...) get their own release. Builds of other branches are under Actions (open a run, then
+Artifacts).
 
 | Computer | Frame Studio |
 |---|---|
 | Windows, 64-bit PCs | `FrameStudio-windows-x64.zip` |
 | Windows, 32-bit | `FrameStudio-windows-x86.zip` |
-| Windows on ARM (Snapdragon, Surface Pro X…) | `FrameStudio-windows-arm64.zip` |
+| Windows on ARM (Snapdragon, Surface Pro X...) | `FrameStudio-windows-arm64.zip` |
 | Linux, 64-bit PCs | `FrameStudio-linux-x64.tar.gz` |
 | Linux, 32-bit | `FrameStudio-linux-x86.tar.gz` |
 | Linux on ARM (Raspberry Pi 5, ARM laptops, the Steam Frame's desktop) | `FrameStudio-linux-arm64.tar.gz` |
 | Mac with Apple Silicon (M1 and later) | `FrameStudio-macos-arm64.zip` |
 | Mac with Intel | `FrameStudio-macos-x64.zip` |
+| Frame Home only, installed from any computer | `FrameHome-installer.zip` |
 
-Studio needs a GPU with Vulkan 1.2: any recent NVIDIA, AMD or Intel driver on Windows and Linux; on a Mac, Vulkan runs
-on Metal through MoltenVK, which comes inside the app. The 32-bit builds have at most 4 GB to work in: the very
-largest homes may not fit.
+Studio needs a GPU with Vulkan 1.2: any recent NVIDIA, AMD or Intel driver on Windows and Linux. On a Mac, Vulkan
+runs on Metal through MoltenVK, which comes inside the app. The 32-bit builds have at most 4 GB to work in, so the
+very largest homes may not fit.
 
-**Frame Home without Studio:** `FrameHome-installer.zip` installs it on the headset from any computer (or on the
-headset itself); see `frame/README-frame-home.txt` inside it.
+## Highlights
 
-## Building
+**Frame Home (on the headset)**
 
-Everything Studio needs is in `third_party/` (Vulkan is loaded at runtime). CMake 3.16+ and Ninja.
+- Takes SteamVR's environment slot natively: no app, no library entry, controllers and passthrough still work.
+- An **Environments** panel in the Steam menu: switch homes live, delete them, change settings, debug views.
+- Walk, teleport, snap or smooth turn, sit in seats, gravity zones, comfort vignette.
+- Built for 120 fps: baked environments, eye-tracked foveation, auto resolution, per-world tuned settings, and a
+  thermal governor that keeps the headset cool.
+- Safe: a compositor layer that steps aside if Frame Home stops, and a one-file off switch.
 
-| On | Command | Builds |
-|---|---|---|
-| Windows (Visual Studio 2022 with C++) | `studio\build_windows.bat x64` (or `x86`, `arm64`) | Windows |
-| Linux | `scripts/build-studio.sh linux-x64` (or `linux-x86`, `linux-arm64` on an ARM machine) | Linux |
-| Linux with [llvm-mingw](https://github.com/mstorsjo/llvm-mingw) | `scripts/build-studio.sh windows-x64 windows-x86 windows-arm64` | Windows, cross |
-| macOS (Xcode command line tools, `brew install ninja molten-vk`) | `scripts/build-studio.sh macos-arm64 macos-x64` | macOS |
-| anywhere | `scripts/build-studio.sh frame-home` | the Frame Home installer |
-| anywhere it can | `scripts/build-studio.sh all` | everything this computer can build |
+**Frame Studio (on your computer)**
 
-Linux builds need the X11 headers (`libx11-dev libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev`) and, for
-`linux-x86`, `gcc-multilib g++-multilib`. Packages land in `dist/`.
+- Opens Meta homes (HSL, Clay, glTF), `.fenv` environments and Blender or Unity models; pairs rooms with vistas.
+- Move, rotate, scale, hide and delete objects, with undo and auto-saved versions.
+- Shape the walkable area: auto-generated surfaces, drawn floors, spawns, seats, hotspots, wall spots, gravity zones.
+- Add a background sound and a picture; set and calculate per-world settings.
+- Saves baked `.fenv` files and leaves out what can't be seen; sends them to the headset in one click.
+- Debug views (wireframe, meshes, GPU cost, overdraw), a home report, and the headset's settings and debug page
+  from your desk.
 
-The headset side (`frame-home`, `frame-switcher`, `fenv-tool`, the compositor layer) is built on the Steam Frame
-itself against SteamVR's own OpenVR library: the top-level `CMakeLists.txt`, then
-`g++ -O2 -shared -fPIC -std=c++17 layer/frame_home_layer.cpp -o build/layer/libframe_home_layer.so`. Its ready-built
-copy is `frame/payload/`, which every Studio build and the installer carry.
+## Guides
 
-## Layout
-
-| | |
+| Guide | What it covers |
 |---|---|
-| `studio/` | Frame Studio: `studio.cpp` (the editor), `platform*.{h,cpp}` (Windows / Linux / macOS), `frame_pacer.h` |
-| `src/` | shared engine: renderer (`hsl_renderer`), scene loading and baking, `.fenv`, walkable area, Frame Home (`main.cpp`), `fenv-tool` |
-| `layer/` | the Vulkan layer inside SteamVR's compositor that shows Frame Home in place of its environment |
-| `frame/` | the headset payload and the stand-alone installers |
-| `third_party/` | vendored libraries (each with its own license) |
-| `tools/` | test and measuring tools (headless renders, walk tests, shader generators) |
+| [Getting started](docs/getting-started.md) | Requirements, downloads, first launch, a 5-minute walkthrough |
+| [Preparing the Steam Frame](docs/headset-setup.md) | Developer mode, SSH, keys, the `frame` address |
+| [Installing Frame Home](docs/install-frame-home.md) | Three ways to install, updating, uninstalling, the off switch |
+| [Using Frame Home](docs/using-frame-home.md) | The Environments panel, moving around, every setting |
+| [Environments and .fenv](docs/environments-and-fenv.md) | The format, `fenv-tool`, per-world settings and tuning |
+| [Performance](docs/performance.md) | Reaching 120 fps, checking it, fixing stutter |
+| [Frame Studio guide](docs/studio-guide.md) | The Studio window, tools and panels |
+| [Bundles](docs/bundles.md) | Several environments in one `.fbundle` |
+| [Building from source](docs/building.md) | Building on each system, CI, the headset side |
+| [Troubleshooting](docs/troubleshooting.md) | Symptoms and fixes, logs, the self-test |
+
+## Building from source
+
+Everything Studio needs is in `third_party/`; you need CMake 3.16+ and Ninja. In short:
+
+| On | Command |
+|---|---|
+| Windows (Visual Studio 2022 with C++) | `studio\build_windows.bat x64` (or `x86`, `arm64`) |
+| Linux, macOS | `scripts/build-studio.sh <target>...` or `scripts/build-studio.sh all` |
+
+The headset side is built on the Steam Frame; a ready-built copy is in `frame/payload/`. Full details, prerequisites
+and the CI: [docs/building.md](docs/building.md).
+
+## Repository layout
+
+| Path | What it holds |
+|---|---|
+| `studio/` | Frame Studio: `studio.cpp` (the editor), `platform*.{h,cpp}` (Windows, Linux, macOS), `frame_pacer.h` |
+| `src/` | Shared engine: renderer (`hsl_renderer`), scene loading and baking, `.fenv`, walkable area, Frame Home (`main.cpp`), the Environments panel (`switcher.cpp`), `fenv-tool` |
+| `layer/` | The Vulkan layer inside SteamVR's compositor that shows Frame Home in place of its environment |
+| `frame/` | The headset payload and the stand-alone installers |
+| `scripts/`, `cmake/` | Build script and the llvm-mingw toolchain file |
+| `tools/`, `tests_loco/` | Test and measuring tools, movement tests |
+| `third_party/` | Vendored libraries (each with its own license) |
+| `docs/` | The guides |

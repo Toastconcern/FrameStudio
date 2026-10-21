@@ -30,6 +30,10 @@ largest homes may not fit.
 **Frame Home without Studio:** `FrameHome-installer.zip` installs it on the headset from any computer (or on the
 headset itself); see `frame/README-frame-home.txt` inside it.
 
+**Environment bundles** (`.fbundle`): several `.fenv` environments in one file, to share or install together; each
+stays its own environment. `fenv-tool bundle out.fbundle a.fenv b.fenv` makes one, `fenv-tool unbundle` takes it
+apart, and on the headset the Environments panel unpacks one dropped into `~/frame-home/envs` (`src/fenv_bundle.h`).
+
 ## Building
 
 Everything Studio needs is in `third_party/` (Vulkan is loaded at runtime). CMake 3.16+ and Ninja.

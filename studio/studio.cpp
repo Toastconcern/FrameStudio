@@ -657,7 +657,6 @@ struct Studio {
     char frameHost[128] = {};               // ssh target for the headset (frame-host.txt; default kFrameHost)
 
     // Headset > Install on Steam Frame: Frame Home + environments, as the headset's environment
-    bool showInstall = false;
     std::thread installer;
     std::atomic<bool> installing{false};
     std::string installStatus = "Not installed from this PC yet";   // statusMutex
@@ -5462,7 +5461,8 @@ struct Studio {
         ImGui::PushTextWrapPos(0);
         ImGui::TextDisabled("%s", status().c_str());
         ImGui::PopTextWrapPos();
-        if (ImGui::Button("Install on Steam Frame\u2026", ImVec2(-1, 0))) openInstall();
+        section("INSTALL FRAME HOME");
+        installPanel();
     }
 
 
@@ -6396,7 +6396,6 @@ struct Studio {
         ImGui::End();
         statusBar(top + h + timelineH, barH);
         controlsWindow();
-        installWindow();
         settingsWindow();
         reportWindow();
         headsetDebugWindow();
@@ -6410,9 +6409,14 @@ struct Studio {
     // no game is running (in place of the default environment, not as a game or an extra app), plus the chosen
     // environments. The headset side is frame\install.sh beside this exe, with Frame Home's arm64 binaries.
 
-    void openInstall() {
-        showInstall = true;
-        if (installEnvs.empty())                 // start from the environments saved recently
+    void openInstall() { showInspectorTab(InspectorTab::Headset); }
+
+    // The install list starts from the environments saved recently (once: after that it's yours).
+    bool installEnvsSeeded = false;
+    void seedInstallEnvs() {
+        if (installEnvsSeeded) return;
+        installEnvsSeeded = true;
+        if (installEnvs.empty())
             for (const auto& r : recent)
                 if (r.size() == 1 && isFenvPath(r[0]) && fs::exists(fs::path(widen(r[0])))) installEnvs.push_back(r[0]);
     }
@@ -6514,22 +6518,19 @@ struct Studio {
         });
     }
 
-    void installWindow() {
-        if (!showInstall) return;
-        ImGui::SetNextWindowSize(ImVec2(480 * scale, 0), ImGuiCond_Appearing);
-        ImGui::SetNextWindowPos(ImVec2(ImGui::GetIO().DisplaySize.x * 0.5f, ImGui::GetIO().DisplaySize.y * 0.5f), ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
-        if (!ImGui::Begin("Install on Steam Frame", &showInstall, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_AlwaysAutoResize)) { ImGui::End(); return; }
-        ImGui::PushTextWrapPos(460 * scale);
+    // The Headset tab's install part: Frame Home onto the headset, with environments.
+    void installPanel() {
+        seedInstallEnvs();
+        ImGui::PushTextWrapPos(0);
         ImGui::TextWrapped("Installs Frame Home on the headset as its environment. SteamVR runs it natively in place of the default "
                            "environment whenever no game is running, and brings it back when a game quits. It is not a game or an extra app.");
         ImGui::Spacing();
         ImGui::BeginDisabled(installing);
-        ImGui::SetNextItemWidth(220 * scale);
-        ImGui::InputText("Headset", frameHost, sizeof frameHost);
-        ImGui::SameLine();
-        ImGui::TextDisabled("ssh alias or steamos@<address>");
+        fieldLabel("Headset");
+        ImGui::InputText("##installHost", frameHost, sizeof frameHost);
+        ImGui::TextDisabled("an ssh alias, or steamos@<address>");
         ImGui::Spacing();
-        ImGui::SeparatorText("Environments");
+        ImGui::SeparatorText("Environments to install");
         if (scene) {
             const std::string label = "The open home (" + homeName + ")" + (openHomeIsFenv() ? "" : ", saved as .fenv");
             ImGui::Checkbox(label.c_str(), &installOpenHome);
@@ -6548,15 +6549,13 @@ struct Studio {
         ImGui::Spacing();
         ImGui::Separator();
         pushPrimary();
-        if (ImGui::Button(installing ? "Installing\u2026" : "Install", ImVec2(140 * scale, ImGui::GetFrameHeight() * 1.4f))) startInstall(false);
+        if (ImGui::Button(installing ? "Installing\u2026" : "Install Frame Home", ImVec2(-1, ImGui::GetFrameHeight() * 1.4f))) startInstall(false);
         ImGui::PopStyleColor(3);
-        ImGui::SameLine();
-        if (ImGui::Button("Restore SteamVR's environment", ImVec2(0, ImGui::GetFrameHeight() * 1.4f))) startInstall(true);
+        if (ImGui::Button("Restore SteamVR's Environment", ImVec2(-1, 0))) startInstall(true);
         ImGui::EndDisabled();
         ImGui::Spacing();
         ImGui::TextWrapped("%s", getInstallStatus().c_str());
         ImGui::PopTextWrapPos();
-        ImGui::End();
     }
 
     // A world point on the viewport (false behind the camera).
@@ -7968,6 +7967,12 @@ int runStudio(StudioWindow& window, const std::vector<std::string>& args) {
     ii.MSAASamples = VK_SAMPLE_COUNT_1_BIT;
     ImGui_ImplVulkan_Init(&ii);
 
+    if (const char* tab = std::getenv("FS_INSPECTOR_TAB")) {   // diagnostics / screenshots: start on this Inspector tab
+        const std::string t = tab;
+        app->showInspectorTab(t == "world" ? Studio::InspectorTab::World : t == "environment" ? Studio::InspectorTab::Environment
+                              : t == "sound" ? Studio::InspectorTab::Sound : t == "headset" ? Studio::InspectorTab::Headset
+                                                                                            : Studio::InspectorTab::Selection);
+    }
     std::unique_ptr<SelfTest> selftest;
     if (args.size() > 1 && args[0] == "--selftest") {
         selftest = std::make_unique<SelfTest>(*app, std::vector<std::string>(args.begin() + 1, args.end()));

@@ -58,6 +58,7 @@ jobs:
           New-Item -ItemType Directory -Force $stage | Out-Null
           Copy-Item "build/windows-${{ matrix.arch }}/Frame Studio.exe" $stage
           Copy-Item -Recurse "build/windows-${{ matrix.arch }}/frame" "$stage/frame"
+          Copy-Item LICENSE "$stage/LICENSE.txt"
           New-Item -ItemType Directory -Force dist | Out-Null
           Compress-Archive -Path $stage -DestinationPath "dist/$name.zip" -Force
       - uses: actions/upload-artifact@v4

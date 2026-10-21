@@ -57,6 +57,7 @@ package() {
     target=$1 dir="$BUILD/$1" name="FrameStudio-$1"
     stage="$BUILD/stage/$name"
     rm -rf "$stage" && mkdir -p "$stage"
+    cp "$ROOT/LICENSE" "$stage/LICENSE.txt"
     case "$target" in
         windows-*) cp "$dir/Frame Studio.exe" "$stage/" && cp -R "$dir/frame" "$stage/frame"
                    (cd "$BUILD/stage" && rm -f "$DIST/$name.zip" && zip -qr "$DIST/$name.zip" "$name") ;;
@@ -87,6 +88,7 @@ package_frame_home() {
     stage="$BUILD/stage/FrameHome-installer"
     rm -rf "$stage" && mkdir -p "$stage"
     cp -R "$ROOT/frame/payload" "$stage/payload"
+    cp "$ROOT/LICENSE" "$stage/LICENSE.txt"
     cp "$ROOT/frame/install-frame-home.sh" "$ROOT/frame/install-frame-home.ps1" "$ROOT/frame/Install Frame Home.bat" "$ROOT/frame/README-frame-home.txt" "$stage/"
     chmod +x "$stage/install-frame-home.sh" "$stage/payload/install.sh" "$stage"/payload/bin/* 2>/dev/null || true
     (cd "$BUILD/stage" && rm -f "$DIST/FrameHome-installer.zip" && zip -qr "$DIST/FrameHome-installer.zip" FrameHome-installer)

@@ -71,7 +71,7 @@ ssh frame
 | Windows: "ssh is not recognized", or Studio says "install OpenSSH or Git for Windows" | Turn on **OpenSSH Client** in **Settings > Apps > Optional features**, or install Git for Windows |
 | "... isn't a Steam Frame" | The address points at another computer |
 
-In Studio, the address is the **Headset** field in **Frame > Install on Steam Frame...**. Studio remembers it.
+In Studio, the address is the **Headset** field in **Headset > Install on Steam Frame...**. Studio remembers it.
 
 ## Install failed
 

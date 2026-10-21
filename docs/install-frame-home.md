@@ -8,18 +8,18 @@ Before you start, the headset needs developer mode and SSH: see [headset-setup.m
 
 ## Way 1: from Frame Studio
 
-1. Choose **Frame > Install on Steam Frame...**.
+1. Open the Inspector's **Headset** tab (on the right), or choose **Headset > Install on Steam Frame...**, which opens it.
 2. In **Headset**, type the headset's address: an SSH alias such as `frame`, or `steamos@<address>`, for example
    `steamos@192.168.1.50`. Studio remembers it.
-3. Under **Environments**, choose what to copy along:
+3. Under **Environments to install**, choose what to copy along:
    - **The open home** (if one is open). It is saved as a `.fenv` first if it isn't one already.
    - **Add .fenv...** adds more environment files.
    - With nothing chosen, only Frame Home is installed. Environments already on the headset stay.
-4. Click **Install**. The window shows each step and, at the end, "Installed".
+4. Click **Install Frame Home**. The tab shows each step and, at the end, "Installed".
 
 Environments already on the headset with the same name and size are not copied again.
 
-**Restore SteamVR's environment** in the same window uninstalls (see [Uninstalling](#uninstalling)).
+**Restore SteamVR's Environment** in the same tab uninstalls (see [Uninstalling](#uninstalling)).
 
 Studio connects without asking for passwords, so it needs an SSH key (see [headset-setup.md](headset-setup.md)).
 
@@ -153,7 +153,7 @@ Frame Home.
 
 | From | Do this |
 |---|---|
-| Studio | **Frame > Install on Steam Frame...**, then **Restore SteamVR's environment** |
+| Studio | **Headset > Install on Steam Frame...**, then **Restore SteamVR's Environment** |
 | Windows | `powershell -ExecutionPolicy Bypass -File install-frame-home.ps1 -Uninstall` |
 | Linux, macOS | `sh install-frame-home.sh --uninstall` |
 | On the headset | `sh payload/install.sh uninstall` |

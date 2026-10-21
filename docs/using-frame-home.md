@@ -53,7 +53,7 @@ Over SSH (`ssh frame`) you can do the same with the panel's program:
 
 Every environment lives in `~/frame-home/envs` on the headset. Ways to put one there:
 
-- From Frame Studio: **Frame > Send to Frame** (the open home), or **Frame > Install on Steam Frame...** (any
+- From Frame Studio: **Headset > Send to Frame** (the open home), or **Headset > Install on Steam Frame...** (any
   `.fenv` files).
 - With the stand-alone installer: drop `.fenv` files on `Install Frame Home.bat`, or list them after
   `install-frame-home.sh`. See [install-frame-home.md](install-frame-home.md).

@@ -128,7 +128,7 @@ it cannot connect, check the address and that SSH is on. See [troubleshooting.md
 
 You do not have to use the name `frame`:
 
-- In Studio, **Frame > Install on Steam Frame...** has a **Headset** field. Type an SSH alias or
+- In Studio, **Headset > Install on Steam Frame...** has a **Headset** field. Type an SSH alias or
   `steamos@<address>`. Studio remembers it and uses it for **Send to Frame** too.
 - The installers take `--host` (Linux, macOS) or ask for the address (Windows). See
   [install-frame-home.md](install-frame-home.md).

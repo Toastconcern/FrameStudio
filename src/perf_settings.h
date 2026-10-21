@@ -1,7 +1,7 @@
 #pragma once
 // Frame Home's performance and quality settings: ~/frame-home/settings.json on the Steam Frame. Frame Home reads it
-// when it starts and again whenever it changes; the Environments panel (Settings) and Frame Studio (Frame > Headset
-// Settings) edit it. Frame Home writes how it's doing to stats.json beside it for those two to show.
+// when it starts and again whenever it changes; the Environments panel (Settings) and Frame Studio (Edit > Settings,
+// its Steam Frame part) edit it. Frame Home writes how it's doing to stats.json beside it for those two to show.
 #include "core/tinyjson.h"
 
 #include <algorithm>
@@ -119,7 +119,7 @@ struct PerfSettings {
 };
 
 // Frame Home's debug tools: ~/frame-home/debug.json, beside settings.json. The Environments panel's Debug page and
-// Frame Studio (Frame > Headset Debug) edit it and Frame Home applies it within a second. They're for finding out
+// Frame Studio (Debug > Headset Debug) edit it and Frame Home applies it within a second. They're for finding out
 // why a home looks or runs wrong, not for keeping: Frame Home clears the file each time it starts.
 struct DebugSettings {
     int view = 0;                       // HslRenderer::DebugView: 0 normal, 1 wireframe, 2 meshes, 3 GPU cost, 4 overdraw

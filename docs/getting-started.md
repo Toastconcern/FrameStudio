@@ -111,7 +111,7 @@ Frame Home, which Studio installs for you. Keep the two together.
 ## A first walkthrough (about 5 minutes)
 
 Before you start, set up the headset once: [headset-setup.md](headset-setup.md). Then install Frame Home on it with
-**Frame > Install on Steam Frame...** (see [install-frame-home.md](install-frame-home.md)).
+**Headset > Install on Steam Frame...** (see [install-frame-home.md](install-frame-home.md)).
 
 ### 1. Open a home
 
@@ -149,7 +149,7 @@ copy somewhere else.
 ### 4. Send it to the headset
 
 1. Put the headset on, or at least make sure it is on and connected to your network.
-2. Choose **Frame > Send to Frame**.
+2. Choose **Headset > Send to Frame**.
 3. Studio saves the home as one `.fenv`, copies it to the headset and makes it the current environment. Its
    progress shows in the Studio window.
 

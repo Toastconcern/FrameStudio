@@ -11,10 +11,10 @@ headset runs, and lets you edit, save and send them to the headset.
 1. **Download** Frame Studio for your computer from the Releases page (**Latest build**, or a version release) and
    unpack it. See [Getting started](docs/getting-started.md).
 2. **Prepare the headset** once: developer mode, SSH and a key. See [Preparing the Steam Frame](docs/headset-setup.md).
-3. **Install Frame Home**: in Studio, **Frame > Install on Steam Frame...**, then **Install**.
+3. **Install Frame Home**: in Studio, **Headset > Install on Steam Frame...**, then **Install Frame Home**.
    See [Installing Frame Home](docs/install-frame-home.md).
 4. **Open a home**: **File > Open Home...** and pick a Meta home `.apk`, a `.fenv` or a model.
-5. **Send it**: **Frame > Send to Frame**. Put the headset on: you are standing in it.
+5. **Send it**: **Headset > Send to Frame**. Put the headset on: you are standing in it.
 
 ## Downloads
 

@@ -471,6 +471,6 @@ int main(int argc, char** argv) {
                  "  fenv-tool upgrade file.fenv...   re-bake with this build (keeps world, edits, sound, picture)\n"
                  "  fenv-tool report [--json] <home.apk | home.fenv | footprint.apk+vista.apk>...   what it costs and what's wrong with it\n"
                  "  fenv-tool settings <home.fenv | home.apk> [JSON | --clear]   a world's own settings, shown or set\n"
-                 "  fenv-tool tune [--seconds 30] [--late 0.01] [--cool 88] [--dry-run] <home.fenv | home.apk>   its best settings on this headset, stored in it\n");
+                 "  fenv-tool tune [--seconds 30] [--late 0.01] [--cool 80] [--dry-run] <home.fenv | home.apk>   its best settings on this headset, stored in it\n");
     return 2;
 }

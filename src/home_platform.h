@@ -66,7 +66,9 @@ inline std::filesystem::path selfPath() {
     const DWORD n = GetModuleFileNameW(nullptr, buf, static_cast<DWORD>(std::size(buf)));
     return n ? std::filesystem::path(buf) : std::filesystem::path();
 }
-inline bool stderrIsTerminal() { return _isatty(_fileno(stderr)) != 0; }
+// Is somebody reading stderr? On Windows a program SteamVR starts gets a hidden console (or NUL), indistinguishable
+// from a terminal: the modes SteamVR runs (the environment, the panel) always log to their files there.
+inline bool stderrIsTerminal() { return false; }
 inline long peakRamMB() {
     PROCESS_MEMORY_COUNTERS pmc = {};
     return GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof pmc) ? static_cast<long>(pmc.PeakWorkingSetSize / (1024 * 1024)) : 0;
@@ -265,6 +267,33 @@ inline int run(const std::vector<std::string>& args, int nice, bool wait) {
 #endif
 
 inline void sleepMs(int ms) { std::this_thread::sleep_for(std::chrono::milliseconds(ms)); }
+
+// A crash, said in the log (stderr): the exception, where, and the return addresses on the stack (each an address in
+// this program: tools/symbolize or `nm` maps them to functions). Windows only: Linux has its own (coredumps, the
+// headset's journal).
+#ifdef _WIN32
+inline LONG WINAPI logCrash(EXCEPTION_POINTERS* ep) {
+    const HMODULE self = GetModuleHandleW(nullptr);
+    const uintptr_t base = reinterpret_cast<uintptr_t>(self);
+    std::fprintf(stderr, "[crash] exception 0x%08lx at 0x%llx (this program loads at 0x%llx)\n", ep->ExceptionRecord->ExceptionCode,
+                 static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(ep->ExceptionRecord->ExceptionAddress)), static_cast<unsigned long long>(base));
+    const uintptr_t* sp = reinterpret_cast<const uintptr_t*>(ep->ContextRecord->Rsp);
+    MODULEINFO mi = {};
+    GetModuleInformation(GetCurrentProcess(), self, &mi, sizeof mi);
+    const uintptr_t end = base + mi.SizeOfImage;
+    int shown = 0;
+    for (int k = 0; k < 2048 && shown < 24; ++k) {   // words on the stack that point into this program's code
+        uintptr_t v = 0;
+        if (!ReadProcessMemory(GetCurrentProcess(), sp + k, &v, sizeof v, nullptr)) break;
+        if (v > base && v < end) { std::fprintf(stderr, "[crash]   stack+%d: +0x%llx\n", k * 8, static_cast<unsigned long long>(v - base)); ++shown; }
+    }
+    std::fflush(stderr);
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+inline void logCrashes() { SetUnhandledExceptionFilter(logCrash); }
+#else
+inline void logCrashes() {}
+#endif
 
 // Is SteamVR running (its server)? Asked before connecting as a utility: on Windows, connecting starts SteamVR.
 inline bool steamVrRunning() {

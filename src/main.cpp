@@ -24,6 +24,7 @@
 #include "thermal.h"
 #include "fenv.h"
 #include "home_platform.h"
+#include "vr_compat.h"
 #include "stb_image_write.h"
 
 #include <openvr.h>
@@ -935,7 +936,7 @@ VkPhysicalDevice pickVrDevice(VkInstance instance) {
 // widen > 1: a wider view than the lens shows (system mode: margin for the compositor's rotation reprojection).
 Mat4 eyeProjection(vr::EVREye eye, float widen = 1.0f) {
     // Tangents from OpenVR's own projection (GL style: row 3 = [0 0 -1 0], y up).
-    vr::HmdMatrix44_t p = vr::VRSystem()->GetProjectionMatrix(eye, kNear, 100.0f);
+    vr::HmdMatrix44_t p = vrcompat::projectionMatrix(eye, kNear, 100.0f);
     const float l = (p.m[0][2] - 1) / p.m[0][0], r = (p.m[0][2] + 1) / p.m[0][0];
     const float b = (p.m[1][2] - 1) / p.m[1][1], t = (p.m[1][2] + 1) / p.m[1][1];
     return projection(l * widen, r * widen, b * widen, t * widen);
@@ -1154,8 +1155,8 @@ int runVr(const std::vector<std::string>& apks, bool system = false) {
     float lastHeadR[9] = {1, 0, 0, 0, 1, 0, 0, 0, 1};
     double widenSum = 0;
     uint64_t widenN = 0;
-    const Mat4 eyeToHead[2] = {fromHmd34(vr::VRSystem()->GetEyeToHeadTransform(vr::Eye_Left)),
-                               fromHmd34(vr::VRSystem()->GetEyeToHeadTransform(vr::Eye_Right))};
+    const Mat4 eyeToHead[2] = {fromHmd34(vrcompat::eyeToHead(vr::Eye_Left)),
+                               fromHmd34(vrcompat::eyeToHead(vr::Eye_Right))};
     auto start = std::chrono::steady_clock::now();      // the shader clock (Animations off holds it)
     const auto loopEpoch = start;
     vr::TrackedDevicePose_t poses[vr::k_unMaxTrackedDeviceCount];
@@ -1180,7 +1181,7 @@ int runVr(const std::vector<std::string>& apks, bool system = false) {
     float gazeSmooth[2][2] = {{-1, -1}, {-1, -1}};   // pixels: restarted when the resolution changes
     uint32_t gazeW = 0;
     uint64_t gpuSeen = 0;
-    bool restart = false, lostDevice = false;
+    bool restart = false, lostDevice = false, quitAsked = false;
     float animTime = 0, animLength = 60;
     auto animTick = std::chrono::steady_clock::now();
     SystemPacer pacer;                               // system mode: frames timed to the compositor's
@@ -1250,7 +1251,7 @@ int runVr(const std::vector<std::string>& apks, bool system = false) {
     while (running) {
         vr::VREvent_t ev;
         while (vr::VRSystem()->PollNextEvent(&ev, sizeof(ev)))
-            if (ev.eventType == vr::VREvent_Quit) { vr::VRSystem()->AcknowledgeQuit_Exiting(); running = false; }
+            if (ev.eventType == vr::VREvent_Quit) { vr::VRSystem()->AcknowledgeQuit_Exiting(); running = false; quitAsked = true; }
         if (!running) break;
 
         // A parsed home goes to the GPU a few milliseconds a frame (system mode: once faded to black), so frames keep
@@ -1798,6 +1799,14 @@ int runVr(const std::vector<std::string>& apks, bool system = false) {
         if (++frames == 1) LOG("first frame submitted");
         if (frames % 5400 == 0) LOG("%llu frames", static_cast<unsigned long long>(frames));   // alive (about once a minute)
     }
+    if (quitAsked && !restart) {   // SteamVR wants the scene for a game (or room setup) now, and kills a home that takes
+                                   // more than 5 s: off SteamVR at once, no waiting for a load under way; the system frees
+                                   // the rest.
+        vr::VR_Shutdown();
+        LOG("quit: SteamVR asked for the scene");
+        std::fflush(stderr);
+        std::_Exit(0);
+    }
     if (worker.joinable()) worker.join();
     if (soundJob.joinable()) soundJob.join();
     publisher.finish();
@@ -1974,6 +1983,7 @@ int runInstall(bool install) {
 }  // namespace
 
 int main(int argc, char** argv) {
+    homeos::logCrashes();
 #ifdef FH_USE_VOLK
     if (volkInitialize() != VK_SUCCESS) { std::fprintf(stderr, "frame-home: no Vulkan on this system\n"); return 1; }
 #endif

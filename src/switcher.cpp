@@ -1489,6 +1489,11 @@ void prepareEnvironments() {
 }
 
 int runPanel() {
+    if (!homeos::stderrIsTerminal()) {   // started by SteamVR: messages go to logs/frame-switcher.log
+        std::error_code ec;
+        fs::create_directories(rootDir() / "logs", ec);
+        if (homeos::reopenStderr(rootDir() / "logs" / "frame-switcher.log", "w")) setvbuf(stderr, nullptr, _IOLBF, 0);
+    }
     signal(SIGINT, [](int) { g_quit = 1; });
     signal(SIGTERM, [](int) { g_quit = 1; });
     vr::EVRInitError ierr = vr::VRInitError_None;
@@ -1585,7 +1590,15 @@ int runPanel() {
     bool adopted = false;                            // systemPid isn't our child (a panel before this one started it)
     auto lastSpawn = std::chrono::steady_clock::now() - std::chrono::minutes(1);
     auto keepSystem = [&](std::chrono::steady_clock::time_point now) {
-        if (!systemEnv) return;                       // SteamVR runs Frame Home itself (its home app)
+        if (!systemEnv) {   // SteamVR's home app: SteamVR starts it, but not again after it stopped on its own (a crash):
+                            // when nothing else is in VR, have it started (at most every 5 s)
+            if (!homeInstalled || now - lastSpawn < std::chrono::seconds(5) || !homeos::runningCopies("frame-home").empty()) return;
+            if (vr::VRApplications()->GetSceneApplicationState() != vr::EVRSceneApplicationState_None) return;   // a game, or one starting / quitting
+            lastSpawn = now;
+            const vr::EVRApplicationError le = vr::VRApplications()->LaunchApplication("openvr.tool.steamvr_environments");
+            LOG("Frame Home wasn't running: started it (%s)", vr::VRApplications()->GetApplicationsErrorNameFromEnum(le));
+            return;
+        }
 #ifndef _WIN32
         if (systemPid > 0 && adopted) {
             if (kill(systemPid, 0) == 0) return;

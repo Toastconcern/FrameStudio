@@ -1203,7 +1203,7 @@ struct Panel {
         sc[0].content = envContent();
         if (envs.empty()) {
             const float cy = kTop + (H - kTop) * 0.42f;
-            const std::string a = "No environments yet", b = "Send one from Frame Studio: Frame > Install on Steam Frame.";
+            const std::string a = "No environments yet", b = "Send one from Frame Studio: Headset > Install on Steam Frame.";
             head.draw(cv, (W - head.width(a)) * 0.5f, cy - 40, a, kText);
             small.draw(cv, (W - small.width(b)) * 0.5f, cy + 8, b, kMuted);
             return;

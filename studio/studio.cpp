@@ -656,7 +656,7 @@ struct Studio {
     std::string frameStatus = "Not sent yet";
     char frameHost[128] = {};               // ssh target for the headset (frame-host.txt; default kFrameHost)
 
-    // Frame > Install on Steam Frame: Frame Home + environments, as the headset's environment
+    // Headset > Install on Steam Frame: Frame Home + environments, as the headset's environment
     bool showInstall = false;
     std::thread installer;
     std::atomic<bool> installing{false};
@@ -674,8 +674,7 @@ struct Studio {
     ImVec2 clickPos;
     bool clickArmed = false;
     bool gizmoWasUsing = false;
-    float outlinerW = 0, propertiesW = 0;
-    float explorerFrac = 0.58f;             // share of the right-hand column the explorer takes (the rest: properties)
+    float outlinerW = 0, propertiesW = 0;   // the Explorer (left) and the Inspector (right), dragged by their splitters
     std::vector<float> clip;                // selection wire: clip-space vertices of the selected mesh
     char filter[128] = {};
     std::set<int> collapsed;                // outliner groups the user folded
@@ -2107,7 +2106,7 @@ struct Studio {
         });
     }
 
-    // Frame > Send to Frame: the environment as it is now (saved or not), as one file, becomes the headset's current one.
+    // Headset > Send to Frame: the environment as it is now (saved or not), as one file, becomes the headset's current one.
     void sendToFrame() {
         if (!scene || sending || uploading) return;
         sendAsOneFile();
@@ -4093,10 +4092,11 @@ struct Studio {
             ImGui::TextDisabled("%s", walkSaved() ? "Walking: the walkable area saved with the home" : "Walking: the walkable area Frame Home works out at load");
             ImGui::EndMenu();
         }
-        if (ImGui::BeginMenu("Frame")) {
+        if (ImGui::BeginMenu("Headset")) {
             if (ImGui::MenuItem("Send to Frame", nullptr, false, scene != nullptr && !sending)) sendToFrame();
             ImGui::Separator();
             if (ImGui::MenuItem("Install on Steam Frame\u2026")) openInstall();
+            if (ImGui::MenuItem("Headset Panel")) showInspectorTab(InspectorTab::Headset);
             ImGui::EndMenu();
         }
         if (ImGui::BeginMenu("Debug")) {
@@ -4173,10 +4173,134 @@ struct Studio {
     }
 
     // Play / pause, the scrubber over the home's animation loop, the time, and the ambience mute.
-    void timeline(ImDrawList* dl, const ImVec2& end, float h) {
-        const ImVec2 a(viewPos.x, end.y - h);
-        dl->AddRectFilled(a, end, col(kBar, 0.85f));
-        dl->AddLine(a, ImVec2(end.x, a.y), col(0xffffff, 0.06f), 1.0f);
+    // ── The tool strip (left edge): the transform tools, Draw Floor, then how the gizmo and the view behave ──
+    enum class ToolIcon { Move, Rotate, Scale, DrawFloor, Global, Local, PlayerView, FrameAll };
+
+    // A small line icon in a square of side `size` centred on `c`.
+    void drawToolIcon(ImDrawList* dl, ToolIcon icon, ImVec2 c, float size, ImU32 color) {
+        const float r = size * 0.5f, t = std::max(1.0f, 1.6f * scale);
+        auto arrowHead = [&](ImVec2 tip, ImVec2 dir) {   // dir: unit vector the arrow points along
+            const float l = r * 0.32f;
+            const ImVec2 back(tip.x - dir.x * l, tip.y - dir.y * l), side(-dir.y * l * 0.7f, dir.x * l * 0.7f);
+            dl->AddTriangleFilled(tip, ImVec2(back.x + side.x, back.y + side.y), ImVec2(back.x - side.x, back.y - side.y), color);
+        };
+        switch (icon) {
+            case ToolIcon::Move: {
+                dl->AddLine(ImVec2(c.x - r * 0.8f, c.y), ImVec2(c.x + r * 0.8f, c.y), color, t);
+                dl->AddLine(ImVec2(c.x, c.y - r * 0.8f), ImVec2(c.x, c.y + r * 0.8f), color, t);
+                arrowHead(ImVec2(c.x + r, c.y), ImVec2(1, 0)); arrowHead(ImVec2(c.x - r, c.y), ImVec2(-1, 0));
+                arrowHead(ImVec2(c.x, c.y - r), ImVec2(0, -1)); arrowHead(ImVec2(c.x, c.y + r), ImVec2(0, 1));
+                break;
+            }
+            case ToolIcon::Rotate: {
+                dl->PathArcTo(c, r * 0.72f, -1.2f, 3.9f, 24);
+                dl->PathStroke(color, 0, t);
+                arrowHead(ImVec2(c.x + std::cos(-1.2f) * r * 0.72f, c.y + std::sin(-1.2f) * r * 0.72f), ImVec2(0.93f, 0.36f));
+                break;
+            }
+            case ToolIcon::Scale: {
+                dl->AddRect(ImVec2(c.x - r * 0.8f, c.y - r * 0.1f), ImVec2(c.x + r * 0.1f, c.y + r * 0.8f), color, 1.5f * scale, 0, t);
+                dl->AddLine(ImVec2(c.x - r * 0.1f, c.y + r * 0.1f), ImVec2(c.x + r * 0.7f, c.y - r * 0.7f), color, t);
+                arrowHead(ImVec2(c.x + r * 0.85f, c.y - r * 0.85f), ImVec2(0.707f, -0.707f));
+                break;
+            }
+            case ToolIcon::DrawFloor: {
+                dl->AddLine(ImVec2(c.x + r * 0.75f, c.y - r * 0.75f), ImVec2(c.x - r * 0.15f, c.y + r * 0.15f), color, t * 1.6f);
+                dl->AddCircleFilled(ImVec2(c.x - r * 0.4f, c.y + r * 0.4f), r * 0.32f, color);
+                dl->AddLine(ImVec2(c.x - r * 0.95f, c.y + r * 0.9f), ImVec2(c.x + r * 0.2f, c.y + r * 0.9f), color, t);
+                break;
+            }
+            case ToolIcon::Global: {
+                dl->AddCircle(c, r * 0.8f, color, 24, t);
+                dl->AddEllipse(c, ImVec2(r * 0.35f, r * 0.8f), color, 0, 20, t);
+                dl->AddLine(ImVec2(c.x - r * 0.8f, c.y), ImVec2(c.x + r * 0.8f, c.y), color, t);
+                break;
+            }
+            case ToolIcon::Local: {   // a little cube: its own axes
+                const float a = r * 0.55f, d = r * 0.3f;
+                dl->AddRect(ImVec2(c.x - a, c.y - a + d), ImVec2(c.x + a - d, c.y + a), color, 0, 0, t);
+                dl->AddLine(ImVec2(c.x - a, c.y - a + d), ImVec2(c.x - a + d, c.y - a), color, t);
+                dl->AddLine(ImVec2(c.x + a - d, c.y - a + d), ImVec2(c.x + a, c.y - a), color, t);
+                dl->AddLine(ImVec2(c.x + a - d, c.y + a), ImVec2(c.x + a, c.y + a - d), color, t);
+                dl->AddLine(ImVec2(c.x - a + d, c.y - a), ImVec2(c.x + a, c.y - a), color, t);
+                dl->AddLine(ImVec2(c.x + a, c.y - a), ImVec2(c.x + a, c.y + a - d), color, t);
+                break;
+            }
+            case ToolIcon::PlayerView: {   // a head and shoulders
+                dl->AddCircle(ImVec2(c.x, c.y - r * 0.35f), r * 0.3f, color, 16, t);
+                dl->PathArcTo(ImVec2(c.x, c.y + r * 0.85f), r * 0.65f, 3.4f, 6.02f, 16);
+                dl->PathStroke(color, 0, t);
+                break;
+            }
+            case ToolIcon::FrameAll: {   // four corners
+                const float a = r * 0.8f, l = r * 0.35f;
+                for (int sx = -1; sx <= 1; sx += 2)
+                    for (int sy = -1; sy <= 1; sy += 2) {
+                        const ImVec2 k(c.x + sx * a, c.y + sy * a);
+                        dl->AddLine(k, ImVec2(k.x - sx * l, k.y), color, t);
+                        dl->AddLine(k, ImVec2(k.x, k.y - sy * l), color, t);
+                    }
+                break;
+            }
+        }
+    }
+
+    // One square button of the strip; `on`: drawn as the active tool. True when clicked.
+    bool toolStripButton(const char* id, ToolIcon icon, bool on, const char* tip, uint32_t onColor = kBlue) {
+        const float side = 34 * scale;
+        const ImVec2 p = ImGui::GetCursorScreenPos();
+        ImGui::SetCursorScreenPos(ImVec2(p.x + 5 * scale, p.y));
+        const bool clicked = ImGui::InvisibleButton(id, ImVec2(side, side));
+        const bool hot = ImGui::IsItemHovered();
+        const ImVec2 a = ImGui::GetItemRectMin(), b = ImGui::GetItemRectMax();
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        if (on || hot) dl->AddRectFilled(a, b, col(on ? onColor : kToolHover), 6 * scale);
+        drawToolIcon(dl, icon, ImVec2((a.x + b.x) * 0.5f, (a.y + b.y) * 0.5f), side * 0.5f, col(on ? 0xffffff : hot ? kText : 0xb4b8be));
+        if (hot) ImGui::SetTooltip("%s", tip);
+        ImGui::SetCursorScreenPos(ImVec2(p.x, b.y + 4 * scale));
+        return clicked;
+    }
+
+    void toolStrip(float width, float height) {
+        ImGui::PushStyleColor(ImGuiCol_ChildBg, hex(kBar));
+        ImGui::BeginChild("toolStrip", ImVec2(width, height), ImGuiChildFlags_None, ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+        ImGui::PopStyleColor();
+        ImGui::SetCursorPosY(8 * scale);
+        ImGui::BeginDisabled(!scene);
+        if (toolStripButton("##tMove", ToolIcon::Move, tool == Tool::Move, "Move (G) \u00b7 hold Ctrl to snap")) tool = Tool::Move;
+        if (toolStripButton("##tRotate", ToolIcon::Rotate, tool == Tool::Rotate, "Rotate (R) \u00b7 hold Ctrl to snap 15\u00b0")) tool = Tool::Rotate;
+        if (toolStripButton("##tScale", ToolIcon::Scale, tool == Tool::Scale, "Scale (S) \u00b7 hold Ctrl to snap")) tool = Tool::Scale;
+        if (toolStripButton("##tFloor", ToolIcon::DrawFloor, tool == Tool::DrawFloor,
+                            "Draw Floor (B) \u00b7 select an object, then drag over it to draw walkable floor on it\n"
+                            "Shift+drag erases \u00b7 [ and ] size the brush", kGo))
+            tool = Tool::DrawFloor;
+        {   // a hairline between the tools and the view options
+            const ImVec2 p = ImGui::GetCursorScreenPos();
+            ImGui::GetWindowDrawList()->AddLine(ImVec2(p.x + 10 * scale, p.y + 2 * scale), ImVec2(p.x + width - 10 * scale, p.y + 2 * scale), col(kLine), 1.0f);
+            ImGui::SetCursorScreenPos(ImVec2(p.x, p.y + 8 * scale));
+        }
+        if (toolStripButton("##tSpace", localSpace ? ToolIcon::Local : ToolIcon::Global, false,
+                            localSpace ? "Gizmo: the object's own axes (click: the world's)" : "Gizmo: the world's axes (click: the object's own)"))
+            localSpace = !localSpace;
+        if (toolStripButton("##tPlayer", ToolIcon::PlayerView, false, "Player view (P or Numpad 0) \u00b7 from the middle of the home, at head height"))
+            cam.playerView();
+        if (toolStripButton("##tFrameAll", ToolIcon::FrameAll, false, "Frame everything (Home)")) frameAll();
+        ImGui::EndDisabled();
+        ImGui::EndChild();
+    }
+
+    // The timeline row under the 3D view: play / pause, the scrubber over the home's animation loop, the sound switch.
+    void timelineRow(const ImVec2& at, const ImVec2& size) {
+        ImGui::SetCursorScreenPos(at);
+        ImGui::BeginChild("timeline", size, ImGuiChildFlags_None, ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+        timeline(ImGui::GetWindowDrawList(), at, ImVec2(at.x + size.x, at.y + size.y));
+        ImGui::EndChild();
+    }
+
+    void timeline(ImDrawList* dl, const ImVec2& a, const ImVec2& end) {
+        const float h = end.y - a.y;
+        dl->AddRectFilled(a, end, col(kBar));
+        dl->AddLine(a, ImVec2(end.x, a.y), col(kSplit), 1.0f);
         const float pad = 8 * scale, bw = h - 2 * pad + 18 * scale;
         ImGui::SetCursorScreenPos(ImVec2(a.x + pad, a.y + pad * 0.6f));
         ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(6 * scale, 3 * scale));
@@ -4852,16 +4976,60 @@ struct Studio {
         ImGui::PopFont();
     }
 
-    void properties(float height) {
-        ImGui::BeginChild("properties", ImVec2(0, height), ImGuiChildFlags_AlwaysUseWindowPadding);
-        const float labelW = 78 * scale;
-        auto label = [&](const char* t) {
-            ImGui::AlignTextToFramePadding();
-            ImGui::TextDisabled("%s", t);
-            ImGui::SameLine(labelW);
-            ImGui::SetNextItemWidth(-1);
-        };
+    // ── The Inspector (right): the selection's and the environment's settings, one tab each ──
+    enum class InspectorTab { Selection, World, Environment, Sound, Headset };
+    InspectorTab inspectorTab = InspectorTab::Selection;
+    int lastSelected = -1, lastWorldKind = -1, lastWorldIndex = -1;   // selecting something new shows its tab
 
+    // A field's label, left of it, every field starting at the same column.
+    void fieldLabel(const char* text) {
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextDisabled("%s", text);
+        ImGui::SameLine(78 * scale);
+        ImGui::SetNextItemWidth(-1);
+    }
+
+    void inspector(float height) {
+        if (selected != lastSelected || wKind != lastWorldKind || wIndex != lastWorldIndex) {
+            if (selected >= 0 || wKind >= 0) inspectorTab = InspectorTab::Selection;
+            lastSelected = selected; lastWorldKind = wKind; lastWorldIndex = wIndex;
+        }
+        static const struct { InspectorTab tab; const char* name; const char* tip; } kTabs[] = {
+            {InspectorTab::Selection, "Selected", "The object or world item you selected"},
+            {InspectorTab::World, "World", "Where you can walk: the walkable area and its settings"},
+            {InspectorTab::Environment, "Environment", "Its name, picture, what it's made of, and its headset settings"},
+            {InspectorTab::Sound, "Sound", "Its ambience, and a background sound of your own"},
+            {InspectorTab::Headset, "Headset", "Send it to the Steam Frame, or install Frame Home there"},
+        };
+        ImGui::BeginChild("inspector", ImVec2(0, height), ImGuiChildFlags_AlwaysUseWindowPadding);
+        if (ImGui::BeginTabBar("##inspectorTabs", ImGuiTabBarFlags_FittingPolicyResizeDown)) {
+            for (const auto& t : kTabs) {
+                const bool force = inspectorTab == t.tab && forceInspectorTab;
+                if (ImGui::BeginTabItem(t.name, nullptr, force ? ImGuiTabItemFlags_SetSelected : 0)) {
+                    if (!forceInspectorTab) inspectorTab = t.tab;
+                    ImGui::EndTabItem();
+                }
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", t.tip);
+            }
+            ImGui::EndTabBar();
+        }
+        forceInspectorTab = false;
+        ImGui::BeginChild("inspectorBody", ImVec2(0, 0), ImGuiChildFlags_None);
+        switch (inspectorTab) {
+            case InspectorTab::Selection: selectionTab(); break;
+            case InspectorTab::World: worldTab(); break;
+            case InspectorTab::Environment: environmentTab(); break;
+            case InspectorTab::Sound: soundTab(); break;
+            case InspectorTab::Headset: headsetTab(); break;
+        }
+        ImGui::EndChild();
+        ImGui::EndChild();
+    }
+    bool forceInspectorTab = false;         // inspectorTab was set in code: the tab bar shows it
+    void showInspectorTab(InspectorTab t) { inspectorTab = t; forceInspectorTab = true; }
+
+    // Selected: the world item or object picked in the view or the Explorer.
+    void selectionTab() {
         if (scene && wKind >= 0 && wIndex >= 0 && wIndex < worldCount(wKind)) {
             section("WORLD ITEM");
             ImGui::TextUnformatted(worldName(wKind, wIndex).c_str());
@@ -4883,20 +5051,20 @@ struct Studio {
             if (WorldPoint* pt = worldPoint(wKind, wIndex)) {
                 char nm[128];
                 std::snprintf(nm, sizeof nm, "%s", pt->name.c_str());
-                label("Name");
+                fieldLabel("Name");
                 if (ImGui::InputText("##wname", nm, sizeof nm)) { pt->name = nm; changed = true; }
                 track();
-                label("Position");
+                fieldLabel("Position");
                 ImGui::DragFloat3("##wpos", pt->pos, 0.01f, 0, 0, "%.2f m"); track();
                 float deg = pt->yaw * 180.0f / kPi;
-                label("Facing");
+                fieldLabel("Facing");
                 if (ImGui::DragFloat("##wyaw", &deg, 1.0f, -360, 360, "%.0f\u00b0")) pt->yaw = deg * kPi / 180.0f;
                 track();
-                if (wKind == kSeat) { label("Stand up at"); ImGui::DragFloat3("##wexit", pt->exit, 0.01f, 0, 0, "%.2f m"); track(); }
+                if (wKind == kSeat) { fieldLabel("Stand up at"); ImGui::DragFloat3("##wexit", pt->exit, 0.01f, 0, 0, "%.2f m"); track(); }
             } else if (wKind == kCollider) {
                 WorldCollider& c = scene->world.colliders[wIndex];
                 static const char* kinds[] = {"Box", "Sphere", "Capsule", "Mesh"};
-                label("Role");
+                fieldLabel("Role");
                 static const char* roles[4] = {"Surface", "Collider", "Walk through", "Drawn floor"};
                 static const int roleOf[4] = {WorldCollider::Solid, WorldCollider::Object, WorldCollider::Trigger, WorldCollider::Walkable};
                 int role = c.role == WorldCollider::Trigger ? 2 : c.role == WorldCollider::Object ? 1 : c.role == WorldCollider::Walkable ? 3 : 0;
@@ -4908,7 +5076,7 @@ struct Studio {
                 ImGui::PushTextWrapPos(0);
                 ImGui::TextDisabled("%s", kRoleHelp[std::clamp(c.role, 0, 5)]);
                 ImGui::PopTextWrapPos();
-                label("Shape");
+                fieldLabel("Shape");
                 ImGui::Text("%s%s", kinds[std::clamp(c.kind, 0, 3)],
                             c.kind == WorldCollider::Mesh ? (" \u00b7 " + std::to_string(c.indices.size() / 3) + " triangles").c_str() : "");
                 if (!c.mesh.empty()) {
@@ -4921,38 +5089,38 @@ struct Studio {
                     float t[3], r[3], sc[3];
                     ImGuizmo::DecomposeMatrixToComponents(c.world, t, r, sc);
                     bool moved = false;
-                    label("Location"); moved |= ImGui::DragFloat3("##wloc", t, 0.01f, 0, 0, "%.2f m"); track();
-                    label("Rotation"); moved |= ImGui::DragFloat3("##wrot", r, 0.5f, 0, 0, "%.0f\u00b0"); track();
-                    if (c.kind == WorldCollider::Mesh) { label("Scale"); moved |= ImGui::DragFloat3("##wscl", sc, 0.01f, 0.01f, 1000.0f, "%.2f"); track(); }
+                    fieldLabel("Location"); moved |= ImGui::DragFloat3("##wloc", t, 0.01f, 0, 0, "%.2f m"); track();
+                    fieldLabel("Rotation"); moved |= ImGui::DragFloat3("##wrot", r, 0.5f, 0, 0, "%.0f\u00b0"); track();
+                    if (c.kind == WorldCollider::Mesh) { fieldLabel("Scale"); moved |= ImGui::DragFloat3("##wscl", sc, 0.01f, 0.01f, 1000.0f, "%.2f"); track(); }
                     if (moved) ImGuizmo::RecomposeMatrixFromComponents(t, r, sc, c.world);
                     if (c.kind == WorldCollider::Box) {
                         float size[3] = {c.half[0] * 2, c.half[1] * 2, c.half[2] * 2};
-                        label("Size");
+                        fieldLabel("Size");
                         if (ImGui::DragFloat3("##wsize", size, 0.01f, 0.02f, 200.0f, "%.2f m")) for (int k = 0; k < 3; ++k) c.half[k] = std::max(0.01f, size[k] * 0.5f);
                         track();
                     }
-                    if (c.kind == WorldCollider::Sphere || c.kind == WorldCollider::Capsule) { label("Radius"); ImGui::DragFloat("##wrad", &c.radius, 0.01f, 0.01f, 50.0f, "%.2f m"); track(); }
-                    if (c.kind == WorldCollider::Capsule) { label("Length"); ImGui::DragFloat("##wlen", &c.length, 0.01f, 0.0f, 50.0f, "%.2f m"); track(); }
+                    if (c.kind == WorldCollider::Sphere || c.kind == WorldCollider::Capsule) { fieldLabel("Radius"); ImGui::DragFloat("##wrad", &c.radius, 0.01f, 0.01f, 50.0f, "%.2f m"); track(); }
+                    if (c.kind == WorldCollider::Capsule) { fieldLabel("Length"); ImGui::DragFloat("##wlen", &c.length, 0.01f, 0.0f, 50.0f, "%.2f m"); track(); }
                 }
             } else if (wKind == kWallSpot) {
                 WorldWallSpot& ws = scene->world.wallSpots[wIndex];
                 float t[3], r[3], sc[3];
                 ImGuizmo::DecomposeMatrixToComponents(ws.world, t, r, sc);
                 bool moved = false;
-                label("Location"); moved |= ImGui::DragFloat3("##wsloc", t, 0.01f, 0, 0, "%.2f m"); track();
-                label("Rotation"); moved |= ImGui::DragFloat3("##wsrot", r, 0.5f, 0, 0, "%.0f\u00b0"); track();
+                fieldLabel("Location"); moved |= ImGui::DragFloat3("##wsloc", t, 0.01f, 0, 0, "%.2f m"); track();
+                fieldLabel("Rotation"); moved |= ImGui::DragFloat3("##wsrot", r, 0.5f, 0, 0, "%.0f\u00b0"); track();
                 if (moved) { sc[0] = sc[1] = sc[2] = 1; ImGuizmo::RecomposeMatrixFromComponents(t, r, sc, ws.world); }
-                label("Width"); ImGui::DragFloat("##wwid", &ws.width, 0.01f, 0.1f, 20.0f, "%.2f m"); track();
-                label("Height"); ImGui::DragFloat("##whei", &ws.height, 0.01f, 0.1f, 20.0f, "%.2f m"); track();
+                fieldLabel("Width"); ImGui::DragFloat("##wwid", &ws.width, 0.01f, 0.1f, 20.0f, "%.2f m"); track();
+                fieldLabel("Height"); ImGui::DragFloat("##whei", &ws.height, 0.01f, 0.1f, 20.0f, "%.2f m"); track();
             }
             if (wKind == kGravity) {
                 WorldGravity& g = scene->world.gravity[wIndex];
                 char nm[128];
                 std::snprintf(nm, sizeof nm, "%s", g.name.c_str());
-                label("Name");
+                fieldLabel("Name");
                 if (ImGui::InputText("##gname", nm, sizeof nm)) { g.name = nm; changed = true; }
                 track();
-                label("Kind");
+                fieldLabel("Kind");
                 int kind = std::clamp(g.kind, 0, 2);
                 if (ImGui::Combo("##gkind", &kind, kGravityNames, 3) && kind != g.kind) { before = std::make_shared<HomeWorld>(scene->world); g.kind = kind; changed = true; }
                 ImGui::PushTextWrapPos(0);
@@ -4961,17 +5129,17 @@ struct Studio {
                 float t[3], r[3], sc[3];
                 ImGuizmo::DecomposeMatrixToComponents(g.world, t, r, sc);
                 bool moved = false;
-                label(g.kind == WorldGravity::Planet ? "Centre" : "Location"); moved |= ImGui::DragFloat3("##gloc", t, 0.01f, 0, 0, "%.2f m"); track();
-                if (g.kind != WorldGravity::Planet) { label("Rotation"); moved |= ImGui::DragFloat3("##grot", r, 0.5f, 0, 0, "%.0f\u00b0"); track(); }
+                fieldLabel(g.kind == WorldGravity::Planet ? "Centre" : "Location"); moved |= ImGui::DragFloat3("##gloc", t, 0.01f, 0, 0, "%.2f m"); track();
+                if (g.kind != WorldGravity::Planet) { fieldLabel("Rotation"); moved |= ImGui::DragFloat3("##grot", r, 0.5f, 0, 0, "%.0f\u00b0"); track(); }
                 if (moved) { sc[0] = sc[1] = sc[2] = 1; ImGuizmo::RecomposeMatrixFromComponents(t, r, sc, g.world); }
-                if (g.kind == WorldGravity::Planet) { label("Pull radius"); ImGui::DragFloat("##grad", &g.radius, 0.1f, 0.5f, 5000.0f, "%.1f m"); track(); }
+                if (g.kind == WorldGravity::Planet) { fieldLabel("Pull radius"); ImGui::DragFloat("##grad", &g.radius, 0.1f, 0.5f, 5000.0f, "%.1f m"); track(); }
                 else {
                     float size[3] = {g.half[0] * 2, g.half[1] * 2, g.half[2] * 2};
-                    label("Size");
+                    fieldLabel("Size");
                     if (ImGui::DragFloat3("##gsize", size, 0.05f, 0.2f, 5000.0f, "%.1f m")) for (int k = 0; k < 3; ++k) g.half[k] = std::max(0.1f, size[k] * 0.5f);
                     track();
                 }
-                label("Priority"); ImGui::DragInt("##gpri", &g.priority, 0.1f, -100, 100); track();
+                fieldLabel("Priority"); ImGui::DragInt("##gpri", &g.priority, 0.1f, -100, 100); track();
                 if (ImGui::IsItemHovered()) ImGui::SetTooltip("Where zones overlap, the higher priority one decides down.");
             }
             if (bool* hid = worldHidden(wKind, wIndex)) {
@@ -5008,15 +5176,15 @@ struct Studio {
             ImGuizmo::DecomposeMatrixToComponents(o.pivot, t, r, s);
             bool changed = false;
             bool done = false;              // a field let go: its surfaces split again if it turned
-            label("Location");
+            fieldLabel("Location");
             changed |= ImGui::DragFloat3("##loc", t, 0.01f, 0, 0, "%.3f m");
             if (ImGui::IsItemActivated()) pushUndo(selected);
             done |= ImGui::IsItemDeactivatedAfterEdit();
-            label("Rotation");
+            fieldLabel("Rotation");
             changed |= ImGui::DragFloat3("##rot", r, 0.5f, 0, 0, "%.1f\u00b0");
             if (ImGui::IsItemActivated()) pushUndo(selected);
             done |= ImGui::IsItemDeactivatedAfterEdit();
-            label("Scale");
+            fieldLabel("Scale");
             changed |= ImGui::DragFloat3("##scl", s, 0.01f, 0.001f, 1000.0f, "%.3f");
             if (ImGui::IsItemActivated()) pushUndo(selected);
             done |= ImGui::IsItemDeactivatedAfterEdit();
@@ -5108,22 +5276,30 @@ struct Studio {
             if (ImGui::Button("Delete")) deleteSelected();
             ImGui::PopStyleColor(3);
         } else {
-            ImGui::TextDisabled(scene ? "Click an object in the viewport\nor the outliner." : "Open a home to start.");
+            ImGui::TextDisabled(scene ? "Nothing selected.\nClick an object in the 3D view or the Explorer." : "Open a home to start.");
         }
 
+    }
+
+    // World: the walkable area, as Frame Home walks it.
+    void worldTab() {
         section("WALKABLE AREA");
         walkPanel();
 
+    }
+
+    // Environment: its name and picture, what it's made of, saving, and its own headset settings.
+    void environmentTab() {
         section("ENVIRONMENT");
         if (scene) {
-            label("Name");
+            fieldLabel("Name");
             {
                 char nb[128];
                 std::snprintf(nb, sizeof nb, "%s", envTitle.c_str());
                 if (ImGui::InputTextWithHint("##envname", homeName.c_str(), nb, sizeof nb)) { envTitle = nb; dirty = true; updateTitle(); }
                 if (ImGui::IsItemHovered()) ImGui::SetTooltip("What it's called on the headset (Environments panel) and in a saved .fenv");
             }
-            label("Picture");
+            fieldLabel("Picture");
             if (ImGui::Button(envImage.empty() ? "Choose\u2026##envimg" : "Change\u2026##envimg")) chooseImage();
             if (ImGui::IsItemHovered()) ImGui::SetTooltip("Its picture on the headset (Environments panel); without one, a view of it is taken when it's saved");
             if (!envImage.empty()) {
@@ -5152,31 +5328,16 @@ struct Studio {
             for (const Object& o : objects) { if (o.deleted) ++deleted; else if (o.hidden) ++hidden; else ++live; }
             for (const MeshData& md : scene->meshes) lightmapped += md.hasLightmap;
             const bool clay = scene->animate != nullptr;
-            label("Objects");
+            fieldLabel("Objects");
             ImGui::Text("%zu shown, %zu hidden, %zu deleted", live, hidden, deleted);
-            label("Shaders");
+            fieldLabel("Shaders");
             ImGui::Text(clay ? "built-in unlit (Clay)" : "%zu of the home's own", scene->programs.size());
-            label("Lighting");
+            fieldLabel("Lighting");
             ImGui::Text("%s", lightmapped ? (std::to_string(lightmapped) + " baked lightmaps").c_str()
                                           : clay ? "baked into textures" : scene->hasEnvAmbient ? "light probes" : "estimated ambient");
-            label("Animation");
+            fieldLabel("Animation");
             if (clay) ImGui::Text("%zu animated objects, %.0f s loop", scene->animatedMeshes.size(), scene->animDuration);
             else ImGui::Text("%zu rigs + shader motion", scene->anims.size());
-            label("Sound");
-            ImGui::Text("%s", scene->ambientSource.empty() ? "none of its own" : scene->ambientSource == "FMOD bank" ? "FMOD bank (ambience bed)" : "Ogg loop");
-            soundPanel();
-            {   // the sounds it uses, to keep: the home's own ambience (an Ogg file) and the one added to it
-                const bool own = scene && !scene->ambientOgg.empty();
-                ImGui::BeginDisabled(!own);
-                if (ImGui::Button("Save Its Sound\u2026")) saveSoundAs(scene->ambientOgg, (scene->ambientName.empty() ? shownName() + " ambience" : scene->ambientName) + ".ogg");
-                ImGui::EndDisabled();
-                if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-                    ImGui::SetTooltip("%s", own ? "The home's own ambience as it plays (Ogg Vorbis)" : "This home has no sound of its own");
-                if (sound.bytes) {
-                    ImGui::SameLine();
-                    if (ImGui::Button("Save the Added Sound\u2026")) saveSoundAs(*sound.bytes, sound.name.empty() ? sound.s.file : sound.name);
-                }
-            }
             ImGui::Spacing();
             ImGui::BeginDisabled(!dirty);
             if (ImGui::Button(envFile.empty() ? "Save to My Environments" : "Save")) saveToLibrary();
@@ -5198,7 +5359,7 @@ struct Studio {
             ImGui::PushTextWrapPos(0);
             ImGui::TextDisabled("On the headset it uses %s", worldSettings.describe().c_str());
             ImGui::PopTextWrapPos();
-            label("Resolution");
+            fieldLabel("Resolution");
             {
                 static const float kRes[] = {0, 0.8f, 0.9f, 1.0f, 1.1f, 1.2f, 1.3f, 1.4f, 1.5f};
                 char cur[32];
@@ -5212,7 +5373,7 @@ struct Studio {
                     ImGui::EndCombo();
                 }
             }
-            label("Foveation");
+            fieldLabel("Foveation");
             {
                 bool own = worldSettings.foveation > 0;
                 if (ImGui::Checkbox("##wsfovown", &own)) worldSettings.foveation = own ? 1.0f : 0.0f;
@@ -5226,7 +5387,7 @@ struct Studio {
                 if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
                     ImGui::SetTooltip("1 gentle .. 3 strong: where you look stays sharp, the edges of view get coarser (cheaper)");
             }
-            label("MSAA");
+            fieldLabel("MSAA");
             {
                 static const int kMsaa[] = {0, 1, 2, 4};
                 static const char* kMsaaNames[] = {"The headset's", "Off", "2x", "4x"};
@@ -5235,7 +5396,7 @@ struct Studio {
                 if (ImGui::Combo("##wsmsaa", &at, kMsaaNames, 4)) worldSettings.msaa = kMsaa[at];
                 if (ImGui::IsItemHovered()) ImGui::SetTooltip("Different from the headset's: Frame Home restarts itself to show this world");
             }
-            label("Frame rate");
+            fieldLabel("Frame rate");
             {
                 static const char* kRates[] = {"The headset's", "Full", "Half"};
                 int at = worldSettings.frameRate + 1;
@@ -5247,9 +5408,9 @@ struct Studio {
             if (ImGui::Button(tuning ? "Calculating\u2026" : "Calculate Best Settings")) calculateBestSettings();
             ImGui::EndDisabled();
             if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-                ImGui::SetTooltip("On the headset: walks through the world at a few settings, counts what each frame costs the GPU, and keeps\n"
-                                  "the sharpest that leaves room (for heat and the views the walk missed). Your resolution and MSAA stay;\n"
-                                  "foveation moves first. Takes a few minutes; the headset cools between tries.");
+                ImGui::SetTooltip("On the headset: walks through the world at 120 Hz at a few settings and keeps the sharpest one that holds\n"
+                                  "its frame rate (at most 1%% of frames late). Your MSAA stays; foveation moves first, then resolution.\n"
+                                  "Takes a few minutes; the headset cools between tries.");
             ImGui::SameLine();
             ImGui::BeginDisabled(worldSettings.empty() && worldSettings.tuned.empty());
             if (ImGui::Button("Use Headset Settings")) { worldSettings = WorldSettings(); setTuneStatus(""); dirty = true; updateTitle(); }
@@ -5265,6 +5426,31 @@ struct Studio {
             }
         }
 
+    }
+
+    // Sound: the home's own ambience and a background sound added to it.
+    void soundTab() {
+        if (!scene) { ImGui::TextDisabled("Open a home to start."); return; }
+        section("SOUND");
+        fieldLabel("Sound");
+        ImGui::Text("%s", scene->ambientSource.empty() ? "none of its own" : scene->ambientSource == "FMOD bank" ? "FMOD bank (ambience bed)" : "Ogg loop");
+        soundPanel();
+        {   // the sounds it uses, to keep: the home's own ambience (an Ogg file) and the one added to it
+            const bool own = scene && !scene->ambientOgg.empty();
+            ImGui::BeginDisabled(!own);
+            if (ImGui::Button("Save Its Sound\u2026")) saveSoundAs(scene->ambientOgg, (scene->ambientName.empty() ? shownName() + " ambience" : scene->ambientName) + ".ogg");
+            ImGui::EndDisabled();
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                ImGui::SetTooltip("%s", own ? "The home's own ambience as it plays (Ogg Vorbis)" : "This home has no sound of its own");
+            if (sound.bytes) {
+                ImGui::SameLine();
+                if (ImGui::Button("Save the Added Sound\u2026")) saveSoundAs(*sound.bytes, sound.name.empty() ? sound.s.file : sound.name);
+            }
+        }
+    }
+
+    // Headset: send the environment to the Steam Frame, or install Frame Home there.
+    void headsetTab() {
         section("STEAM FRAME");
         ImGui::TextDisabled("ssh %s  \u2192  ~/%s", frameHost, kFrameEnvDir);
         ImGui::Spacing();
@@ -5277,8 +5463,8 @@ struct Studio {
         ImGui::TextDisabled("%s", status().c_str());
         ImGui::PopTextWrapPos();
         if (ImGui::Button("Install on Steam Frame\u2026", ImVec2(-1, 0))) openInstall();
-        ImGui::EndChild();
     }
+
 
     // Vertical splitter between panels; dragging changes `width` (sign: +1 grows with the mouse, -1 shrinks).
     void splitter(const char* id, float& width, float sign, float height) {
@@ -5787,7 +5973,7 @@ struct Studio {
                                    ImGuiButtonFlags_MouseButtonLeft | ImGuiButtonFlags_MouseButtonRight | ImGuiButtonFlags_MouseButtonMiddle);
             overView = ImGui::IsItemHovered();
         }
-        const float tlH = 34 * scale;                   // the timeline strip along the bottom edge
+        const float tlH = 0;                            // (the timeline has its own row under the view)
         const bool overTimeline = scene && io.MousePos.y >= viewPos.y + viewSize.y - tlH && io.MousePos.y <= viewPos.y + viewSize.y &&
                                   io.MousePos.x >= viewPos.x && io.MousePos.x <= viewPos.x + viewSize.x;
         const bool hovered = overView && !overTimeline;
@@ -5865,7 +6051,6 @@ struct Studio {
         }
         if (scene) drawWorld(dl, viewProj);
         if (scene) drawAxes(dl, view);
-        if (scene) timeline(dl, end, tlH);
         if (scene && isolating) {   // say why everything else vanished, and how to get it back
             const char* msg = "Showing only the selection  \u00b7  I or Esc shows everything";
             const ImVec2 ts = ImGui::CalcTextSize(msg);
@@ -6048,68 +6233,17 @@ struct Studio {
             }
         }
 
-        // Tool strip (top-left), Blender's toolbar position: the tools as one segmented group on a dark backing.
+        // Draw Floor's brush size, over the view's top-left corner while that tool is on.
+        if (scene && tool == Tool::DrawFloor) {
+            const ImVec2 at(viewPos.x + 10 * scale, viewPos.y + 10 * scale);
+            const float w = 180 * scale;
+            dl->AddRectFilled(at, ImVec2(at.x + w + 8 * scale, at.y + ImGui::GetFrameHeight() + 8 * scale), col(kBar, 0.85f), 6 * scale);
+            ImGui::SetCursorScreenPos(ImVec2(at.x + 4 * scale, at.y + 4 * scale));
+            ImGui::SetNextItemWidth(w);
+            ImGui::SliderFloat("##brush", &floorBrush, 0.05f, 3.0f, "brush %.2f m", ImGuiSliderFlags_Logarithmic);
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Brush size \u00b7 [ and ] change it \u00b7 Shift+drag erases");
+        }
         if (scene) {
-            const ImVec2 stripAt(viewPos.x + 10 * scale, viewPos.y + 10 * scale), stripPad(4 * scale, 4 * scale);
-            ImGui::SetCursorScreenPos(ImVec2(stripAt.x + stripPad.x, stripAt.y + stripPad.y));
-            dl->ChannelsSplit(2);               // the buttons on top, the backing (sized once they're laid out) under them
-            dl->ChannelsSetCurrent(1);
-            ImVec2 stripEnd = stripAt;
-            auto grow = [&]() { stripEnd.x = std::max(stripEnd.x, ImGui::GetItemRectMax().x); stripEnd.y = std::max(stripEnd.y, ImGui::GetItemRectMax().y); };
-            auto toolButton = [&](const char* label, Tool t, const char* tip) {
-                const bool on = tool == t;
-                ImGui::PushStyleColor(ImGuiCol_Button, on ? hex(kBlue) : hex(kToolBg, 0.92f));
-                ImGui::PushStyleColor(ImGuiCol_ButtonHovered, on ? hex(kBlueHover) : hex(kToolHover, 0.95f));
-                if (ImGui::Button(label, ImVec2(64 * scale, 0))) tool = t;
-                ImGui::PopStyleColor(2);
-                grow();
-                if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", tip);
-            };
-            toolButton("Move", Tool::Move, "G \u00b7 hold Ctrl to snap");
-            ImGui::SameLine(0, 2 * scale);
-            toolButton("Rotate", Tool::Rotate, "R \u00b7 hold Ctrl to snap 15\u00b0");
-            ImGui::SameLine(0, 2 * scale);
-            toolButton("Scale", Tool::Scale, "S \u00b7 hold Ctrl to snap");
-            ImGui::SameLine(0, 2 * scale);
-            ImGui::PushID("drawfloor");
-            {
-                const bool on = tool == Tool::DrawFloor;
-                ImGui::PushStyleColor(ImGuiCol_Button, on ? hex(kGo) : hex(kToolBg, 0.92f));
-                ImGui::PushStyleColor(ImGuiCol_ButtonHovered, on ? hex(kGoHover) : hex(kToolHover, 0.95f));
-                if (ImGui::Button("Draw Floor", ImVec2(84 * scale, 0))) tool = Tool::DrawFloor;
-                ImGui::PopStyleColor(2);
-                grow();
-                if (ImGui::IsItemHovered())
-                    ImGui::SetTooltip("B \u00b7 select an object, then drag over it to draw walkable floor on it\nShift+drag erases \u00b7 [ and ] size the brush");
-                if (on) {
-                    ImGui::SameLine(0, 4 * scale);
-                    ImGui::SetNextItemWidth(110 * scale);
-                    ImGui::SliderFloat("##brush", &floorBrush, 0.05f, 3.0f, "brush %.2f m", ImGuiSliderFlags_Logarithmic);
-                    grow();
-                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Brush size \u00b7 [ and ] change it");
-                }
-            }
-            ImGui::PopID();
-            ImGui::SameLine(0, 8 * scale);
-            {   // a hairline between the tools and the view options
-                const ImVec2 c = ImGui::GetCursorScreenPos();
-                dl->AddLine(ImVec2(c.x - 4 * scale, c.y + 3 * scale), ImVec2(c.x - 4 * scale, c.y + ImGui::GetFrameHeight() - 3 * scale), col(kLine), 1.0f);
-            }
-            ImGui::PushStyleColor(ImGuiCol_Button, hex(kToolBg, 0.92f));
-            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, hex(kToolHover, 0.95f));
-            if (ImGui::Button(localSpace ? "Local" : "Global", ImVec2(64 * scale, 0))) localSpace = !localSpace;
-            grow();
-            if (ImGui::IsItemHovered()) ImGui::SetTooltip(localSpace ? "The gizmo follows the object's own axes (click: the world's)"
-                                                                     : "The gizmo follows the world's axes (click: the object's own)");
-            ImGui::SameLine(0, 2 * scale);
-            if (ImGui::Button("Player View")) cam.playerView();
-            grow();
-            if (ImGui::IsItemHovered()) ImGui::SetTooltip("P or Numpad 0 \u00b7 the view from the middle of the home, at head height");
-            ImGui::PopStyleColor(2);
-            dl->ChannelsSetCurrent(0);
-            dl->AddRectFilled(stripAt, ImVec2(stripEnd.x + stripPad.x, stripEnd.y + stripPad.y), col(kBar, 0.82f), 8 * scale);
-            dl->AddRect(stripAt, ImVec2(stripEnd.x + stripPad.x, stripEnd.y + stripPad.y), col(0xffffff, 0.06f), 8 * scale, 0, 1.0f);
-            dl->ChannelsMerge();
             if (flying) {
                 char b[64];
                 std::snprintf(b, sizeof b, "Fly \u00b7 %.1f m/s (wheel)", flySpeed);
@@ -6214,15 +6348,18 @@ struct Studio {
         ImGui::PopStyleVar(3);
     }
 
+    // The window, as an editor dock: the menu bar; the tool strip, the Explorer, the 3D view and the Inspector side by
+    // side; the timeline and the status bar along the bottom.
     void ui() {
-        if (outlinerW == 0) { outlinerW = 270 * scale; propertiesW = 340 * scale; }
+        if (outlinerW == 0) { outlinerW = 270 * scale; propertiesW = 360 * scale; }
         shortcuts();
         menuBar();
         ImGuiIO& io = ImGui::GetIO();
         const float top = ImGui::GetFrameHeight(), barH = ImGui::GetFrameHeight();
-        const float h = io.DisplaySize.y - top - barH;
+        const float timelineH = scene ? 34 * scale : 0.0f;
+        const float h = io.DisplaySize.y - top - barH - timelineH;
         ImGui::SetNextWindowPos(ImVec2(0, top));
-        ImGui::SetNextWindowSize(ImVec2(io.DisplaySize.x, h));
+        ImGui::SetNextWindowSize(ImVec2(io.DisplaySize.x, h + timelineH));
         ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
         ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(0, 0));
         ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0);
@@ -6230,31 +6367,34 @@ struct Studio {
         ImGui::Begin("##main", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoSavedSettings |
                                         ImGuiWindowFlags_NoBringToFrontOnFocus | ImGuiWindowFlags_NoScrollWithMouse | ImGuiWindowFlags_NoNav);
         ImGui::PopStyleVar(4);
-        const float split = 4 * scale;
-        // Viewport on the left; the right-hand column stacks the explorer over the selected object's properties.
-        const float viewW = std::max(64.0f, io.DisplaySize.x - propertiesW - split);
+        const float split = 4 * scale, stripW = 44 * scale;
+        // never narrower than this, whatever the splitters say
+        outlinerW = std::clamp(outlinerW, 180 * scale, std::max(180 * scale, io.DisplaySize.x * 0.35f));
+        propertiesW = std::clamp(propertiesW, 260 * scale, std::max(260 * scale, io.DisplaySize.x * 0.4f));
+        const float viewW = std::max(64.0f, io.DisplaySize.x - stripW - outlinerW - propertiesW - 2 * split);
+        toolStrip(stripW, h);
+        ImGui::SameLine(0, 0);
+        ImGui::BeginChild("explorerColumn", ImVec2(outlinerW, h), ImGuiChildFlags_None, ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(8 * scale, 8 * scale));
+        outliner(h);
+        ImGui::PopStyleVar();
+        ImGui::EndChild();
+        ImGui::SameLine(0, 0);
+        splitter("##s1", outlinerW, +1, h);
+        ImGui::SameLine(0, 0);
         viewport(viewW, h);
         ImGui::SameLine(0, 0);
         splitter("##s2", propertiesW, -1, h);
         ImGui::SameLine(0, 0);
-        ImGui::BeginChild("side", ImVec2(0, h), ImGuiChildFlags_None, ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
-        const float explorerH = std::clamp(h * explorerFrac, 120 * scale, h - 160 * scale);
-        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(8 * scale, 8 * scale));
-        outliner(explorerH);
-        ImGui::PopStyleVar();
-        {   // horizontal splitter: drag to give the explorer or the properties more room
-            ImGui::InvisibleButton("##hs", ImVec2(-1, split));
-            if (ImGui::IsItemHovered() || ImGui::IsItemActive()) ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeNS);
-            if (ImGui::IsItemActive()) explorerFrac = std::clamp(explorerFrac + ImGui::GetIO().MouseDelta.y / h, 0.15f, 0.85f);
-            ImGui::GetWindowDrawList()->AddRectFilled(ImGui::GetItemRectMin(), ImGui::GetItemRectMax(), col(ImGui::IsItemActive() ? kBlue : kSplit));
-        }
+        ImGui::BeginChild("inspectorColumn", ImVec2(0, h), ImGuiChildFlags_None, ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
         ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(10 * scale, 8 * scale));
         ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(6 * scale, 5 * scale));
-        properties(h - explorerH - split);
+        inspector(h);
         ImGui::PopStyleVar(2);
         ImGui::EndChild();
+        if (scene) timelineRow(ImVec2(0, top + h), ImVec2(io.DisplaySize.x, timelineH));
         ImGui::End();
-        statusBar(top + h, barH);
+        statusBar(top + h + timelineH, barH);
         controlsWindow();
         installWindow();
         settingsWindow();
@@ -6265,7 +6405,7 @@ struct Studio {
         autoSummaryWindow();
     }
 
-    // ── Frame > Install on Steam Frame ──
+    // ── Headset > Install on Steam Frame ──
     // Puts Frame Home on the headset as its environment: SteamVR's home-app slot, which SteamVR itself runs whenever
     // no game is running (in place of the default environment, not as a game or an extra app), plus the chosen
     // environments. The headset side is frame\install.sh beside this exe, with Frame Home's arm64 binaries.

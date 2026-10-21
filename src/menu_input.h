@@ -4,10 +4,20 @@
 // always runs, takes the sticks through a global-priority action set (steamvr.globalActionSetPriority) whenever the
 // menu is up, Frame Home is the environment, and that hand isn't pointing at a panel, and passes them to Frame Home
 // through a shared page (/dev/shm/framehome-sticks). Pointing at the menu still drives the menu.
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#endif
 
 #include <atomic>
 #include <chrono>
@@ -27,6 +37,16 @@ struct MenuSticks {
 
 inline double menuNow() { return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
 
+#ifdef _WIN32
+// (Windows: a named mapping; kept open for the process's life, as the Linux one stays mapped)
+inline MenuSticks* menuSticksMap(bool create) {
+    const HANDLE h = create ? CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, sizeof(MenuSticks), L"Local\\FrameHomeSticks")
+                            : OpenFileMappingW(FILE_MAP_ALL_ACCESS, FALSE, L"Local\\FrameHomeSticks");
+    if (!h) return nullptr;
+    void* p = MapViewOfFile(h, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(MenuSticks));
+    return static_cast<MenuSticks*>(p);
+}
+#else
 inline MenuSticks* menuSticksMap(bool create) {
     const int fd = open("/dev/shm/framehome-sticks", O_RDWR | (create ? O_CREAT : 0), 0600);
     if (fd < 0) return nullptr;
@@ -37,6 +57,7 @@ inline MenuSticks* menuSticksMap(bool create) {
     close(fd);
     return p == MAP_FAILED ? nullptr : static_cast<MenuSticks*>(p);
 }
+#endif
 
 // A consistent copy (seqlock); false when there is nothing recent (within maxAge seconds).
 inline bool menuSticksRead(const MenuSticks* m, MenuSticks& out, double maxAge = 0.15) {

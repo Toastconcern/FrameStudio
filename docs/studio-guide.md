@@ -160,6 +160,8 @@ The **Headset** tab (or the **Headset** menu):
 - **Send to Frame** makes the open environment the headset's current one, saved or not.
 - **Install Frame Home** puts Frame Home itself on the headset, with the environments and bundles you list under
   **Environments to install**. **Restore SteamVR's Environment** takes it off again.
+- **This PC** (Windows and Linux): **Install Frame Home on This PC** makes your environments SteamVR's environment on
+  the computer Studio runs on. See [pc-steamvr.md](pc-steamvr.md).
 - The **Headset** field is the headset's address: an SSH alias such as `frame`, or `steamos@<address>`.
   See [headset-setup.md](headset-setup.md) and [install-frame-home.md](install-frame-home.md).
 

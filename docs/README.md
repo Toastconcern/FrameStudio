@@ -10,5 +10,6 @@
 | [Performance](performance.md) | How Frame Home reaches 120 fps, checking it, fixing stutter, Studio's own pacing |
 | [Frame Studio guide](studio-guide.md) | The Studio window, tools and panels |
 | [Bundles](bundles.md) | Several environments in one `.fbundle` file |
+| [Frame Home on a PC](pc-steamvr.md) | Your homes as SteamVR's environment on a Windows or Linux PC |
 | [Building from source](building.md) | Building on each system, the CI, the headset side, the repository layout |
 | [Troubleshooting](troubleshooting.md) | Symptoms and fixes, logs, the self-test |

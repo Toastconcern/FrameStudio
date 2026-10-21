@@ -1994,25 +1994,8 @@ struct Studio {
             saveStatus = "Couldn't save: the object edits couldn't be written to " + narrow(tmpEdits.wstring());
             return;
         }
-        std::vector<u8> thumb = imageThumb();             // the picture chosen for it, else the current view
-        if (thumb.empty()) {   // the current view, 512 px wide
-            std::vector<u8> rgba;
-            const uint32_t w = renderer.width(), h = renderer.height();
-            if (rendered && w > 8 && h > 8 && renderer.readback(0, rgba) && rgba.size() >= static_cast<size_t>(w) * h * 4) {
-                const uint32_t tw = 512, th = std::max<uint32_t>(1, h * tw / w);
-                std::vector<u8> small(static_cast<size_t>(tw) * th * 4);
-                for (uint32_t y = 0; y < th; ++y)
-                    for (uint32_t x = 0; x < tw; ++x) {
-                        const u8* src = &rgba[(static_cast<size_t>(y * h / th) * w + x * w / tw) * 4];
-                        u8* dst = &small[(static_cast<size_t>(y) * tw + x) * 4];
-                        dst[0] = src[0]; dst[1] = src[1]; dst[2] = src[2]; dst[3] = 255;
-                    }
-                stbi_write_png_to_func([](void* ctx, void* data, int size) {
-                    auto* v = static_cast<std::vector<u8>*>(ctx);
-                    v->insert(v->end(), static_cast<u8*>(data), static_cast<u8*>(data) + size);
-                }, &thumb, tw, th, 4, small.data(), tw * 4);
-            }
-        }
+        std::vector<u8> thumb = imageThumb();             // the picture chosen for it, else the view from where you start
+        if (thumb.empty()) thumb = spawnThumb();
         if (saver.joinable()) saver.join();
         saving = true;
         { std::lock_guard<std::mutex> l(statusMutex); saveStatus = "Saving " + narrow(fs::path(widen(out)).filename().wstring()) + "\u2026"; }
@@ -2253,6 +2236,49 @@ struct Studio {
         dirty = true;
         updateTitle();
     }
+    // A .fenv's thumbnail when it has no picture of its own: the home as you first see it in Frame Home, from the first
+    // spawn (standing on the floor under it, eyes 1.6 m up, facing its way, a little down). One frame drawn from there
+    // without the selection or the walkable area, read back at 512 px wide as PNG; the view is put back after. No
+    // spawn: the view as it is.
+    std::vector<u8> spawnThumb() {
+        std::vector<u8> png;
+        const Camera kept = cam;
+        if (scene && !scene->world.spawns.empty()) {
+            const WorldPoint& sp = scene->world.spawns[0];
+            float floor = sp.pos[1];
+            float f;
+            if (floorUnder(sp.pos[0], sp.pos[2], sp.pos[1] + 0.5f, f)) floor = f;
+            cam.yaw = sp.yaw;
+            cam.pitch = -5.0f * kPi / 180.0f;
+            cam.dist = 0.5f;
+            float fwd[3];
+            cam.forward(fwd);
+            const float eye[3] = {sp.pos[0], floor + 1.6f, sp.pos[2]};
+            for (int k = 0; k < 3; ++k) cam.pivot[k] = eye[k] + fwd[k] * cam.dist;
+            renderer.setSelection(-1);
+            if (walkGuideOn) { renderer.setStaticGuide({}); walkGuideOn = false; walkGuideDirty = true; }   // (back next frame)
+            renderViewport();
+        }
+        std::vector<u8> rgba;
+        const uint32_t w = renderer.width(), h = renderer.height();
+        if (rendered && w > 8 && h > 8 && renderer.readback(0, rgba) && rgba.size() >= static_cast<size_t>(w) * h * 4) {
+            const uint32_t tw = 512, th = std::max<uint32_t>(1, h * tw / w);
+            std::vector<u8> small(static_cast<size_t>(tw) * th * 4);
+            for (uint32_t y = 0; y < th; ++y)
+                for (uint32_t x = 0; x < tw; ++x) {
+                    const u8* src = &rgba[(static_cast<size_t>(y * h / th) * w + x * w / tw) * 4];
+                    u8* dst = &small[(static_cast<size_t>(y) * tw + x) * 4];
+                    dst[0] = src[0]; dst[1] = src[1]; dst[2] = src[2]; dst[3] = 255;
+                }
+            stbi_write_png_to_func([](void* ctx, void* data, int size) {
+                auto* v = static_cast<std::vector<u8>*>(ctx);
+                v->insert(v->end(), static_cast<u8*>(data), static_cast<u8*>(data) + size);
+            }, &png, tw, th, 4, small.data(), tw * 4);
+        }
+        cam = kept;
+        return png;
+    }
+
     // The picture as the .fenv's thumbnail: 512 px wide, PNG (empty: none chosen, or it doesn't read).
     std::vector<u8> imageThumb() const {
         std::vector<u8> png;
@@ -5289,6 +5315,74 @@ struct Studio {
         ImGui::PopTextWrapPos();
         section("INSTALL FRAME HOME");
         installPanel();
+        if (pcAvailable()) { section("THIS PC"); pcPanel(); }
+    }
+
+    // ── This PC: Frame Home as SteamVR's environment on the computer Studio runs on (the installer beside Studio,
+    // pc/: install-frame-home-pc.ps1 on Windows, install.sh on Linux). It shows My Environments, so what's saved here
+    // is in VR straight away; the Environments panel in the Steam menu switches them.
+    std::thread pcJob;
+    std::atomic<bool> pcBusy{false};
+    std::string pcStatus;                    // (statusMutex)
+    fs::path pcPayload() const { return exeDir() / L"pc"; }
+    bool pcAvailable() const {
+#if defined(_WIN32)
+        return fs::exists(pcPayload() / L"install-frame-home-pc.ps1");
+#elif defined(__APPLE__)
+        return false;                        // (no SteamVR for macOS)
+#else
+        return fs::exists(pcPayload() / L"install.sh");
+#endif
+    }
+    static fs::path pcRoot() {
+#ifdef _WIN32
+        const char* l = std::getenv("LOCALAPPDATA");
+        return fs::u8path(l ? l : "") / L"Frame Home";
+#else
+        const char* h = std::getenv("HOME");
+        return fs::u8path(h ? h : "") / "frame-home";
+#endif
+    }
+    bool pcInstalled() const { std::error_code ec; return fs::exists(pcRoot() / L"frame-switcher.vrmanifest", ec); }
+    void pcInstall(bool uninstall) {
+        if (pcBusy) return;
+        if (pcJob.joinable()) pcJob.join();
+        pcBusy = true;
+        { std::lock_guard<std::mutex> l(statusMutex); pcStatus = uninstall ? "Giving SteamVR its own environment back\u2026" : "Installing\u2026"; }
+        pcJob = std::thread([this, uninstall] {
+#ifdef _WIN32
+            const std::string cmd = "powershell -NoProfile -ExecutionPolicy Bypass -File \"" + narrow((pcPayload() / L"install-frame-home-pc.ps1").wstring()) + "\"" +
+                                    (uninstall ? " -Uninstall" : "");
+#else
+            const std::string cmd = "sh \"" + narrow((pcPayload() / L"install.sh").wstring()) + "\"" + (uninstall ? " uninstall" : "");
+#endif
+            std::string out;
+            const int rc = platform::run(cmd, pcPayload(), out);
+            std::string msg = lastLine(out);   // the installer's verdict: its last "frame-install:" line
+            if (const size_t at = out.rfind("frame-install: "); at != std::string::npos) msg = lastLine(out.substr(at + 15, out.find('\n', at) == std::string::npos ? std::string::npos : out.find('\n', at) - at - 15));
+            if (!msg.empty()) msg[0] = static_cast<char>(std::toupper(static_cast<unsigned char>(msg[0])));
+            { std::lock_guard<std::mutex> l(statusMutex); pcStatus = rc == 0 ? msg : "Failed: " + (msg.empty() ? std::to_string(rc) : msg); }
+            pcBusy = false;
+        });
+    }
+    void pcPanel() {
+        ImGui::PushTextWrapPos(0);
+        ImGui::TextWrapped("SteamVR on this computer: your environments (My Environments) become its environment, switched in the "
+                           "Steam menu's Environments panel. SteamVR's own settings are put back exactly when you remove it.");
+        ImGui::Spacing();
+        const bool installed = pcInstalled();
+        ImGui::BeginDisabled(pcBusy);
+        if (!installed) pushPrimary();
+        if (ImGui::Button(pcBusy ? "Working\u2026###pcinst" : installed ? "Update Frame Home on This PC###pcinst" : "Install Frame Home on This PC###pcinst",
+                          ImVec2(-1, ImGui::GetFrameHeight() * (installed ? 1.0f : 1.4f))))
+            pcInstall(false);
+        if (!installed) ImGui::PopStyleColor(3);
+        if (installed && ImGui::Button("Remove from This PC", ImVec2(-1, 0))) pcInstall(true);
+        ImGui::EndDisabled();
+        std::string st;
+        { std::lock_guard<std::mutex> l(statusMutex); st = pcStatus; }
+        if (!st.empty()) { ImGui::Spacing(); ImGui::TextWrapped("%s", st.c_str()); }
+        ImGui::PopTextWrapPos();
     }
 
 
@@ -9122,6 +9216,8 @@ bool allowClose() {
     if (!g_app->confirmDiscard()) return false;
     if (g_app->installing)
         platform::message("Frame Studio", "Frame Home is still being installed on the headset. Frame Studio will close when the copy finishes.");
+    if (g_app->pcBusy)
+        platform::message("Frame Studio", "Frame Home is still being installed on this PC. Frame Studio will close when it's done.");
     if (!g_app->confirmBundleDiscard()) return false;
     if (g_app->bundleBusy)
         platform::message("Frame Studio", "A bundle is still being written. Frame Studio will close when it's done.");
@@ -9443,6 +9539,7 @@ int runStudio(StudioWindow& window, const std::vector<std::string>& args) {
     if (app->tuner.joinable()) app->tuner.join();
     if (app->filesReader.joinable()) app->filesReader.join();
     if (app->installer.joinable()) app->installer.join();
+    if (app->pcJob.joinable()) app->pcJob.join();
     if (app->bundler.joinable()) app->bundler.join();
     if (app->headsetThread.joinable()) app->headsetThread.join();
     if (app->headsetDebugThread.joinable()) app->headsetDebugThread.join();

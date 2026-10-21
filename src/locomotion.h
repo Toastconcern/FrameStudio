@@ -87,7 +87,7 @@ public:
     "/actions/main/in/left_trigger": "Sit: left hand", "/actions/main/in/right_trigger": "Sit: right hand", "/actions/main/in/gaze": "Where you look" } ]
 })";
         vr::IVRInput* in = vr::VRInput();
-        if (!in || in->SetActionManifestPath(fs::absolute(dir / "actions.json").c_str()) != vr::VRInputError_None) return false;
+        if (!in || in->SetActionManifestPath(fs::absolute(dir / "actions.json").u8string().c_str()) != vr::VRInputError_None) return false;
         in->GetActionSetHandle("/actions/main", &set_);
         in->GetActionHandle("/actions/main/in/left_stick", &leftStick_);
         in->GetActionHandle("/actions/main/in/right_stick", &rightStick_);

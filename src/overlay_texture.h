@@ -5,7 +5,7 @@
 // redrew (pointer moves, stats refreshes). Here the canvas goes into one of three images in turn (staging buffer,
 // copy, wait for the copy's fence), so the image SteamVR is showing is never the one being written.
 //
-// Vulkan is loaded at run time (dlopen libvulkan.so.1): no link dependency, and if anything is missing init()
+// Vulkan is loaded at run time (libvulkan.so.1, vulkan-1.dll): no link dependency, and if anything is missing init()
 // fails and the caller keeps using SetOverlayRaw.
 #ifndef VK_NO_PROTOTYPES
 #define VK_NO_PROTOTYPES
@@ -13,7 +13,17 @@
 #include <vulkan/vulkan.h>
 #include <openvr.h>
 
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
 #include <dlfcn.h>
+#endif
 
 #include <algorithm>
 #include <cstdint>
@@ -31,8 +41,13 @@ public:
     // VRSystem()->GetOutputDevice, the extensions from VRCompositor()).
     bool init(uint32_t w, uint32_t h, std::string& err) {
         w_ = w; h_ = h;
+#ifdef _WIN32
+        if (!(lib_ = LoadLibraryW(L"vulkan-1.dll"))) return fail(err, "no vulkan-1.dll");
+        gipa_ = reinterpret_cast<PFN_vkGetInstanceProcAddr>(reinterpret_cast<void*>(GetProcAddress(static_cast<HMODULE>(lib_), "vkGetInstanceProcAddr")));
+#else
         if (!(lib_ = dlopen("libvulkan.so.1", RTLD_NOW | RTLD_LOCAL)) && !(lib_ = dlopen("libvulkan.so", RTLD_NOW | RTLD_LOCAL))) return fail(err, "no libvulkan");
         gipa_ = reinterpret_cast<PFN_vkGetInstanceProcAddr>(dlsym(lib_, "vkGetInstanceProcAddr"));
+#endif
         if (!gipa_) return fail(err, "no vkGetInstanceProcAddr");
 #define OT_GLOBAL(n) n = reinterpret_cast<PFN_##n>(gipa_(VK_NULL_HANDLE, #n)); if (!n) return fail(err, "missing " #n)
         OT_GLOBAL(vkCreateInstance);

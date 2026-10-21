@@ -1,13 +1,15 @@
-// frame-switcher — the Steam Frame's environment switcher: a SteamVR dashboard panel listing every environment
-// in ~/frame-home/envs (Frame environments .fenv, home APKs, and footprint + vista pairs from pairs.txt) with
-// thumbnails. Point and click one: ~/frame-home/current changes and Frame Home switches to it live. A bundle of
-// environments (.fbundle) put there is unpacked into its .fenv files, which the panel then lists one by one.
+// frame-switcher — Frame Home's environment switcher: a SteamVR dashboard panel listing every environment (on the
+// Steam Frame ~/frame-home/envs; on a PC, Frame Studio's My Environments: home_platform.h) — Frame environments .fenv,
+// home APKs, and footprint + vista pairs from pairs.txt — with thumbnails. Point and click one: `current` changes and
+// Frame Home switches to it live. A bundle of environments (.fbundle) put there is unpacked into its .fenv files,
+// which the panel then lists one by one.
 //
 //   frame-switcher                 the dashboard panel (SteamVR starts it: see --install)
 //   frame-switcher --install       register with SteamVR and start it with SteamVR from now on
+//   frame-switcher --uninstall     the other way round (a PC's uninstaller)
 //   frame-switcher --list          the environments, the current one marked with *
 //   frame-switcher --set NAME      switch (NAME: the file name, or a number from --list)
-//   frame-switcher --thumbs        render missing thumbnails (frame-home --snapshot) into envs/.thumbs
+//   frame-switcher --thumbs        render missing thumbnails (frame-home --snapshot, from the spawn)
 //   frame-switcher --delete NAME   delete an environment (like the panel's delete button; NAME as for --set)
 //   frame-switcher --unpack-bundles   unpack the bundles (.fbundle) in envs now (the panel does it by itself)
 //   frame-switcher --test-delete DIR   self-check of deleting, in a fake root made in DIR (must not exist yet)
@@ -16,18 +18,14 @@
 #include "overlay_texture.h"
 #include "overlays.h"
 #include "perf_settings.h"
-#include "proc_util.h"
+#include "home_platform.h"
 
 #include <openvr.h>
 
 #define STB_TRUETYPE_IMPLEMENTATION
 #include "stb_truetype.h"
 
-#include <fcntl.h>
-#include <signal.h>
-#include <sys/resource.h>
-#include <sys/wait.h>
-#include <unistd.h>
+#include <csignal>
 
 #include <algorithm>
 #include <atomic>
@@ -57,10 +55,7 @@ namespace {
 constexpr const char* kAppKey = "framehome.switcher";
 constexpr int W = 1280, H = 800;
 
-fs::path rootDir() {
-    const char* home = std::getenv("HOME");
-    return fs::path(home && *home ? home : "/home/steamos") / "frame-home";
-}
+fs::path rootDir() { return homeos::root(); }   // (home_platform.h: ~/frame-home, or a PC's)
 
 std::string readText(const fs::path& p) {
     std::ifstream f(p);
@@ -142,11 +137,11 @@ std::string pretty(std::string stem) {
 fs::path thumbPath(const std::string& key) {
     std::string n = key;
     for (char& c : n) if (c == '\n' || c == '/') c = '+';
-    return rootDir() / "envs" / ".thumbs" / (n + ".ppm");
+    return homeos::thumbs() / (n + ".ppm");
 }
 
 std::vector<Env> scanEnvs() {
-    const fs::path envs = rootDir() / "envs";
+    const fs::path envs = homeos::envs();
     std::vector<Env> out;
     std::error_code ec;
     std::vector<fs::path> files;
@@ -284,7 +279,7 @@ struct DeleteResult {
 // folders go in a thread of their own (they can be big, and an unpack in progress is waited for).
 DeleteResult deleteEnv(const Env& e, const std::vector<Env>& all, bool cacheInBackground) {
     DeleteResult r;
-    const fs::path envs = rootDir() / "envs";
+    const fs::path envs = homeos::envs();
     std::error_code ec;
     if (e.files.empty()) { r.error = "nothing to delete"; return r; }
     for (const auto& f : e.files) {
@@ -349,7 +344,7 @@ DeleteResult deleteEnv(const Env& e, const std::vector<Env>& all, bool cacheInBa
     keys.insert(keys.end(), pairKeys.begin(), pairKeys.end());
     for (const auto& k : keys) {
         const fs::path t = thumbPath(k);
-        if (t.parent_path() == envs / ".thumbs" && fs::remove(t, ec)) r.removed.push_back("envs/.thumbs/" + t.filename().string());
+        if (t.parent_path() == homeos::thumbs() && fs::remove(t, ec)) r.removed.push_back("thumbnail " + t.filename().string());
     }
 
     // 5. The unpacked copies (they'd be cleaned up eventually anyway).
@@ -1444,7 +1439,7 @@ volatile sig_atomic_t g_quit = 0;
 void unpackBundles() {
     static std::set<std::string> failed;                // "<file>|<size>|<time>" of bundles that didn't unpack
     std::error_code ec;
-    const fs::path envs = rootDir() / "envs";
+    const fs::path envs = homeos::envs();
     for (const auto& e : fs::directory_iterator(envs, ec)) {
         if (!e.is_regular_file(ec) || !isFenvBundlePath(e.path().string())) continue;
         const std::string state = e.path().filename().string() + "|" + std::to_string(e.file_size(ec)) + "|" +
@@ -1454,12 +1449,12 @@ void unpackBundles() {
         std::string err;
         const auto t0 = std::chrono::steady_clock::now();
         if (!fenvBundleExtract(e.path().string(), envs.string(), unpacked, err)) {
-            LOG("can't unpack the bundle %s: %s", e.path().filename().c_str(), err.c_str());
+            LOG("can't unpack the bundle %s: %s", e.path().filename().string().c_str(), err.c_str());
             failed.insert(state);
             continue;
         }
         fs::remove(e.path(), ec);
-        LOG("unpacked the bundle %s into %zu environments (%.1f s)", e.path().filename().c_str(), unpacked.size(),
+        LOG("unpacked the bundle %s into %zu environments (%.1f s)", e.path().filename().string().c_str(), unpacked.size(),
             std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
     }
 }
@@ -1471,20 +1466,20 @@ void prepareEnvironments() {
     again = true;                                       // files added while a run is going get a run of their own
     if (busy.exchange(true)) return;
     std::thread([] {
-        setpriority(PRIO_PROCESS, 0, 15);
+        homeos::lowerPriority(15);
         for (;;) {
         while (again.exchange(false)) try {
         unpackBundles();
         std::error_code ec;
-        for (const auto& e : fs::directory_iterator(rootDir() / "envs", ec)) {
+        for (const auto& e : fs::directory_iterator(homeos::envs(), ec)) {
             if (e.path().extension() != ".fenv") continue;
             FenvManifest m;
             std::vector<std::string> sources, models;
             std::string edits, err;
             const auto t0 = std::chrono::steady_clock::now();
-            if (!fenvExtract(e.path().string(), fenvCacheDir(), m, sources, models, edits, err)) { LOG("can't unpack %s: %s", e.path().filename().c_str(), err.c_str()); continue; }
+            if (!fenvExtract(e.path().string(), fenvCacheDir(), m, sources, models, edits, err)) { LOG("can't unpack %s: %s", e.path().filename().string().c_str(), err.c_str()); continue; }
             const double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-            if (sec > 0.5) LOG("unpacked %s ahead of time (%.1f s)", e.path().filename().c_str(), sec);
+            if (sec > 0.5) LOG("unpacked %s ahead of time (%.1f s)", e.path().filename().string().c_str(), sec);
         }
         } catch (const std::exception& ex) { LOG("unpacking ahead of time stopped: %s", ex.what()); }   // a damaged file must not kill the panel
         busy = false;
@@ -1521,8 +1516,8 @@ int runPanel() {
     auto rescan = [&]() {
         std::error_code ec;
         std::string sig;
-        for (const auto& e : fs::directory_iterator(rootDir() / "envs", ec)) sig += e.path().filename().string() + std::to_string(static_cast<long long>(fs::last_write_time(e.path(), ec).time_since_epoch().count()));
-        for (const auto& e : fs::directory_iterator(rootDir() / "envs" / ".thumbs", ec)) sig += e.path().filename().string() + std::to_string(static_cast<long long>(fs::last_write_time(e.path(), ec).time_since_epoch().count()));
+        for (const auto& e : fs::directory_iterator(homeos::envs(), ec)) sig += e.path().filename().string() + std::to_string(static_cast<long long>(fs::last_write_time(e.path(), ec).time_since_epoch().count()));
+        for (const auto& e : fs::directory_iterator(homeos::thumbs(), ec)) sig += e.path().filename().string() + std::to_string(static_cast<long long>(fs::last_write_time(e.path(), ec).time_since_epoch().count()));
         sig += readText(rootDir() / "pairs.txt") + "|" + currentKey();
         if (sig == lastScan) return false;
         lastScan = sig;
@@ -1543,11 +1538,30 @@ int runPanel() {
             LOG("turned SteamVR's overlay input override (globalActionSetPriority) back off");
         }
     }
-    // Frame Home is the system environment: the compositor layer (layer/frame_home_layer.cpp) draws it in Aurora's
-    // place, and frame-home --system renders it. This panel starts with SteamVR, so it keeps that process running
-    // (restarting it if it stops) and makes sure the old way, Frame Home as SteamVR's home app, is off: no app, no
-    // dock entry, and Aurora's slot is where the home shows.
-    {
+    // Two ways Frame Home takes SteamVR's environment:
+    //  - the system environment (the Steam Frame, and a Linux PC with the compositor layer installed: ~/frame-home/
+    //    layer): the layer (layer/frame_home_layer.cpp) draws it in Aurora's place and frame-home --system renders it.
+    //    This panel starts with SteamVR, so it keeps that process running and makes sure SteamVR's home app is off.
+    //  - SteamVR's home app (a Windows PC, whose compositor isn't Vulkan): SteamVR runs Frame Home itself whenever no
+    //    game is open. Here the panel makes sure that's on, and that the moments before Frame Home draws (SteamVR
+    //    starting, a game quitting) show the home too: SteamVR's background is a 360-degree picture of it
+    //    (keepBackground), with the classic environment instead of Aurora.
+#ifdef _WIN32
+    const bool systemEnv = false;
+#else
+    const bool systemEnv = fs::exists(rootDir() / "layer");
+#endif
+    // (Frame Home uninstalled from a PC: its manifest is gone, and SteamVR's settings are left as the uninstall put them)
+    const bool homeInstalled = systemEnv || fs::exists(rootDir() / "frame-home.vrmanifest");
+    if (!systemEnv && homeInstalled) {
+        vr::EVRSettingsError se = vr::VRSettingsError_None;
+        if (!vr::VRSettings()->GetBool(vr::k_pch_SteamVR_Section, "enableHomeApp", &se)) {
+            vr::VRSettings()->SetBool(vr::k_pch_SteamVR_Section, "enableHomeApp", true, &se);
+            LOG("Frame Home is SteamVR's home app: turned it on");
+        }
+        if (vr::VRSettings()->GetInt32(vr::k_pch_SteamVR_Section, "environmentMode", &se) != 0)
+            vr::VRSettings()->SetInt32(vr::k_pch_SteamVR_Section, "environmentMode", 0, &se);   // the background, not Aurora
+    } else {
         vr::EVRSettingsError se = vr::VRSettingsError_None;
         if (vr::VRSettings()->GetBool(vr::k_pch_SteamVR_Section, "enableHomeApp", &se)) {
             vr::VRSettings()->SetBool(vr::k_pch_SteamVR_Section, "enableHomeApp", false, &se);
@@ -1557,20 +1571,22 @@ int runPanel() {
             vr::VRSettings()->SetInt32(vr::k_pch_SteamVR_Section, "environmentMode", 1, &se);   // Aurora's pipelines are what the layer replaces
         }
     }
-    {   // its own SteamVR identity (hidden: no list, no dock), so its controller bindings are its own
+    if (systemEnv) {   // its own SteamVR identity (hidden: no list, no dock), so its controller bindings are its own
         const fs::path m = rootDir() / "frame-environment.vrmanifest";
         std::ofstream(m) << "{\n  \"source\": \"builtin\",\n  \"applications\": [ {\n    \"app_key\": \"framehome.environment\",\n"
                             "    \"launch_type\": \"binary\",\n    \"binary_path_linux\": \"" << (rootDir() / "bin" / "frame-home").string() << "\",\n"
                             "    \"binary_path_linux_arm\": \"" << (rootDir() / "bin" / "frame-home").string() << "\",\n    \"arguments\": \"--system\",\n"
                             "    \"is_dashboard_overlay\": true,\n    \"is_hidden\": true,\n"
                             "    \"strings\": { \"en_us\": { \"name\": \"Frame Home\", \"description\": \"The environment\" } }\n  } ]\n}\n";
-        const vr::EVRApplicationError ae = vr::VRApplications()->AddApplicationManifest(fs::absolute(m).c_str(), false);
+        const vr::EVRApplicationError ae = vr::VRApplications()->AddApplicationManifest(fs::absolute(m).u8string().c_str(), false);
         if (ae != vr::VRApplicationError_None) LOG("registering the environment: %s", vr::VRApplications()->GetApplicationsErrorNameFromEnum(ae));
     }
-    pid_t systemPid = -1;
+    homeos::Pid systemPid = 0;
     bool adopted = false;                            // systemPid isn't our child (a panel before this one started it)
     auto lastSpawn = std::chrono::steady_clock::now() - std::chrono::minutes(1);
     auto keepSystem = [&](std::chrono::steady_clock::time_point now) {
+        if (!systemEnv) return;                       // SteamVR runs Frame Home itself (its home app)
+#ifndef _WIN32
         if (systemPid > 0 && adopted) {
             if (kill(systemPid, 0) == 0) return;
             LOG("frame-home --system (pid %d) stopped: restarting it", static_cast<int>(systemPid));
@@ -1587,7 +1603,7 @@ int runPanel() {
         if (now - lastSpawn < std::chrono::seconds(5)) return;                // a crash loop doesn't spin
         lastSpawn = now;
         // Still running from a panel before this one (the panel restarted): keep it, never a second renderer.
-        if (const std::vector<pid_t> running = runningWith("frame-home", "--system"); !running.empty()) {
+        if (const std::vector<pid_t> running = homeos::runningWith("frame-home", "--system"); !running.empty()) {
             systemPid = running.front();
             adopted = true;
             LOG("frame-home --system already running (pid %d): keeping it", static_cast<int>(systemPid));
@@ -1602,6 +1618,9 @@ int runPanel() {
             _exit(127);
         }
         if (pid > 0) { systemPid = pid; LOG("started frame-home --system (pid %d)", static_cast<int>(pid)); }
+#else
+        (void)now;
+#endif
     };
     // The panel's pixels go to SteamVR in Vulkan images of our own (overlay_texture.h): SetOverlayRaw recreated the
     // texture on every redraw and the panel flickered. SetOverlayRaw stays as the fallback.
@@ -1628,9 +1647,10 @@ int runPanel() {
         panel.kFlingGain, panel.kFlingMax, panel.kFlingDecay);
     // The header's button: Restart stops frame-home --system (keepSystem starts a new one as soon as it's gone);
     // Start / Turn On clears the layer's off switch (the layer checks it every second) and starts it now.
-    pid_t restartingPid = -1;
+    homeos::Pid restartingPid = 0;
     std::chrono::steady_clock::time_point restartAt{}, killAt{};
     bool restarting = false;
+    auto homeRunning = [&] { return systemEnv ? systemPid > 0 && homeos::alive(systemPid) : !homeos::runningCopies("frame-home").empty(); };
     auto homeTick = [&](std::chrono::steady_clock::time_point now) {
         std::error_code ec;
         if (panel.restartAsked) {
@@ -1638,34 +1658,101 @@ int runPanel() {
             restarting = true;
             restartAt = now;
             restartingPid = systemPid;
-            if (fs::exists(rootDir() / "layer" / "off", ec)) {
-                fs::remove(rootDir() / "layer" / "off", ec);
-                fs::remove(rootDir() / "layer" / "crashes", ec);
-                LOG("Frame Home turned back on from the panel");
+            if (!systemEnv) {   // SteamVR's home app: end it and have SteamVR start it again
+                LOG("restarting Frame Home (SteamVR's home app) from the panel");
+                homeos::stopCopies("frame-home");
+                const vr::EVRApplicationError le = vr::VRApplications()->LaunchApplication("openvr.tool.steamvr_environments");
+                if (le != vr::VRApplicationError_None) LOG("start: %s", vr::VRApplications()->GetApplicationsErrorNameFromEnum(le));
+                lastSpawn = now;
+            } else {
+                if (fs::exists(rootDir() / "layer" / "off", ec)) {
+                    fs::remove(rootDir() / "layer" / "off", ec);
+                    fs::remove(rootDir() / "layer" / "crashes", ec);
+                    LOG("Frame Home turned back on from the panel");
+                }
+                if (systemPid > 0 && homeos::alive(systemPid)) {
+                    LOG("restarting frame-home --system (pid %d) from the panel", static_cast<int>(systemPid));
+                    homeos::stop(systemPid, false);
+                    killAt = now + std::chrono::seconds(4);
+                }
+                lastSpawn = now - std::chrono::minutes(1);   // no 5 s wait: a new one as soon as the old one is gone
+                keepSystem(now);
             }
-            if (systemPid > 0 && kill(systemPid, 0) == 0) {
-                LOG("restarting frame-home --system (pid %d) from the panel", static_cast<int>(systemPid));
-                kill(systemPid, SIGTERM);
-                killAt = now + std::chrono::seconds(4);
-            }
-            lastSpawn = now - std::chrono::minutes(1);   // no 5 s wait: a new one as soon as the old one is gone
-            keepSystem(now);
         }
-        if (restarting && restartingPid > 0 && systemPid == restartingPid && now > killAt && kill(restartingPid, 0) == 0) {
+        if (systemEnv && restarting && restartingPid > 0 && systemPid == restartingPid && now > killAt && homeos::alive(restartingPid)) {
             LOG("frame-home --system (pid %d) didn't stop: killing it", static_cast<int>(restartingPid));
-            kill(restartingPid, SIGKILL);
+            homeos::stop(restartingPid, true);
             killAt = now + std::chrono::seconds(10);
         }
         // Restarting until a new process has been up a moment (it loads the home and fades in), 20 s at most.
         if (restarting && (now - restartAt > std::chrono::seconds(20) ||
-                           (systemPid > 0 && systemPid != restartingPid && now - lastSpawn > std::chrono::seconds(2))))
+                           (systemEnv ? systemPid > 0 && systemPid != restartingPid && now - lastSpawn > std::chrono::seconds(2)
+                                      : homeRunning() && now - lastSpawn > std::chrono::seconds(2))))
             restarting = false;
-        const bool alive = systemPid > 0 && kill(systemPid, 0) == 0;
-        const Panel::Home h = restarting ? Panel::Home::Restarting : fs::exists(rootDir() / "layer" / "off", ec) ? Panel::Home::TurnedOff
+        const bool alive = homeRunning();
+        const Panel::Home h = restarting ? Panel::Home::Restarting : systemEnv && fs::exists(rootDir() / "layer" / "off", ec) ? Panel::Home::TurnedOff
                             : alive ? Panel::Home::Running : Panel::Home::Stopped;
         if (h != panel.home) { panel.home = h; return true; }
         return false;
     };
+    // SteamVR's background, when Frame Home is its home app (a Windows PC): a 360-degree picture of the current home
+    // from its spawn, so the moments before Frame Home draws (SteamVR starting, a game quitting) show the home and
+    // not Aurora. Made by frame-home --panorama off the frame loop, at low priority, whenever the home changes; set
+    // here once it's written (a new file each time: SteamVR reloads a background when its path changes).
+    std::string backgroundFor;                       // the home key + file times the background shows
+    std::thread backgroundJob;
+    std::atomic<bool> backgroundDone{false};
+    std::string backgroundPng;                       // (the job's result, read once backgroundDone)
+    auto keepBackground = [&] {
+        if (systemEnv || !homeInstalled) return;
+        if (backgroundDone.exchange(false)) {
+            if (backgroundJob.joinable()) backgroundJob.join();
+            float eye = 1.6f, dome = 0;
+            const std::string j = readText(backgroundPng + ".json");
+            try { const tinyjson::Value d = tinyjson::parse(j); eye = d["eyeHeight"].asFloat(); dome = d["domeRadius"].asFloat(); } catch (...) {}
+            vr::EVRSettingsError se = vr::VRSettingsError_None;
+            vr::VRSettings()->SetString(vr::k_pch_SteamVR_Section, "background", fs::u8path(backgroundPng).u8string().c_str(), &se);
+            vr::VRSettings()->SetBool(vr::k_pch_SteamVR_Section, "backgroundUseDomeProjection", true, &se);
+            vr::VRSettings()->SetFloat(vr::k_pch_SteamVR_Section, "backgroundCameraHeight", eye, &se);
+            vr::VRSettings()->SetFloat(vr::k_pch_SteamVR_Section, "backgroundDomeRadius", dome, &se);
+            LOG("SteamVR's background: %s (eyes %.2f m, dome %.1f m)%s", fs::u8path(backgroundPng).filename().string().c_str(), eye, dome,
+                se == vr::VRSettingsError_None ? "" : " (a setting was refused)");
+            std::error_code ec;   // the earlier pictures go
+            std::vector<fs::path> old;
+            for (const auto& e : fs::directory_iterator(rootDir() / "background", ec))
+                if (e.path() != fs::path(backgroundPng) && e.path() != fs::path(backgroundPng + ".json")) old.push_back(e.path());
+            for (const fs::path& o : old) fs::remove(o, ec);
+        }
+        if (backgroundJob.joinable()) return;        // one at a time
+        const std::vector<Env> envs = scanEnvs();
+        if (envs.empty()) return;
+        const std::string cur = currentKey();
+        const Env* e = &envs.front();
+        for (const Env& x : envs) if (x.key == cur) e = &x;
+        std::string want = e->key;
+        std::error_code ec;
+        for (const auto& f : e->files) want += std::to_string(static_cast<long long>(fs::last_write_time(homeos::envs() / f, ec).time_since_epoch().count()));
+        if (want == backgroundFor) return;
+        backgroundFor = want;
+        fs::create_directories(rootDir() / "background", ec);
+        static int n = 0;
+        backgroundPng = (rootDir() / "background" / ("home-" + std::to_string(static_cast<long long>(std::time(nullptr))) + "-" + std::to_string(++n) + ".png")).string();
+        std::vector<std::string> args = {(rootDir() / "bin" / homeos::exeName("frame-home")).string(), "--panorama", backgroundPng, "--size", "4096", "--spawn"};
+        for (const auto& f : e->files) args.push_back((homeos::envs() / f).string());
+        LOG("making SteamVR's background from %s", e->name.c_str());
+        backgroundJob = std::thread([&, args] {
+            const int rc = homeos::run(args, 15, true);
+            if (rc != 0) LOG("the background picture failed (%d)", rc);
+            else backgroundDone = true;
+        });
+    };
+    // Thumbnails for environments that have none of their own (frame-switcher --thumbs: one at a time, low priority,
+    // only while nobody is looking at Frame Home), once a run.
+    {
+        bool missing = false;
+        for (const Env& e : scanEnvs()) missing |= e.thumb.rgba.empty();
+        if (missing) homeos::run({homeos::selfPath().string(), "--thumbs"}, 19, false);
+    }
     double lastSmooth = -10;
     int scrollLogs = 0;
     bool dirty = true, wasVisible = false;
@@ -1676,6 +1763,7 @@ int runPanel() {
             lastHomeCheck = t;
             if (!panel.restartAsked) keepSystem(t);
             dirty |= homeTick(t);
+            keepBackground();
         }
         panel.now = Panel::clockNow();
         vr::VREvent_t ev;
@@ -1748,40 +1836,58 @@ int runPanel() {
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(!visible ? 16 : moving || dirty ? 2 : 8));
     }
-    if (systemPid > 0) kill(systemPid, SIGTERM);   // SteamVR is going: so is the environment
+    if (systemEnv && systemPid > 0) homeos::stop(systemPid, false);   // SteamVR is going: so is the environment
+    if (backgroundJob.joinable()) backgroundJob.join();
     vr::VR_Shutdown();
     tex.destroy();   // after VR_Shutdown: vrclient holds the images until then
     return 0;
 }
 
 int runInstall() {
-    char self[4096] = {};
-    const ssize_t n = readlink("/proc/self/exe", self, sizeof self - 1);
-    if (n <= 0) return 1;
+    std::string self = homeos::selfPath().string();
+    if (self.empty()) return 1;
     std::error_code ec;   // the installed copy is what SteamVR runs (see frame-home --install)
-    const fs::path installed = rootDir() / "bin" / "frame-switcher";
-    if (fs::exists(installed, ec)) std::snprintf(self, sizeof self, "%s", installed.c_str());
+    const fs::path installed = rootDir() / "bin" / homeos::exeName("frame-switcher");
+    if (fs::exists(installed, ec)) self = installed.string();
+    for (size_t at = 0; (at = self.find('\\', at)) != std::string::npos; at += 2) self.insert(at, 1, '\\');   // (JSON)
     const fs::path manifest = rootDir() / "frame-switcher.vrmanifest";
     std::ofstream(manifest) << "{\n  \"source\": \"builtin\",\n  \"applications\": [ {\n    \"app_key\": \"" << kAppKey
                             << "\",\n    \"launch_type\": \"binary\",\n    \"binary_path_linux\": \"" << self
+                            << "\",\n    \"binary_path_windows\": \"" << self
                             << "\",\n    \"binary_path_linux_arm\": \"" << self
                             << "\",\n    \"arguments\": \"\",\n    \"is_dashboard_overlay\": true,\n"
                                "    \"strings\": { \"en_us\": { \"name\": \"Environments\",\n"
-                               "      \"description\": \"Switch the Steam Frame's environment\" } }\n  } ]\n}\n";
+                               "      \"description\": \"Switch SteamVR's environment (Frame Home)\" } }\n  } ]\n}\n";
     vr::EVRInitError ierr = vr::VRInitError_None;
     vr::VR_Init(&ierr, vr::VRApplication_Utility);
     // 3: SteamVR not running — the installer registers the manifest in SteamVR's config files instead.
     if (ierr != vr::VRInitError_None) { LOG("VR_Init: %s (SteamVR not running)", vr::VR_GetVRInitErrorAsEnglishDescription(ierr)); return 3; }
-    vr::EVRApplicationError ae = vr::VRApplications()->AddApplicationManifest(fs::absolute(manifest).c_str(), false);
+    vr::EVRApplicationError ae = vr::VRApplications()->AddApplicationManifest(fs::absolute(manifest).u8string().c_str(), false);
     LOG("AddApplicationManifest: %s", vr::VRApplications()->GetApplicationsErrorNameFromEnum(ae));
     vr::EVRApplicationError al = vr::VRApplications()->SetApplicationAutoLaunch(kAppKey, true);
     LOG("auto-launch with SteamVR: %s", vr::VRApplications()->GetApplicationsErrorNameFromEnum(al));
     // A running (older) panel is replaced by this binary.
-    stopCopies("frame-switcher");
+    homeos::stopCopies("frame-switcher");
     const vr::EVRApplicationError le = vr::VRApplications()->LaunchApplication(kAppKey);
     LOG("start: %s", vr::VRApplications()->GetApplicationsErrorNameFromEnum(le));
     vr::VR_Shutdown();
     return ae == vr::VRApplicationError_None ? 0 : 1;
+}
+
+// The panel off SteamVR: no longer started with it, its manifest gone, a running one closed.
+int runUninstall() {
+    const fs::path manifest = rootDir() / "frame-switcher.vrmanifest";
+    vr::EVRInitError ierr = vr::VRInitError_None;
+    vr::VR_Init(&ierr, vr::VRApplication_Utility);
+    if (ierr != vr::VRInitError_None) { LOG("VR_Init: %s (SteamVR not running)", vr::VR_GetVRInitErrorAsEnglishDescription(ierr)); return 3; }
+    vr::VRApplications()->SetApplicationAutoLaunch(kAppKey, false);
+    std::error_code ec;
+    if (fs::exists(manifest, ec)) vr::VRApplications()->RemoveApplicationManifest(fs::absolute(manifest).u8string().c_str());
+    fs::remove(manifest, ec);
+    homeos::stopCopies("frame-switcher");
+    vr::VR_Shutdown();
+    LOG("the Environments panel is off SteamVR");
+    return 0;
 }
 
 // Is somebody looking at Frame Home? It draws at the display's rate then, and a frame a second when nobody is (the
@@ -1803,8 +1909,8 @@ bool frameHomeShowing() {
 // Frame Home, so they never stutter the home you're in (29 at once took 7 minutes of stutter, 2026-10-21).
 int runThumbs() {
     std::error_code ec;
-    fs::create_directories(rootDir() / "envs" / ".thumbs", ec);
-    const std::string bin = (rootDir() / "bin" / "frame-home").string();
+    fs::create_directories(homeos::thumbs(), ec);
+    const std::string bin = (rootDir() / "bin" / homeos::exeName("frame-home")).string();
     int made = 0;
     for (const Env& e : scanEnvs()) {
         if (!e.thumb.rgba.empty()) continue;
@@ -1815,23 +1921,11 @@ int runThumbs() {
             std::this_thread::sleep_for(std::chrono::seconds(10));
         }
         const fs::path out = thumbPath(e.key);
-        // (an argv, not a shell line: an environment's name can hold any character)
-        std::vector<std::string> args = {bin, "--snapshot", out.string(), "--size", "384", "--cam", "0,1.6,0,0,-5"};
-        for (const auto& f : e.files) args.push_back((rootDir() / "envs" / f).string());
-        std::vector<char*> argv;
-        for (std::string& a : args) argv.push_back(a.data());
-        argv.push_back(nullptr);
+        // From where Frame Home starts you: the first spawn, eyes 1.6 m up, facing its way, 5 degrees down.
+        std::vector<std::string> args = {bin, "--snapshot", out.string(), "--size", "384", "--spawn", "--cam", "0,1.6,0,0,-5"};
+        for (const auto& f : e.files) args.push_back((homeos::envs() / f).string());
         LOG("thumbnail: %s", e.name.c_str());
-        const pid_t pid = fork();
-        if (pid == 0) {
-            setpriority(PRIO_PROCESS, 0, 19);
-            const int null = ::open("/dev/null", O_RDWR);
-            if (null >= 0) { dup2(null, 1); dup2(null, 2); }
-            execv(argv[0], argv.data());
-            _exit(127);
-        }
-        int st = 0;
-        if (pid > 0 && waitpid(pid, &st, 0) == pid && WIFEXITED(st) && WEXITSTATUS(st) == 0) ++made;
+        if (homeos::run(args, 19, true) == 0) ++made;
     }
     LOG("%d thumbnails made", made);
     return 0;
@@ -1843,8 +1937,8 @@ int runTestDelete(const fs::path& dirIn) {
     if (fs::exists(dirIn, ec)) { std::fprintf(stderr, "test-delete: %s exists; give a new folder\n", dirIn.c_str()); return 2; }
     fs::create_directories(dirIn, ec);
     const fs::path dir = fs::canonical(dirIn, ec);
-    setenv("HOME", dir.c_str(), 1);
-    setenv("FRAME_FENV_CACHE", (dir / "cache").c_str(), 1);
+    homeos::setEnv("HOME", dir.string().c_str());
+    homeos::setEnv("FRAME_FENV_CACHE", (dir / "cache").string().c_str());
     const fs::path root = rootDir(), envs = root / "envs", th = envs / ".thumbs", cache = dir / "cache";
     if (root != dir / "frame-home") return 2;
     fs::create_directories(th, ec);
@@ -1936,6 +2030,7 @@ int main(int argc, char** argv) {
     const std::string a = argc > 1 ? argv[1] : "";
     if (a == "--install") return runInstall();
     if (a == "--thumbs") return runThumbs();
+    if (a == "--uninstall") return runUninstall();
     if (a == "--unpack-bundles") { unpackBundles(); return 0; }
     if (a == "--test-delete" && argc > 2) return runTestDelete(argv[2]);
     if (a == "--render" && argc > 2) {   // the panel as it looks now, to a PPM (no SteamVR needed)

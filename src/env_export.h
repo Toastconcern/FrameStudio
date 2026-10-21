@@ -4,6 +4,25 @@
 #include "env_share.h"
 #include "hsl_renderer.h"
 
+#ifdef _WIN32
+// A PC has no compositor layer: Frame Home is SteamVR's scene app there, so system mode never starts (init() fails).
+class EnvExport {
+public:
+    bool init() { return false; }
+    envshare::State* state() { return &state_; }
+    void release(HslRenderer&) {}
+    bool connected() const { return false; }
+    bool createImages(HslRenderer&) { return false; }
+    bool connect() { return false; }
+    void poll() {}
+    int beginFrame() { return 0; }
+    void publish(int, const float[2][16], const float[2][3]) {}
+    uint32_t refusedFlags() const { return 0; }
+    double sinceSampled() const { return 1e9; }
+private:
+    envshare::State state_;
+};
+#else
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -141,3 +160,4 @@ private:
     uint32_t generation_ = 0;
     std::chrono::steady_clock::time_point lastTry_;
 };
+#endif  // _WIN32

@@ -12,6 +12,7 @@
 // with SCM_RIGHTS fds: kSlots image memories, then the shared State (a memfd). A new Hello (new size) replaces the
 // old images.
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <ctime>
@@ -65,9 +66,13 @@ struct State {
 };
 
 inline uint64_t nowNs() {
+#ifdef _WIN32
+    return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+#else
     timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return static_cast<uint64_t>(ts.tv_sec) * 1000000000ull + static_cast<uint64_t>(ts.tv_nsec);
+#endif
 }
 
 }  // namespace envshare

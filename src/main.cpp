@@ -23,13 +23,11 @@
 #include "perf_settings.h"
 #include "thermal.h"
 #include "fenv.h"
-#include "proc_util.h"
+#include "home_platform.h"
 #include "stb_image_write.h"
 
 #include <openvr.h>
 
-#include <signal.h>
-#include <unistd.h>
 
 #include <algorithm>
 #include <atomic>
@@ -47,7 +45,6 @@
 #include <string>
 #include <thread>
 #include <vector>
-#include <sys/resource.h>
 
 #define LOG(...)  do { std::fprintf(stderr, "[frame-home] " __VA_ARGS__); std::fputc('\n', stderr); } while (0)
 
@@ -117,10 +114,7 @@ namespace fs = std::filesystem;
 // SteamVR's home-app slot: the app it keeps running as the world whenever no game is open.
 constexpr const char* kHomeAppKey = "openvr.tool.steamvr_environments";
 
-fs::path rootDir() {
-    const char* home = std::getenv("HOME");
-    return fs::path(home && *home ? home : "/home/steamos") / "frame-home";
-}
+fs::path rootDir() { return homeos::root(); }   // (home_platform.h: ~/frame-home, or a PC's)
 
 std::string readText(const fs::path& p) {
     std::ifstream f(p);
@@ -132,7 +126,7 @@ std::string readText(const fs::path& p) {
 // The home environment mode shows: ~/frame-home/current lists its APKs in envs/, one per line (footprint,
 // then vista); else the first home there.
 std::vector<std::string> currentHome() {
-    const fs::path envs = rootDir() / "envs";
+    const fs::path envs = homeos::envs();
     std::vector<std::string> home;
     std::istringstream lines(readText(rootDir() / "current"));
     std::string name;
@@ -437,20 +431,24 @@ void sleepUntilNs(uint64_t t) {
 
 // ── Headless snapshot (no SteamVR) ──────────────────────────────────────────────────────────────
 
+// Where Frame Home starts you: the first spawn, eyes 1.6 m over its floor, facing its way (cam: x, y, z, yaw; the
+// pitch is left as given).
+void spawnView(const HslScene& scene, float cam[5]) {
+    Locomotion loco;
+    loco.setWorld(walkWorld(scene));
+    float rig[16];
+    loco.rig(rig);
+    cam[0] = rig[12]; cam[1] = rig[13] + 1.6f; cam[2] = rig[14];
+    cam[3] = std::atan2(rig[8], rig[0]) * 180.0f / 3.14159265f;
+    LOG("spawn view: (%.2f %.2f %.2f) yaw %.0f", cam[0], cam[1], cam[2], cam[3]);
+}
+
 int runSnapshot(const std::string& out, const std::vector<std::string>& apks, const float camIn[5], uint32_t size, bool fromSpawn) {
     HslScene scene;
     std::string err;
     if (!loadHslScene(apks, scene, err)) { LOG("%s", err.c_str()); return 1; }
     float cam[5] = {camIn[0], camIn[1], camIn[2], camIn[3], camIn[4]};
-    if (fromSpawn) {   // where Frame Home starts you: the spawn, eyes 1.6 m over its floor, facing its way
-        Locomotion loco;
-        loco.setWorld(walkWorld(scene));
-        float rig[16];
-        loco.rig(rig);
-        cam[0] = rig[12]; cam[1] = rig[13] + 1.6f; cam[2] = rig[14];
-        cam[3] = std::atan2(rig[8], rig[0]) * 180.0f / 3.14159265f;
-        LOG("spawn view: (%.2f %.2f %.2f) yaw %.0f", cam[0], cam[1], cam[2], cam[3]);
-    }
+    if (fromSpawn) spawnView(scene, cam);
     HslRenderer r;
     // FH_FOVEATE=level (1-3) and FH_GAZE=x,y (0..1 of the image): render foveated, looking there (tests foveation).
     if (const char* fv = std::getenv("FH_FOVEATE")) r.foveation = std::atoi(fv) > 0;
@@ -571,7 +569,7 @@ int runSnapshot(const std::string& out, const std::vector<std::string>& apks, co
 // FH_BENCH_MOVES=1 (with FH_BENCH_WALK): every 8 s, after 4 s of walking, a snap turn, a teleport ahead (aimed with the
 // real arc, landing at once) and a fast head turn (180 degrees in half a second): what a visitor does. The JSON's
 // "moves" says, for each, how many frames ran late and the slowest; "spikes" the slowest frames (s, ms, move).
-static long peakRamMB() { rusage u = {}; getrusage(RUSAGE_SELF, &u); return u.ru_maxrss / 1024; }   // (KB on Linux)
+static long peakRamMB() { return homeos::peakRamMB(); }
 
 int runBench(const std::vector<std::string>& apks, double seconds, uint32_t w, uint32_t h, float hz, bool unpaced) {
     const fs::path settingsPath = rootDir() / "settings.json";
@@ -614,8 +612,12 @@ int runBench(const std::vector<std::string>& apks, double seconds, uint32_t w, u
     r.msaa = perf.msaa;
     r.anisotropy = static_cast<float>(perf.anisotropy);
     r.foveation = perf.foveation > 0;
+#ifdef _WIN32
+    r.exportDirect = false;                           // (a PC: as the scene app draws; there's no system mode)
+#else
     r.deviceExtensions = {"VK_KHR_external_memory", "VK_KHR_external_memory_fd"};
     r.exportDirect = !std::getenv("FH_BENCH_COPY");   // as system mode draws (FH_BENCH_COPY=1: copied in, the old way)
+#endif
     r.exportSubsampled = !std::getenv("FH_EXPORT_PLAIN");   // likewise (FH_EXPORT_PLAIN=1: our smoothing pass)
     r.pipelineCachePath = (fs::temp_directory_path() / "frame-home-bench-pipelines.bin").string();
     if (const char* pc = std::getenv("FH_BENCH_PIPELINES")) r.pipelineCachePath = pc;
@@ -833,13 +835,13 @@ int runBench(const std::vector<std::string>& apks, double seconds, uint32_t w, u
     std::vector<const View*> picked;
     for (const View& v : views) {
         if (picked.size() >= 5) break;
-        bool near = false;                     // another picked view within 1.5 m looking within 40 degrees
+        bool nearOne = false;                  // another picked view within 1.5 m looking within 40 degrees
         for (const View* q : picked) {
             float dy = std::fabs(v.v[3] - q->v[3]);
             if (dy > 180) dy = 360 - dy;
-            near |= std::hypot(v.v[0] - q->v[0], v.v[2] - q->v[2]) < 1.5f && dy < 40;
+            nearOne |= std::hypot(v.v[0] - q->v[0], v.v[2] - q->v[2]) < 1.5f && dy < 40;
         }
-        if (near) continue;
+        if (nearOne) continue;
         picked.push_back(&v);
         char b[128];
         std::snprintf(b, sizeof b, "%s[%.2f,%.2f,%.2f,%.0f,%.0f,%.2f]", worst.empty() ? "" : ",", v.v[0], v.v[1], v.v[2], v.v[3], v.v[4], v.gpuMs);
@@ -896,10 +898,14 @@ int runBench(const std::vector<std::string>& apks, double seconds, uint32_t w, u
 }
 
 // Renders a home into the Frame's native environment panorama (equirect PNG) and prints the dome radius.
-int runPanorama(const std::string& out, const std::vector<std::string>& apks, const float cam[5], uint32_t width) {
+// A 360-degree picture of the home (equirectangular PNG, width x width/2) from `cam` (or the spawn), and beside it
+// <out>.json: the eye height and the dome radius SteamVR's background needs to project it (the panel on a PC sets it).
+int runPanorama(const std::string& out, const std::vector<std::string>& apks, const float camIn[5], uint32_t width, bool fromSpawn) {
     HslScene scene;
     std::string err;
     if (!loadHslScene(apks, scene, err)) { LOG("%s", err.c_str()); return 1; }
+    float cam[5] = {camIn[0], camIn[1], camIn[2], camIn[3], camIn[4]};
+    if (fromSpawn) spawnView(scene, cam);
     HslRenderer r;
     if (!r.init(256, 256)) return 1;
     if (!r.load(scene)) { LOG("nothing renderable"); return 1; }
@@ -910,8 +916,10 @@ int runPanorama(const std::string& out, const std::vector<std::string>& apks, co
     v.yawDeg = cam[3];
     std::vector<u8> rgb;
     if (!renderPanorama(r, v, width, rgb) || !writePng(out, rgb, width, width / 2)) { LOG("panorama failed"); return 1; }
-    std::printf("{\"png\": \"%s\", \"width\": %u, \"eyeHeight\": %.3f, \"domeRadius\": %.3f}\n", out.c_str(), width, cam[1],
-                panoramaDomeRadius(r, scene, v.eye));
+    char j[512];
+    std::snprintf(j, sizeof j, "{\"width\": %u, \"eyeHeight\": %.3f, \"domeRadius\": %.3f}\n", width, fromSpawn ? 1.6f : cam[1], panoramaDomeRadius(r, scene, v.eye));
+    std::printf("%s", j);
+    if (FILE* f = homeos::openFile(out + ".json", "w")) { std::fputs(j, f); std::fclose(f); }
     r.shutdown();
     return 0;
 }
@@ -936,10 +944,10 @@ Mat4 eyeProjection(vr::EVREye eye, float widen = 1.0f) {
 // system: Frame Home as the system environment (frame-home --system): not a scene app; it renders for the
 // compositor layer, which shows it in Aurora's place (env_share.h, layer/frame_home_layer.cpp).
 int runVr(const std::vector<std::string>& apks, bool system = false) {
-    if (!isatty(2)) {   // started by SteamVR: messages go to ~/frame-home/logs/frame-home.log
+    if (!homeos::stderrIsTerminal()) {   // started by SteamVR: messages go to ~/frame-home/logs/frame-home.log
         std::error_code ec;
         fs::create_directories(rootDir() / "logs", ec);
-        if (std::freopen((rootDir() / "logs" / "frame-home.log").c_str(), std::getenv("FH_RESTARTED") ? "a" : "w", stderr)) setvbuf(stderr, nullptr, _IOLBF, 0);
+        if (homeos::reopenStderr(rootDir() / "logs" / "frame-home.log", std::getenv("FH_RESTARTED") ? "a" : "w")) setvbuf(stderr, nullptr, _IOLBF, 0);
     }
     vr::EVRInitError ierr = vr::VRInitError_None;
     vr::VR_Init(&ierr, system ? vr::VRApplication_Overlay : vr::VRApplication_Scene);
@@ -967,6 +975,9 @@ int runVr(const std::vector<std::string>& apks, bool system = false) {
         ici.ppEnabledExtensionNames = ie.data();
         VkInstance probe = VK_NULL_HANDLE;
         if (vkCreateInstance(&ici, nullptr, &probe) != VK_SUCCESS) { LOG("no Vulkan instance"); vr::VR_Shutdown(); return 1; }
+#ifdef FH_USE_VOLK
+        volkLoadInstanceOnly(probe);               // (the renderer loads its own instance's after)
+#endif
         VkPhysicalDevice pd = pickVrDevice(probe);
         uint32_t dn = vr::VRCompositor()->GetVulkanDeviceExtensionsRequired(pd, nullptr, 0);
         std::string dext(dn, '\0');
@@ -1130,7 +1141,7 @@ int runVr(const std::vector<std::string>& apks, bool system = false) {
         }
     };
     checkHome();
-    if (loadState == 0) LOG("no home to show yet: put one in %s", (rootDir() / "envs").c_str());
+    if (loadState == 0) LOG("no home to show yet: put one in %s", homeos::envs().string().c_str());
     auto lastCheck = std::chrono::steady_clock::now();
 
     // System mode draws a little wider than the lens shows: the compositor turns the last frame with your head until the
@@ -1315,13 +1326,13 @@ int runVr(const std::vector<std::string>& apks, bool system = false) {
                 {   // what it's made of and what's wrong with it, for the Debug page (and logs/report.txt to read)
                     pendingReport.loadSec += uploadSec;
                     std::error_code ec;
-                    if (FILE* f = std::fopen((rootDir() / "report.json.part").c_str(), "w")) {
+                    if (FILE* f = homeos::openFile(rootDir() / "report.json.part", "w")) {
                         const std::string j = pendingReport.json();
                         std::fwrite(j.data(), 1, j.size(), f);
                         std::fclose(f);
                         fs::rename(rootDir() / "report.json.part", rootDir() / "report.json", ec);
                     }
-                    if (FILE* f = std::fopen((rootDir() / "logs" / "report.txt").c_str(), "w")) {
+                    if (FILE* f = homeos::openFile(rootDir() / "logs" / "report.txt", "w")) {
                         const std::string t = pendingReport.text();
                         std::fwrite(t.data(), 1, t.size(), f);
                         std::fclose(f);
@@ -1493,8 +1504,6 @@ int runVr(const std::vector<std::string>& apks, bool system = false) {
                 std::snprintf(b, sizeof b, "\"gpuMs\":%.2f,", statGpu / statGpuN);
                 j += b;
             }
-            long pages = 0, rssPages = 0;
-            if (FILE* sm = std::fopen("/proc/self/statm", "r")) { if (std::fscanf(sm, "%ld %ld", &pages, &rssPages) != 2) rssPages = 0; std::fclose(sm); }
             const HslRenderer::FrameStats& rs = r.lastStats();
             std::snprintf(b, sizeof b,
                           "\"budgetMs\":%.2f,\"scale\":%.2f,\"width\":%u,\"height\":%u,\"foveation\":%s,\"eyeTracking\":%s,\"msaa\":%d,"
@@ -1502,7 +1511,7 @@ int runVr(const std::vector<std::string>& apks, bool system = false) {
                           "\"ramMB\":%.0f,\"dashboard\":%s,\"debugView\":%d,\"loading\":%s,\"foveationLevel\":%d,\"tempC\":%.1f,\"margin\":%.3f,\"late\":%d,\"shownFps\":%.1f,\"home\":",
                           budget, scale, r.width(), r.height(), r.foveationActive() ? "true" : "false", gazeOk ? "true" : "false", perf.msaa,
                           statFrames ? statCpu / statFrames : 0.0, statFrames / secs, rs.draws, static_cast<unsigned long long>(rs.triangles), r.meshCount(),
-                          r.drawnCount(), r.texturesPending(), rssPages * (sysconf(_SC_PAGESIZE) / 1048576.0), dashboard ? "true" : "false", r.debugView(),
+                          r.drawnCount(), r.texturesPending(), homeos::ramMB(), dashboard ? "true" : "false", r.debugView(),
                           loadState != 0 || uploading ? "true" : "false", r.foveationActive() ? static_cast<int>(std::lround(r.foveationStrength())) : 0,
                           thermal.available() ? thermal.hottest() : 0.0f, widenN ? widenSum / widenN : widen, statLate, statPublished / secs);
             statLate = statPublished = 0;
@@ -1524,10 +1533,11 @@ int runVr(const std::vector<std::string>& apks, bool system = false) {
             }
             j += "}\n";
             statGpu = 0; statGpuN = 0; statCpu = 0; statFrames = 0;
-            if (FILE* f = std::fopen((statsPath.string() + ".part").c_str(), "w")) {
+            if (FILE* f = homeos::openFile(statsPath.string() + ".part", "w")) {
                 std::fwrite(j.data(), 1, j.size(), f);
                 std::fclose(f);
-                std::rename((statsPath.string() + ".part").c_str(), statsPath.c_str());
+                std::error_code rec;
+                fs::rename(statsPath.string() + ".part", statsPath, rec);
             }
         }
 
@@ -1538,7 +1548,7 @@ int runVr(const std::vector<std::string>& apks, bool system = false) {
             const bool layer = env.connect();
             if (env.refusedFlags()) {   // an older layer, or a compositor that can't sample them: plain images instead
                 LOG("the compositor can't read the frames with flags 0x%x: restarting with plain ones", env.refusedFlags());
-                setenv("FH_EXPORT_PLAIN", "1", 1);
+                homeos::setEnv("FH_EXPORT_PLAIN", "1");
                 restart = true;
                 running = false;
             }
@@ -1799,22 +1809,11 @@ int runVr(const std::vector<std::string>& apks, bool system = false) {
     r.shutdown();
     if (restart) {   // settings that build the renderer differently: start again as the same program (SteamVR
                      // knows it by its path, so it's still the environment)
-        char self[4096] = {};
-        const ssize_t n = readlink("/proc/self/exe", self, sizeof self - 1);
-        if (n > 0) {
-            if (lostDevice) std::this_thread::sleep_for(std::chrono::seconds(2));   // (a GPU still resetting: not straight back into it)
-            LOG("restarting %s", lostDevice ? "with a new GPU device" : "with the new settings");
-            std::fflush(stderr);
-            std::ifstream cl("/proc/self/cmdline", std::ios::binary);   // the same arguments as this run
-            std::vector<std::string> args;
-            for (std::string a; std::getline(cl, a, '\0');) args.push_back(a);
-            std::vector<char*> argv;
-            for (auto& a : args) argv.push_back(a.data());
-            if (argv.empty()) argv.push_back(self);
-            argv.push_back(nullptr);
-            setenv("FH_RESTARTED", "1", 1);
-            execv(self, argv.data());
-        }
+        if (lostDevice) std::this_thread::sleep_for(std::chrono::seconds(2));   // (a GPU still resetting: not straight back into it)
+        LOG("restarting %s", lostDevice ? "with a new GPU device" : "with the new settings");
+        std::fflush(stderr);
+        homeos::setEnv("FH_RESTARTED", "1");
+        homeos::restartSelf();
     }
     return 0;
 }
@@ -1823,17 +1822,61 @@ int runRegister(const char* manifest) {
     vr::EVRInitError ierr = vr::VRInitError_None;
     vr::VR_Init(&ierr, vr::VRApplication_Utility);
     if (ierr != vr::VRInitError_None) { LOG("VR_Init: %s", vr::VR_GetVRInitErrorAsEnglishDescription(ierr)); return 1; }
-    char full[4096];
     int rc = 1;
-    if (realpath(manifest, full)) {
-        vr::EVRApplicationError ae = vr::VRApplications()->AddApplicationManifest(full, false);
-        LOG("AddApplicationManifest(%s): %s", full, vr::VRApplications()->GetApplicationsErrorNameFromEnum(ae));
+    std::error_code ec;
+    if (fs::exists(manifest, ec)) {
+        const std::string full = fs::absolute(manifest, ec).u8string();
+        vr::EVRApplicationError ae = vr::VRApplications()->AddApplicationManifest(full.c_str(), false);
+        LOG("AddApplicationManifest(%s): %s", full.c_str(), vr::VRApplications()->GetApplicationsErrorNameFromEnum(ae));
         rc = ae == vr::VRApplicationError_None ? 0 : 1;
     } else {
         LOG("no such manifest: %s", manifest);
     }
     vr::VR_Shutdown();
     return rc;
+}
+
+// SteamVR's own settings that a PC install changes (steamvr section), kept in <root>/steamvr-before.json the first
+// time so an uninstall puts back exactly what was there.
+struct SteamVrBefore { bool homeApp = false, dome = false; int envMode = 1; std::string background; float camHeight = 1.6f, domeRadius = 0; };
+void saveSteamVrBefore() {
+    const fs::path f = rootDir() / "steamvr-before.json";
+    std::error_code ec;
+    if (fs::exists(f, ec)) return;                   // (already saved: what was there before Frame Home, not since)
+    vr::IVRSettings* s = vr::VRSettings();
+    vr::EVRSettingsError se = vr::VRSettingsError_None;
+    char bg[2048] = {};
+    s->GetString(vr::k_pch_SteamVR_Section, "background", bg, sizeof bg, &se);
+    std::string esc;
+    for (const char* c = bg; *c; ++c) { if (*c == '\\' || *c == '"') esc += '\\'; esc += *c; }
+    char j[4096];
+    std::snprintf(j, sizeof j, "{\"enableHomeApp\": %s, \"environmentMode\": %d, \"background\": \"%s\", \"backgroundUseDomeProjection\": %s, "
+                               "\"backgroundCameraHeight\": %.3f, \"backgroundDomeRadius\": %.3f}\n",
+                  s->GetBool(vr::k_pch_SteamVR_Section, "enableHomeApp", &se) ? "true" : "false", s->GetInt32(vr::k_pch_SteamVR_Section, "environmentMode", &se),
+                  esc.c_str(), s->GetBool(vr::k_pch_SteamVR_Section, "backgroundUseDomeProjection", &se) ? "true" : "false",
+                  s->GetFloat(vr::k_pch_SteamVR_Section, "backgroundCameraHeight", &se), s->GetFloat(vr::k_pch_SteamVR_Section, "backgroundDomeRadius", &se));
+    fs::create_directories(rootDir(), ec);
+    if (FILE* o = homeos::openFile(f, "w")) { std::fputs(j, o); std::fclose(o); }
+}
+void restoreSteamVrBefore() {
+    const fs::path f = rootDir() / "steamvr-before.json";
+    std::error_code ec;
+    SteamVrBefore b;
+    try {
+        const tinyjson::Value d = tinyjson::parse(readText(f));
+        b.homeApp = d["enableHomeApp"].boolVal; b.envMode = static_cast<int>(d["environmentMode"].asFloat()); b.background = d["background"].asString();
+        b.dome = d["backgroundUseDomeProjection"].boolVal; b.camHeight = d["backgroundCameraHeight"].asFloat(); b.domeRadius = d["backgroundDomeRadius"].asFloat();
+    } catch (...) {}                                  // (none saved: SteamVR's defaults)
+    vr::IVRSettings* s = vr::VRSettings();
+    vr::EVRSettingsError se = vr::VRSettingsError_None;
+    s->SetBool(vr::k_pch_SteamVR_Section, "enableHomeApp", b.homeApp, &se);
+    s->SetInt32(vr::k_pch_SteamVR_Section, "environmentMode", b.envMode, &se);
+    s->SetString(vr::k_pch_SteamVR_Section, "background", b.background.c_str(), &se);
+    s->SetBool(vr::k_pch_SteamVR_Section, "backgroundUseDomeProjection", b.dome, &se);
+    s->SetFloat(vr::k_pch_SteamVR_Section, "backgroundCameraHeight", b.camHeight, &se);
+    s->SetFloat(vr::k_pch_SteamVR_Section, "backgroundDomeRadius", b.domeRadius, &se);
+    fs::remove(f, ec);
+    fs::remove_all(rootDir() / "background", ec);
 }
 
 // Makes Frame Home SteamVR's environment: registers it under the home-app key and turns the home app on,
@@ -1844,29 +1887,32 @@ int runRegister(const char* manifest) {
 // registers it in SteamVR's config files instead.
 int runInstall(bool install) {
     const fs::path manifest = rootDir() / "frame-home.vrmanifest";
-    char self[4096] = {};
+    std::string self;
     if (install) {
-        const ssize_t n = readlink("/proc/self/exe", self, sizeof self - 1);
-        if (n <= 0) { LOG("cannot find my own path"); return 1; }
+        self = homeos::selfPath().string();
+        if (self.empty()) { LOG("cannot find my own path"); return 1; }
         // The installed copy is what SteamVR runs. The installer runs this from its own folder on purpose: SteamVR
         // knows apps by binary path, and the installed path would make this process pass for the running home.
         std::error_code ec;
-        const fs::path installed = rootDir() / "bin" / "frame-home";
-        if (fs::exists(installed, ec)) std::snprintf(self, sizeof self, "%s", installed.c_str());
-        fs::create_directories(rootDir() / "envs", ec);
+        const fs::path installed = rootDir() / "bin" / homeos::exeName("frame-home");
+        if (fs::exists(installed, ec)) self = installed.string();
+        fs::create_directories(homeos::envs(), ec);
+        std::string json = self;                     // (JSON: a Windows path's backslashes doubled)
+        for (size_t at = 0; (at = json.find('\\', at)) != std::string::npos; at += 2) json.insert(at, 1, '\\');
         std::ofstream m(manifest);
         m << "{\n  \"source\": \"builtin\",\n  \"applications\": [ {\n"
           << "    \"app_key\": \"" << kHomeAppKey << "\",\n"
           << "    \"launch_type\": \"binary\",\n"
-          << "    \"binary_path_linux\": \"" << self << "\",\n"
-          << "    \"binary_path_linux_arm\": \"" << self << "\",\n"
+          << "    \"binary_path_linux\": \"" << json << "\",\n"
+          << "    \"binary_path_linux_arm\": \"" << json << "\",\n"
+          << "    \"binary_path_windows\": \"" << json << "\",\n"
           << "    \"arguments\": \"\",\n"
           << "    \"is_dashboard_overlay\": false,\n"
           // The environment, not an app: kept out of SteamVR's app lists and its dock.
           << "    \"is_hidden\": true,\n"
           << "    \"is_internal\": true,\n"
           << "    \"strings\": { \"en_us\": { \"name\": \"Frame Home\",\n"
-          << "      \"description\": \"Meta homes as the Steam Frame's environment\" } }\n"
+          << "      \"description\": \"Meta homes as SteamVR's environment\" } }\n"
           << "  } ]\n}\n";
     }
     vr::EVRInitError ierr = vr::VRInitError_None;
@@ -1881,31 +1927,42 @@ int runInstall(bool install) {
             vr::VRApplications()->GetApplicationPropertyString(kHomeAppKey, vr::VRApplicationProperty_BinaryPath_String, path, sizeof path, &pe);
             if (std::string(path) != self) LOG("replacing the existing environment app (%s)", path);
         }
-        vr::EVRApplicationError ae = vr::VRApplications()->AddApplicationManifest(manifest.c_str(), false);
-        LOG("AddApplicationManifest(%s): %s", manifest.c_str(), vr::VRApplications()->GetApplicationsErrorNameFromEnum(ae));
+        vr::EVRApplicationError ae = vr::VRApplications()->AddApplicationManifest(manifest.u8string().c_str(), false);
+        LOG("AddApplicationManifest(%s): %s", manifest.u8string().c_str(), vr::VRApplications()->GetApplicationsErrorNameFromEnum(ae));
         if (ae != vr::VRApplicationError_None) rc = 1;
         // An older Frame Home still running: replace it with the installed one.
-        const bool replaced = !runningCopies("frame-home").empty();
-        stopCopies("frame-home");
+        const bool replaced = !homeos::runningCopies("frame-home").empty();
+        homeos::stopCopies("frame-home");
         const bool wasEnabled = vr::VRSettings()->GetBool(vr::k_pch_SteamVR_Section, "enableHomeApp");
+#ifdef _WIN32
+        // A Windows PC: SteamVR's classic environment (its background: the panel makes it a picture of the home)
+        // instead of Aurora, for the moments before Frame Home draws.
+        saveSteamVrBefore();
+        vr::VRSettings()->SetInt32(vr::k_pch_SteamVR_Section, "environmentMode", 0, &se);
+#endif
         vr::VRSettings()->SetBool(vr::k_pch_SteamVR_Section, "enableHomeApp", true, &se);
         // Turning the setting on makes SteamVR start the home app itself; when it was already on, start it now
         // unless a game is running (SteamVR brings the home back when the game quits).
-        usleep(1500000);
-        if ((wasEnabled || replaced) && runningCopies("frame-home").empty() &&
+        homeos::sleepMs(1500);
+        if ((wasEnabled || replaced) && homeos::runningCopies("frame-home").empty() &&
             vr::VRApplications()->GetSceneApplicationState() == vr::EVRSceneApplicationState_None) {
             const vr::EVRApplicationError le = vr::VRApplications()->LaunchApplication(kHomeAppKey);
             LOG("start: %s", vr::VRApplications()->GetApplicationsErrorNameFromEnum(le));
         }
     } else {
+#ifdef _WIN32
+        restoreSteamVrBefore();                      // the settings as they were before Frame Home
+#else
         vr::VRSettings()->SetBool(vr::k_pch_SteamVR_Section, "enableHomeApp", false, &se);
+#endif
         std::error_code ec;
         if (fs::exists(manifest, ec)) {
-            vr::EVRApplicationError ae = vr::VRApplications()->RemoveApplicationManifest(manifest.c_str());
+            vr::EVRApplicationError ae = vr::VRApplications()->RemoveApplicationManifest(manifest.u8string().c_str());
             LOG("RemoveApplicationManifest: %s", vr::VRApplications()->GetApplicationsErrorNameFromEnum(ae));
+            fs::remove(manifest, ec);                // (the panel takes SteamVR's settings in hand only while this is here)
         }
         // Close a running Frame Home so SteamVR's own environment comes back.
-        stopCopies("frame-home");
+        homeos::stopCopies("frame-home");
     }
     if (se != vr::VRSettingsError_None) { LOG("settings error %d", static_cast<int>(se)); rc = 1; }
     LOG("%s", rc ? "failed" : install ? "Frame Home is now the environment" : "SteamVR's environment restored");
@@ -1916,9 +1973,12 @@ int runInstall(bool install) {
 }  // namespace
 
 int main(int argc, char** argv) {
+#ifdef FH_USE_VOLK
+    if (volkInitialize() != VK_SUCCESS) { std::fprintf(stderr, "frame-home: no Vulkan on this system\n"); return 1; }
+#endif
     std::string snapshot, panorama;
     std::vector<std::string> apks;                   // footprint [+ vista]
-    bool list = false, spawnView = false, bench = false, unpaced = false;
+    bool list = false, fromSpawn = false, bench = false, unpaced = false;
     float cam[5] = {0, 1.6f, 0, 0, 0};
     uint32_t size = 1024, sizeH = 0;
     double benchSeconds = 20;
@@ -1932,7 +1992,7 @@ int main(int argc, char** argv) {
         if (a == "--list") list = true;
         else if (a == "--panorama" && i + 1 < argc) panorama = argv[++i];
         else if (a == "--snapshot" && i + 1 < argc) snapshot = argv[++i];
-        else if (a == "--spawn") spawnView = true;
+        else if (a == "--spawn") fromSpawn = true;
         else if (a == "--cam" && i + 1 < argc) std::sscanf(argv[++i], "%f,%f,%f,%f,%f", &cam[0], &cam[1], &cam[2], &cam[3], &cam[4]);
         else if (a == "--size" && i + 1 < argc) {   // N, or WxH (--bench)
             unsigned sw = 0, sh = 0;
@@ -1975,13 +2035,13 @@ int main(int argc, char** argv) {
         const bool given = std::any_of(argv + 1, argv + argc, [](const char* x) { return std::strcmp(x, "--size") == 0; });
         return runBench(apks, benchSeconds, given ? size : 0, given ? (sizeH ? sizeH : size) : 0, benchHz, unpaced);
     }
-    if (!panorama.empty() && !apks.empty()) return runPanorama(panorama, apks, cam, size >= 512 ? size : 8192);
+    if (!panorama.empty() && !apks.empty()) return runPanorama(panorama, apks, cam, size >= 512 ? size : 8192, fromSpawn);
     if (!snapshot.empty()) {
         if (apks.empty()) {
             std::fprintf(stderr, "usage: frame-home --snapshot out.ppm [--cam x,y,z,yaw,pitch] [--size N] <footprint.apk> [vista.apk]\n");
             return 2;
         }
-        return runSnapshot(snapshot, apks, cam, size, spawnView);
+        return runSnapshot(snapshot, apks, cam, size, fromSpawn);
     }
     if (std::getenv("FH_SYSTEM") || (argc > 1 && std::string(argv[1]) == "--system")) return runVr({}, true);
     return runVr(apks);                              // no home given: environment mode

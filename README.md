@@ -98,3 +98,16 @@ and the CI: [docs/building.md](docs/building.md).
 | `tools/`, `tests_loco/` | Test and measuring tools, movement tests |
 | `third_party/` | Vendored libraries (each with its own license) |
 | `docs/` | The guides |
+
+## License
+
+Frame Studio and Frame Home are licensed under the **GNU Affero General Public License v3.0**: see [LICENSE](LICENSE).
+You may use, study, change and share them; if you share a changed version, or run one for others over a network,
+its source must be available under the same license.
+
+Vendored libraries in `third_party/` keep their own licenses (in each folder). The home loaders in `third_party/qhe`
+started from Quest Home Editor and keep its MIT license for the original code; see
+[third_party/qhe/LICENSE.md](third_party/qhe/LICENSE.md).
+
+Neither license covers Meta's homes or other assets: Frame Studio only works with files you already have, and no
+Meta content is included in this repository or its downloads.

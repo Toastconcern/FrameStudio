@@ -6587,7 +6587,7 @@ struct Studio {
             {"Hide / unhide all", "H / Alt + H"}, {"Delete", "X or Delete"}, {"Undo / redo", "Ctrl + Z / Ctrl + Shift + Z"},
             {"Open / save edits", "Ctrl + O / Ctrl + S"}, {"Show only selected", "I (I or Esc shows everything)"},
             {"Show / hide world layer", "W (each kind: View \u203a Show, or the eyes in the explorer)"},
-            {"Floor / wall from a mesh", "Object panel \u203a Surface, or right-click it"},
+            {"Floor / wall from a mesh", "Inspector \u203a Selected \u203a Surface, or right-click it"},
             {"Every mesh walkable where flat, blocking where steep", "World \u203a Auto-generate Walkable Surfaces"},
             {"Deselect", "Esc"}};
         if (ImGui::BeginTable("keys", 2, ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingFixedFit)) {

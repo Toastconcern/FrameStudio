@@ -15,6 +15,6 @@ Thumbs.db
 *.pem
 id_rsa*
 id_ed25519*
-*:Zone.Identifier
+*Zone.Identifier
 # astcenc's own test framework (not built here)
 third_party/astcenc/Source/GoogleTest/

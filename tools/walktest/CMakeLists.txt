@@ -8,6 +8,7 @@
 #   listcolliders <apk>          the world's box / sphere / capsule colliders
 #   animcheck <apk> <fenv> [sweep s]   a Clay / glTF home's animation from the APK against the baked .fenv (bit for bit)
 #   animrender <home> <prefix> <size> <t,t,...>   the home drawn at those animation times (APK against .fenv)
+#   wallcheck <home> [drawn]    invisible walls at every angle: no walkable area inside them (exit 2 if there is)
 #   bakecmp <home> <home>        both baked as they load, byte for byte (a .fenv's scene re-baked against its APK's bake)
 #   fenv-tool report <apk[+vista]|fenv>   the home report (home_report.h), as Frame Studio and Frame Home make it
 #   worldrender <apk> <prefix> <size> [seats|spots|cams x,y,z,yaw,pitch ...] [view=N hide=bits world]: the home rendered with the area and
@@ -95,6 +96,9 @@ add_executable(animrender animrender.cpp ${R}/src/hsl_renderer.cpp ${TP}/volk/vo
 target_compile_definitions(animrender PRIVATE FH_USE_VOLK)
 target_include_directories(animrender PRIVATE ${TP}/volk ${TP}/vulkan-headers/include)
 target_link_libraries(animrender frame-scene)
+# wallcheck <home> [drawn]: invisible walls at every angle never have walkable area inside them
+add_executable(wallcheck wallcheck.cpp)
+target_link_libraries(wallcheck frame-scene)
 # bakecmp <home> <home>: both baked as loaded, byte for byte (a .fenv re-baked against its APK's bake)
 add_executable(bakecmp bakecmp.cpp)
 target_link_libraries(bakecmp frame-scene)

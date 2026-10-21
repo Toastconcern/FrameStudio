@@ -101,11 +101,15 @@ edges, grey are floors you can't reach. **W** shows or hides it.
 | **Teleport Hotspot** | a spot the teleport arc snaps to |
 | **Surface** | a box you can scale into a floor, a step or a wall |
 | **Wall Spot** | where SteamVR's panels dock |
-| **Gravity Zone** | inside it, "down" is the zone's own: a direction, any surface you stand on, or a planet's pull |
-| **Planet** | a sphere you can walk all the way round |
+| **Invisible Wall** | stops you; never drawn on the headset. Scale and turn it to fit; where it stands is no longer walkable |
+| **Gravity Zone** | inside it, "down" is the zone's own: a direction, or any surface you stand on |
 
 Select an item to move it with the gizmo or type its values in the Selected tab. **World > Clear World Layer**
 removes them all.
+
+Meta's own homes have invisible walls too, round their play space (Cascadia, Space Station, Desert Terrace, Haven).
+Frame Studio and Frame Home read them as invisible walls, so you can't walk out past them. Select one in the Explorer
+to delete it, or set its **Role** to Surface, if you want to go further in that home.
 
 ## The environment: name, picture, sound
 

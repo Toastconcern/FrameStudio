@@ -8854,22 +8854,33 @@ bool ImGui::BeginMenuEx(const char* label, const char* icon, bool enabled)
         bool moving_toward_child_menu = false;
         ImGuiPopupData* child_popup = (g.BeginPopupStack.Size < g.OpenPopupStack.Size) ? &g.OpenPopupStack[g.BeginPopupStack.Size] : NULL; // Popup candidate (testing below)
         ImGuiWindow* child_menu_window = (child_popup && child_popup->Window && child_popup->Window->ParentWindow == window) ? child_popup->Window : NULL;
-        if (g.HoveredWindow == window && child_menu_window != NULL)
+        // Frame Studio: a safe triangle from where the pointer last was on the item whose submenu is open to the
+        // submenu's whole near edge (not just the last frame's move, capped at 8 lines): while the pointer stays inside
+        // it, crossing other items on the way there neither opens them nor closes the submenu. Resting still on another
+        // item for a moment still opens that one.
+        if (child_menu_window != NULL)
         {
-            const float ref_unit = g.FontSize; // FIXME-DPI
-            const float child_dir = (window->Pos.x < child_menu_window->Pos.x) ? 1.0f : -1.0f;
-            const ImRect next_window_rect = child_menu_window->Rect();
-            ImVec2 ta = (g.IO.MousePos - g.IO.MouseDelta);
-            ImVec2 tb = (child_dir > 0.0f) ? next_window_rect.GetTL() : next_window_rect.GetTR();
-            ImVec2 tc = (child_dir > 0.0f) ? next_window_rect.GetBL() : next_window_rect.GetBR();
-            const float pad_farmost_h = ImClamp(ImFabs(ta.x - tb.x) * 0.30f, ref_unit * 0.5f, ref_unit * 2.5f); // Add a bit of extra slack.
-            ta.x += child_dir * -0.5f;
-            tb.x += child_dir * ref_unit;
-            tc.x += child_dir * ref_unit;
-            tb.y = ta.y + ImMax((tb.y - pad_farmost_h) - ta.y, -ref_unit * 8.0f); // Triangle has maximum height to limit the slope and the bias toward large sub-menus
-            tc.y = ta.y + ImMin((tc.y + pad_farmost_h) - ta.y, +ref_unit * 8.0f);
-            moving_toward_child_menu = ImTriangleContainsPoint(ta, tb, tc, g.IO.MousePos);
-            //GetForegroundDrawList()->AddTriangleFilled(ta, tb, tc, moving_toward_child_menu ? IM_COL32(0,128,0,128) : IM_COL32(128,0,0,128)); // [DEBUG]
+            ImGuiStorage* aim = &window->StateStorage;
+            const ImGuiID aim_x = ImHashStr("##menu_aim_x", 0, child_popup->PopupId), aim_y = ImHashStr("##menu_aim_y", 0, child_popup->PopupId);
+            const ImGuiID aim_t = ImHashStr("##menu_aim_t", 0, child_popup->PopupId);
+            if (child_popup->PopupId == id && hovered) { aim->SetFloat(aim_x, g.IO.MousePos.x); aim->SetFloat(aim_y, g.IO.MousePos.y); }
+            if (g.IO.MouseDelta.x != 0.0f || g.IO.MouseDelta.y != 0.0f) aim->SetFloat(aim_t, (float)g.Time);
+            if (g.HoveredWindow == window && aim->GetFloat(aim_x, -FLT_MAX) != -FLT_MAX)
+            {
+                const float ref_unit = g.FontSize; // FIXME-DPI
+                const float child_dir = (window->Pos.x < child_menu_window->Pos.x) ? 1.0f : -1.0f;
+                const ImRect next_window_rect = child_menu_window->Rect();
+                ImVec2 ta(aim->GetFloat(aim_x), aim->GetFloat(aim_y));
+                ImVec2 tb = (child_dir > 0.0f) ? next_window_rect.GetTL() : next_window_rect.GetTR();
+                ImVec2 tc = (child_dir > 0.0f) ? next_window_rect.GetBL() : next_window_rect.GetBR();
+                ta.x += child_dir * -0.5f;
+                tb.x += child_dir * ref_unit;
+                tc.x += child_dir * ref_unit;
+                tb.y -= ref_unit * 0.5f;
+                tc.y += ref_unit * 0.5f;
+                const bool resting = (float)g.Time - aim->GetFloat(aim_t, (float)g.Time) > 0.30f;
+                moving_toward_child_menu = !resting && ImTriangleContainsPoint(ta, tb, tc, g.IO.MousePos);
+            }
         }
 
         // The 'HovereWindow == window' check creates an inconsistency (e.g. moving away from menu slowly tends to hit same window, whereas moving away fast does not)

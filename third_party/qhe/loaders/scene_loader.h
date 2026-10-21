@@ -225,6 +225,32 @@ public:
     struct SpawnPt { std::string name, tag; float pos[3]={0,0,0}, euler[3]={0,0,0}; int meshIdx=-1; };
     std::vector<SpawnPt> spawnPts;
     HomeWorld world;                   // spawns, seats, hotspots, colliders, wall spots (world space), from every HSTF
+
+    // Whether an HSTF entity draws anything (a MeshPlatformComponent): its colliders are then that thing's.
+    static bool entityDrawn(const tinyjson::Value& ent) {
+        for (const auto& c : ent["components"].arrVal)
+            if (c["data"]["class"].asString() == "horizon::platform_api::MeshPlatformComponent") return true;
+        return false;
+    }
+    // How tall a collider stands in the world (world Y extent), metres.
+    static float verticalExtent(const WorldCollider& c) {
+        const float* m = c.world;
+        auto axisY = [&](int k) { return std::fabs(m[k * 4 + 1]); };                                    // a local axis' world Y
+        auto axisLen = [&](int k) { return std::sqrt(m[k * 4] * m[k * 4] + m[k * 4 + 1] * m[k * 4 + 1] + m[k * 4 + 2] * m[k * 4 + 2]); };
+        switch (c.kind) {
+            case WorldCollider::Box: return 2 * (axisY(0) * c.half[0] + axisY(1) * c.half[1] + axisY(2) * c.half[2]);
+            case WorldCollider::Sphere: return 2 * c.radius * std::max({axisLen(0), axisLen(1), axisLen(2)});
+            case WorldCollider::Capsule: return axisY(1) * c.length + 2 * c.radius * std::max({axisLen(0), axisLen(1), axisLen(2)});
+            default: {
+                float lo = 1e30f, hi = -1e30f;
+                for (size_t v = 0; v + 2 < c.positions.size(); v += 3) {
+                    const float y = m[1] * c.positions[v] + m[5] * c.positions[v + 1] + m[9] * c.positions[v + 2] + m[13];
+                    lo = std::min(lo, y); hi = std::max(hi, y);
+                }
+                return hi > lo ? hi - lo : 0.0f;
+            }
+        }
+    }
     bool hasAnimation() const {
         for (auto& g : animGroups) if (g.skel.ok() && g.clip.ok() && !g.skinRecs.empty()) return true;
         return false;
@@ -650,6 +676,11 @@ public:
                                 if (hi[0] - lo[0] > 200 || hi[1] - lo[1] > 200 || hi[2] - lo[2] > 200) continue;
                                 col.indices = std::move(idx);
                             }
+                            // Meta's invisible walls: a solid collider with nothing drawn for it, standing 2 m or more
+                            // (the bounds round a home's play area: Cascadia's, Space Station's, Desert Terrace's, Haven's
+                            // moats). They become invisible walls (Object): they stop you, and their tops, metres up, are
+                            // never floor. Flatter ones stay surfaces (floors, ceilings, a desk's top).
+                            if (col.role == WorldCollider::Solid && !entityDrawn(ent) && verticalExtent(col) >= 2.0f) col.role = WorldCollider::Object;
                             world.colliders.push_back(std::move(col));
                         }
                     }

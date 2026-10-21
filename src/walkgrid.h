@@ -1265,11 +1265,27 @@ inline std::shared_ptr<WalkGrid> buildWalkGrid(const std::vector<WalkSource>& so
             }
         }
     }
+    // A wall (a Wall / Object surface: an invisible wall) within a body's radius of a span, in the body's way there.
+    const int wallReach = static_cast<int>(std::ceil(P.radius / cs));
+    auto wallNear = [&](size_t s) {
+        const float h = cs_[s].hi, reach = P.radius + cs;
+        for (int dz = -wallReach; dz <= wallReach; ++dz)
+            for (int dx = -wallReach; dx <= wallReach; ++dx) {
+                const int x = spanX[s] + dx, z = spanZ[s] + dz;
+                if (x < 0 || z < 0 || x >= nx || z >= nz || static_cast<float>(dx * dx + dz * dz) * cs * cs > reach * reach) continue;
+                const size_t cell = static_cast<size_t>(z) * nx + x;
+                for (uint32_t t = cstart[cell]; t < cstart[cell + 1]; ++t)
+                    if ((cs_[t].flags & kWalkWall) && cs_[t].lo < h + P.headroom && cs_[t].hi > h - P.step) return true;
+            }
+        return false;
+    };
     std::vector<uint8_t> core(nsp, 0);
     for (size_t s = 0; s < nsp; ++s) {
         if (!cand[s]) { dist[s] = 0; continue; }
         dist[s] = std::sqrt(std::min(dist[s], 1e8f)) * cs;
-        if (cs_[s].flags & kWalkFloorRole) dist[s] = std::max(dist[s], 2 * P.radius);   // its edge is where it ends
+        // A drawn floor's edge is where it ends (walkable right up to it), but a wall standing on it still keeps
+        // the body its radius away: one drawn through it takes that floor away.
+        if ((cs_[s].flags & kWalkFloorRole) && !wallNear(s)) dist[s] = std::max(dist[s], 2 * P.radius);
         core[s] = dist[s] >= P.radius - 1e-4f;
     }
     // 6. Separate areas; keep the ones the player can get to.

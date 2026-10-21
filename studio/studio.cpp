@@ -405,7 +405,7 @@ const uint32_t kShowColors[kShowCats] = {0x3fd2ff, 0x5fe07a, 0xffd84a, 0x4cd964,
 const char* kGravityNames[3] = {"Direction", "Planet", "Walk on any surface"};
 const char* kGravityHelp[3] = {
     "Inside the box, down is the box's -Y: rotate the zone to choose which way is down (a wall or the ceiling as the floor).",
-    "Down points at the centre within the pull radius: walk all the way round. Give the planet a walkable surface (World > Add > Planet makes both).",
+    "Down points at the centre within the pull radius: walk all the way round it (made by older versions of Frame Studio).",
     "Inside the box, the surface under your feet is the floor: walk off the floor up a wall and across the ceiling."};
 
 // A collider's role, as Studio names and explains it. There's one kind of surface: you walk on it where it's flat
@@ -1476,7 +1476,7 @@ struct Studio {
 
     // What an environment is comes from its file alone: a .fenv's world layer, edits, sound, name and picture; a
     // Meta home or models opened fresh, as they ship. Nothing is kept on the side between opens. The one exception is
-    // a reload of the open home (Add Vista, Add Models, a planet): its unsaved changes are carried across it.
+    // a reload of the open home (Add Vista, Add Models): its unsaved changes are carried across it.
     struct Carry { bool any = false; std::vector<ObjectEdit> objects; std::string world, title, image; SoundState sound; WorldSettings settings; } carry;
     std::vector<ObjectEdit> currentObjectEdits() const {
         std::vector<ObjectEdit> v;
@@ -2762,6 +2762,21 @@ struct Studio {
     void walkSettingsChanged() { walkSaveNext = true; walkPending = true; walkChanged = std::chrono::steady_clock::now(); }
 
     // A Frame Home walker on the area as shown (placing things on the floor, the self-test).
+    // The floor under (x, z) from height y down (up to 0.5 m above it): the walkable area's, else the home's own
+    // surfaces there (a spot beyond the area: past a home's invisible walls, or out of reach).
+    bool floorUnder(float x, float z, float y, float& out) {
+        WorldRuntime rt;
+        walkRuntime(rt);
+        if (rt.floorAt(x, z, y, 0.5f, 5.0f, out)) return true;
+        if (!walkShown) return false;                    // (that was the surfaces already)
+        HomeWorld w = scene->world;
+        w.walkGrid.clear();
+        w.walkGridCache.reset();
+        WorldRuntime surfaces;
+        surfaces.build(w);
+        return surfaces.floorAt(x, z, y, 0.5f, 5.0f, out);
+    }
+
     void walkRuntime(WorldRuntime& rt) {
         HomeWorld w = scene->world;
         w.walkGridCache = walkShown;
@@ -3311,131 +3326,41 @@ struct Studio {
         selected = -1;
     }
 
-    // A planet's surface, 1024 x 512 in latitude / longitude: seas, sand, grass, rock and snow from layered value
-    // noise sampled on the sphere (no seam at the date line), with soft sunlight baked in.
-    static void writePlanetTexture(const fs::path& path, uint32_t seed) {
-        auto hash = [seed](int x, int y, int z) {
-            uint32_t h = static_cast<uint32_t>(x) * 374761393u + static_cast<uint32_t>(y) * 668265263u + static_cast<uint32_t>(z) * 2147483647u + seed * 974711u;
-            h = (h ^ (h >> 13)) * 1274126177u;
-            return ((h ^ (h >> 16)) & 0xffff) / 65535.0f;
-        };
-        auto noise = [&](float x, float y, float z) {   // trilinear value noise
-            const int xi = static_cast<int>(std::floor(x)), yi = static_cast<int>(std::floor(y)), zi = static_cast<int>(std::floor(z));
-            const float fx = x - xi, fy = y - yi, fz = z - zi;
-            auto sm = [](float t) { return t * t * (3 - 2 * t); };
-            const float u = sm(fx), v = sm(fy), w = sm(fz);
-            float r = 0;
-            for (int c = 0; c < 8; ++c) {
-                const float wt = (c & 1 ? u : 1 - u) * (c & 2 ? v : 1 - v) * (c & 4 ? w : 1 - w);
-                r += wt * hash(xi + (c & 1), yi + ((c >> 1) & 1), zi + ((c >> 2) & 1));
-            }
-            return r;
-        };
-        const int W = 1024, H = 512;
-        std::vector<u8> px(static_cast<size_t>(W) * H * 4);
-        const float L[3] = {0.48f, 0.78f, 0.40f};
-        for (int y = 0; y < H; ++y)
-            for (int x = 0; x < W; ++x) {
-                const float th = kPi * (y + 0.5f) / H, ph = 2 * kPi * (x + 0.5f) / W;
-                const float d[3] = {std::sin(th) * std::cos(ph), std::cos(th), std::sin(th) * std::sin(ph)};
-                float h = 0, amp = 0.5f, fr = 1.6f;
-                for (int o = 0; o < 6; ++o) { h += amp * noise(d[0] * fr + 11, d[1] * fr + 7, d[2] * fr + 3); amp *= 0.5f; fr *= 2.1f; }
-                const float pole = std::fabs(d[1]);
-                float c[3];
-                auto mixc = [&](const float* a, const float* b, float t) { t = std::clamp(t, 0.0f, 1.0f); for (int k = 0; k < 3; ++k) c[k] = a[k] + (b[k] - a[k]) * t; };
-                static const float deep[3] = {0.05f, 0.16f, 0.38f}, shallow[3] = {0.10f, 0.38f, 0.58f}, sand[3] = {0.78f, 0.72f, 0.50f},
-                                   grass[3] = {0.25f, 0.52f, 0.20f}, forest[3] = {0.13f, 0.34f, 0.14f}, rock[3] = {0.46f, 0.42f, 0.38f}, snow[3] = {0.94f, 0.95f, 0.97f};
-                if (h < 0.46f) mixc(deep, shallow, (h - 0.30f) / 0.16f);
-                else if (h < 0.49f) mixc(sand, sand, 0);
-                else if (h < 0.60f) mixc(grass, forest, (h - 0.49f) / 0.11f);
-                else if (h < 0.68f) mixc(forest, rock, (h - 0.60f) / 0.08f);
-                else mixc(rock, snow, (h - 0.68f) / 0.06f);
-                if (pole > 0.86f) mixc(c, snow, (pole - 0.86f) / 0.06f);   // ice caps
-                const float lit = 0.55f + 0.45f * std::max(0.0f, d[0] * L[0] + d[1] * L[1] + d[2] * L[2]);
-                u8* p = &px[(static_cast<size_t>(y) * W + x) * 4];
-                for (int k = 0; k < 3; ++k) p[k] = static_cast<u8>(std::clamp(c[k] * lit, 0.0f, 1.0f) * 255.0f + 0.5f);
-                p[3] = 255;
-            }
-        if (FILE* f = platform::openFile(path.c_str(), "wb")) {
-            stbi_write_png_to_func([](void* ctx, void* data, int size) { std::fwrite(data, 1, static_cast<size_t>(size), static_cast<FILE*>(ctx)); },
-                                   f, W, H, 4, px.data(), W * 4);
-            std::fclose(f);
-        }
-    }
-
-    // World > Add > Planet: a walkable sphere you can see (a generated model) with planet gravity round it, in
-    // front of the view. Adding the model reloads the home, so the world layer is saved first.
-    void addPlanet(float radius) {
-        if (!scene || saving || uploading || texLoading || loadState == 1) return;   // it reloads the home
-        float fwd[3];
-        cam.forward(fwd);
-        const float c[3] = {cam.pivot[0] + fwd[0] * (radius + 4), cam.pivot[1] + fwd[1] * (radius + 4), cam.pivot[2] + fwd[2] * (radius + 4)};
+    // World > Add > Invisible Wall: 2 m wide and 2.5 m tall, standing on the floor where the camera looks, across
+    // the view. Frame Home never draws it; it stops you (Object), and the walkable area it stands in is taken away
+    // (the walk grid never stands anyone in a wall's columns).
+    void addInvisibleWall() {
+        if (!scene) return;
         pushWorldUndo();
         HomeWorld& w = scene->world;
+        const float x = cam.pivot[0], z = cam.pivot[2];
+        float y = cam.pivot[1] - 1.6f;
+        {   // on the floor under the pivot when there is one
+            float f;
+            if (floorUnder(x, z, cam.pivot[1], f)) y = f;
+        }
+        float fwd[3];
+        cam.forward(fwd);
+        float fx = fwd[0], fz = fwd[2];
+        const float fl = std::sqrt(fx * fx + fz * fz);
+        if (fl < 1e-4f) { fx = 0; fz = 1; } else { fx /= fl; fz /= fl; }
+        WorldCollider c;
         int n = 1;
-        for (const WorldGravity& g : w.gravity) n += g.kind == WorldGravity::Planet;
-        WorldCollider s;
-        s.name = "Planet " + std::to_string(n);
-        s.kind = WorldCollider::Sphere;
-        s.role = WorldCollider::Solid;
-        s.radius = radius;
-        translation(s.world, c[0], c[1], c[2]);
-        w.colliders.push_back(s);
-        WorldGravity g;
-        g.kind = WorldGravity::Planet;
-        g.name = "Planet " + std::to_string(n) + " gravity";
-        g.radius = radius * 3;
-        g.priority = static_cast<int>(w.gravity.size());
-        translation(g.world, c[0], c[1], c[2]);
-        w.gravity.push_back(g);
-        wKind = kGravity;
-        wIndex = worldCount(kGravity) - 1;
+        for (const WorldCollider& o : w.colliders) n += isInvisibleWall(o);
+        c.name = "Invisible wall " + std::to_string(n);
+        c.kind = WorldCollider::Box;
+        c.role = WorldCollider::Object;
+        c.placed = true;
+        c.half[0] = 1.0f; c.half[1] = 1.25f; c.half[2] = 0.05f;
+        const float m[16] = {fz, 0, -fx, 0,  0, 1, 0, 0,  fx, 0, fz, 0,  x, y + c.half[1], z, 1};   // local X across the view
+        std::copy_n(m, 16, c.world);
+        w.colliders.push_back(c);
+        wKind = kCollider;
+        wIndex = static_cast<int>(w.colliders.size()) - 1;
         selected = -1;
-        if (openHomeIsFenv()) {
-            platform::message("Frame Studio", "The planet's surface and gravity are added. To also see it, open the environment's original home: "
-                                              "a saved .fenv can't take new models.");
-            return;
-        }
-        // The visible sphere: a UV sphere written as OBJ, added like any imported model.
-        std::error_code ec;
-        fs::create_directories(dataDir() / L"models", ec);
-        // A name no other home's planet has: the sphere's vertices are where this one stands, so reusing a file
-        // would move another home's planet here.
-        std::string stem;
-        for (int k = 0;; ++k) {
-            stem = "planet-" + std::to_string(n) + "-" + std::to_string(static_cast<int>(radius * 100)) + (k ? "-" + std::to_string(k) : "");
-            if (!fs::exists(dataDir() / L"models" / widen(stem + ".obj"), ec)) break;
-        }
-        const fs::path obj = dataDir() / L"models" / widen(stem + ".obj");
-        writePlanetTexture(dataDir() / L"models" / widen(stem + ".png"), static_cast<uint32_t>(n * 7919 + radius * 13));
-        if (FILE* m = platform::openFile((dataDir() / L"models" / widen(stem + ".mtl")).c_str(), "wb")) {
-            std::fprintf(m, "newmtl Planet\nKd 1 1 1\nmap_Kd %s.png\n", stem.c_str());
-            std::fclose(m);
-        }
-        if (FILE* f = platform::openFile(obj.c_str(), "wb")) {
-            const int lat = 48, lon = 96;
-            std::fprintf(f, "# Frame Studio planet, radius %.2f m\nmtllib %s.mtl\no Planet%d\nusemtl Planet\n", radius, stem.c_str(), n);
-            for (int i = 0; i <= lat; ++i)
-                for (int j = 0; j <= lon; ++j) {
-                    const float th = kPi * i / lat, ph = 2 * kPi * j / lon;
-                    const float d[3] = {std::sin(th) * std::cos(ph), std::cos(th), std::sin(th) * std::sin(ph)};
-                    std::fprintf(f, "v %.4f %.4f %.4f\nvn %.4f %.4f %.4f\nvt %.4f %.4f\n", c[0] + d[0] * radius, c[1] + d[1] * radius, c[2] + d[2] * radius,
-                                 d[0], d[1], d[2], static_cast<float>(j) / lon, 1.0f - static_cast<float>(i) / lat);
-                }
-            for (int i = 0; i < lat; ++i)
-                for (int j = 0; j < lon; ++j) {
-                    const int a = i * (lon + 1) + j + 1, b = a + lon + 1;
-                    std::fprintf(f, "f %d/%d/%d %d/%d/%d %d/%d/%d\nf %d/%d/%d %d/%d/%d %d/%d/%d\n", a, a, a, a + 1, a + 1, a + 1, b, b, b,
-                                 a + 1, a + 1, a + 1, b + 1, b + 1, b + 1, b, b, b);
-                }
-            std::fclose(f);
-        }
-        carryAcrossReload();                            // keeps the new surface and gravity across the reload
-        dirty = false;
-        std::vector<std::string> paths = homePaths;
-        paths.push_back(narrow(obj.wstring()));
-        open(paths, false);
+        walkPending = true;
     }
+    static bool isInvisibleWall(const WorldCollider& c) { return c.kind != WorldCollider::Mesh && c.role == WorldCollider::Object; }
 
     // New items go where the camera looks, on the floor below it.
     void addWorld(int kind) {
@@ -3445,10 +3370,8 @@ struct Studio {
         const float x = cam.pivot[0], z = cam.pivot[2];
         float y = cam.pivot[1] - 1.6f;
         {   // drop onto the floor under the pivot when there is one
-            WorldRuntime rt;
-            walkRuntime(rt);
             float f;
-            if (rt.floorAt(x, z, cam.pivot[1], 0.5f, 5.0f, f)) y = f;
+            if (floorUnder(x, z, cam.pivot[1], f)) y = f;
         }
         WorldPoint p;
         p.pos[0] = x; p.pos[1] = y; p.pos[2] = z;
@@ -4040,19 +3963,12 @@ struct Studio {
                 if (ImGui::MenuItem("Teleport Hotspot")) addWorld(kHotspot);
                 ImGui::Separator();
                 if (ImGui::MenuItem("Surface (2 x 2 m box: scale it into a floor, a step or a wall)")) addWorld(kCollider);
+                if (ImGui::MenuItem("Invisible Wall")) addInvisibleWall();
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("Stops the player, never drawn on the headset. Scale and turn it to fit;\nwhere it stands is no longer walkable.");
                 if (ImGui::MenuItem("Wall Spot (panel placement)")) addWorld(kWallSpot);
                 ImGui::Separator();
                 if (ImGui::MenuItem("Gravity Zone: Direction")) addGravity(WorldGravity::Direction);
                 if (ImGui::MenuItem("Gravity Zone: Walk on Any Surface")) addGravity(WorldGravity::Surface);
-                if (ImGui::MenuItem("Gravity Zone: Planet Pull")) addGravity(WorldGravity::Planet);
-                if (ImGui::BeginMenu("Planet (sphere + gravity)")) {
-                    for (float rad : {5.0f, 10.0f, 25.0f, 50.0f}) {
-                        char lbl[64];
-                        std::snprintf(lbl, sizeof lbl, "%.0f m radius", rad);
-                        if (ImGui::MenuItem(lbl)) addPlanet(rad);
-                    }
-                    ImGui::EndMenu();
-                }
                 ImGui::EndMenu();
             }
             {   // falling this far puts the player back at the spawn (Frame Home)
@@ -5092,7 +5008,7 @@ struct Studio {
                 WorldCollider& c = scene->world.colliders[wIndex];
                 static const char* kinds[] = {"Box", "Sphere", "Capsule", "Mesh"};
                 fieldLabel("Role");
-                static const char* roles[4] = {"Surface", "Collider", "Walk through", "Drawn floor"};
+                const char* roles[4] = {"Surface", c.kind == WorldCollider::Mesh ? "Collider" : "Invisible wall", "Walk through", "Drawn floor"};
                 static const int roleOf[4] = {WorldCollider::Solid, WorldCollider::Object, WorldCollider::Trigger, WorldCollider::Walkable};
                 int role = c.role == WorldCollider::Trigger ? 2 : c.role == WorldCollider::Object ? 1 : c.role == WorldCollider::Walkable ? 3 : 0;
                 if (ImGui::Combo("##wrole", &role, roles, 4) && roleOf[role] != c.role) {
@@ -5149,7 +5065,13 @@ struct Studio {
                 track();
                 fieldLabel("Kind");
                 int kind = std::clamp(g.kind, 0, 2);
-                if (ImGui::Combo("##gkind", &kind, kGravityNames, 3) && kind != g.kind) { before = std::make_shared<HomeWorld>(scene->world); g.kind = kind; changed = true; }
+                if (ImGui::BeginCombo("##gkind", kGravityNames[kind])) {
+                    for (int k = 0; k < 3; ++k) {
+                        if (k == WorldGravity::Planet && kind != k) continue;   // planet zones are no longer made (older files keep theirs)
+                        if (ImGui::Selectable(kGravityNames[k], k == kind) && k != g.kind) { before = std::make_shared<HomeWorld>(scene->world); g.kind = k; changed = true; }
+                    }
+                    ImGui::EndCombo();
+                }
                 ImGui::PushTextWrapPos(0);
                 ImGui::TextDisabled("%s", kGravityHelp[std::clamp(g.kind, 0, 2)]);
                 ImGui::PopTextWrapPos();
@@ -7617,9 +7539,29 @@ struct SelfTest {
 
         // ── Draw Floor: fill its flat faces (walkable even on furniture), the brush erases, one Ctrl+Z each
         stages.push_back([this] {
-            a.fillDrawnFloor(static_cast<size_t>(obj), true);
-            const int f = a.drawnFloorIndex(a.objects[obj]);
-            check(f >= 0 && a.scene->world.colliders[f].role == WorldCollider::Walkable && a.surfaceParts(a.objects[obj]).size() == 1,
+            // Its own object: furniture-like, inside the walkable area's reach (a home's invisible walls keep the
+            // area to its play space; one beyond them is never stood on), else the one edited above.
+            a.rebakeWalk();
+            drawObj = obj;
+            float best = 1e30f;
+            for (size_t i = 0; i < a.objects.size() && a.walkShown; ++i) {
+                const Object& o = a.objects[i];
+                if (!a.canBeSurface(o) || o.hidden || o.category == kPlants) continue;
+                float mn[3], mx[3];
+                a.worldBounds(o, mn, mx);
+                const float d = dist3(mn, mx);
+                int cx, cz;
+                if (d <= 0.4f || std::fabs(d - 1.5f) >= best || !a.walkShown->cellOf((mn[0] + mx[0]) * 0.5f, (mn[2] + mx[2]) * 0.5f, cx, cz)) continue;
+                std::vector<u32> fl, wl;
+                a.classifyObject(o, fl, wl);
+                if (fl.size() < 4) continue;
+                best = std::fabs(d - 1.5f);
+                drawObj = static_cast<int>(i);
+            }
+            const size_t partsBefore = a.surfaceParts(a.objects[drawObj]).size();
+            a.fillDrawnFloor(static_cast<size_t>(drawObj), true);
+            const int f = a.drawnFloorIndex(a.objects[drawObj]);
+            check(f >= 0 && a.scene->world.colliders[f].role == WorldCollider::Walkable && a.surfaceParts(a.objects[drawObj]).size() == partsBefore,
                   "Fill Flat Faces draws a floor on it (its own part; the surface stays)", f >= 0 ? std::to_string(a.scene->world.colliders[f].indices.size() / 3) + " triangles" : "none");
             // its drawn faces: walkable (where there's headroom over them) once the area is baked
             a.rebakeWalk();
@@ -7643,17 +7585,17 @@ struct SelfTest {
         });
         stages.push_back([this] {
             a.pushWorldUndo();
-            a.paintFloor(static_cast<size_t>(obj), wallAt, 100.0f, true, -1);   // a brush bigger than it: all erased
-            check(a.drawnFloorIndex(a.objects[obj]) < 0, "the brush with Shift erases it");
+            a.paintFloor(static_cast<size_t>(drawObj), wallAt, 100.0f, true, -1);   // a brush bigger than it: all erased
+            check(a.drawnFloorIndex(a.objects[drawObj]) < 0, "the brush with Shift erases it");
             key(ImGuiKey_Z, true); queue.push_back(In{});
             return 3;
         });
         stages.push_back([this] {
-            check(a.drawnFloorIndex(a.objects[obj]) >= 0, "Ctrl+Z brings the drawn floor back");
+            check(a.drawnFloorIndex(a.objects[drawObj]) >= 0, "Ctrl+Z brings the drawn floor back");
             a.pushWorldUndo();
-            a.paintFloor(static_cast<size_t>(obj), wallAt, 0.2f, false, -1);
-            a.fillDrawnFloor(static_cast<size_t>(obj), false);
-            check(a.drawnFloorIndex(a.objects[obj]) < 0, "Clear takes it away");
+            a.paintFloor(static_cast<size_t>(drawObj), wallAt, 0.2f, false, -1);
+            a.fillDrawnFloor(static_cast<size_t>(drawObj), false);
+            check(a.drawnFloorIndex(a.objects[drawObj]) < 0, "Clear takes it away");
             a.rebakeWalk();
             return 2;
         });
@@ -7948,29 +7890,59 @@ struct SelfTest {
             screenshot("06_gravity_zone");
             return 1;
         });
-        // ── Planet: a sphere you can see and walk round (reloads the home with the generated model)
+        // ── Invisible walls: one placed on walkable floor takes that floor away, and stops Frame Home's walker; one
+        // through a drawn floor takes that away too
         stages.push_back([this] {
-            if (a.openHomeIsFenv()) { log("(planet model skipped: the open home is a .fenv)"); return 0; }
-            std::error_code ec;
-            for (const auto& e : fs::directory_iterator(dataDir() / L"models", ec)) modelsBefore.insert(e.path().wstring());
-            planetMade = true;
-            a.addPlanet(5.0f);
-            return 10;
+            a.rebakeWalk();
+            if (!a.walkShown || a.scene->world.spawns.empty()) { check(false, "World > Add > Invisible Wall", "no walkable area or spawn"); return 1; }
+            const WorldPoint& sp = a.scene->world.spawns[0];
+            float h = 0;
+            if (!a.walkShown->walkable(sp.pos[0], sp.pos[2], sp.pos[1] + 0.05f, &h)) { check(false, "World > Add > Invisible Wall", "the spawn isn't walkable"); return 1; }
+            invisibleWallAt[0] = sp.pos[0]; invisibleWallAt[1] = h; invisibleWallAt[2] = sp.pos[2];
+            const size_t before = a.scene->world.colliders.size();
+            a.cam.pivot[0] = invisibleWallAt[0]; a.cam.pivot[1] = invisibleWallAt[1] + 1.0f; a.cam.pivot[2] = invisibleWallAt[2];
+            a.addInvisibleWall();
+            const WorldCollider& w = a.scene->world.colliders.back();
+            check(a.scene->world.colliders.size() == before + 1 && Studio::isInvisibleWall(w) && std::fabs(w.world[13] - (h + 1.25f)) < 0.01f,
+                  "World > Add > Invisible Wall stands one on the floor", w.name);
+            a.rebakeWalk();
+            check(!a.walkShown->walkable(invisibleWallAt[0], invisibleWallAt[2], invisibleWallAt[1] + 0.05f), "...and where it stands is no longer walkable");
+            // Frame Home's walker, a metre in front of it, walking straight at it.
+            const float nx = w.world[8], nz = w.world[10];
+            for (int grid = 1; grid >= 0; --grid) {
+                WorldRuntime rt;
+                if (grid) a.walkRuntime(rt);
+                else { HomeWorld hw = a.scene->world; hw.walkGrid.clear(); hw.walkGridCache.reset(); rt.build(hw); }   // (no area: its shapes)
+                float x = invisibleWallAt[0] - nx * 1.0f, z = invisibleWallAt[2] - nz * 1.0f;
+                for (int k = 0; k < 40; ++k) rt.move(x, z, invisibleWallAt[1], nx * 0.05f, nz * 0.05f);
+                const float past = (x - invisibleWallAt[0]) * nx + (z - invisibleWallAt[2]) * nz;   // > 0: through it
+                check(past < -0.04f, grid ? "Frame Home's walker can't go through it" : "...nor without a walkable area (its shape alone)",
+                      "stopped " + std::to_string(-past) + " m before it");
+            }
+            a.step(a.undo, a.redo);
+            check(a.scene->world.colliders.size() == before, "Ctrl+Z takes the wall away");
+            // A drawn floor there instead, then a wall through that.
+            WorldCollider f;
+            f.name = "selftest drawn floor";
+            f.kind = WorldCollider::Box;
+            f.role = WorldCollider::Walkable;
+            f.half[0] = f.half[2] = 1.0f; f.half[1] = 0.02f;
+            translation(f.world, invisibleWallAt[0], invisibleWallAt[1] + 0.02f, invisibleWallAt[2]);
+            a.scene->world.colliders.push_back(f);
+            a.rebakeWalk();
+            const bool drawnWalkable = a.walkShown->walkable(invisibleWallAt[0], invisibleWallAt[2], invisibleWallAt[1] + 0.1f);
+            a.addInvisibleWall();
+            a.rebakeWalk();
+            check(drawnWalkable && !a.walkShown->walkable(invisibleWallAt[0], invisibleWallAt[2], invisibleWallAt[1] + 0.1f),
+                  "a wall through a drawn floor takes that floor away", drawnWalkable ? "" : "the drawn floor wasn't walkable to begin with");
+            screenshot("07_invisible_wall");
+            a.step(a.undo, a.redo);
+            auto& cs = a.scene->world.colliders;
+            cs.erase(std::remove_if(cs.begin(), cs.end(), [](const WorldCollider& c) { return c.name == "selftest drawn floor"; }), cs.end());
+            check(cs.size() == before, "...and the one through the drawn floor");
+            a.rebakeWalk();
+            return 1;
         });
-        stages.push_back([this] {
-            if (a.loadState != 0 || !a.scene || a.uploading || a.texLoading || a.objects.empty()) return -1;
-            bool model = false;
-            for (const Object& o : a.objects) model |= o.name.find("lanet") != std::string::npos;
-            int spheres = 0, planets = 0;
-            for (const WorldCollider& c : a.scene->world.colliders) spheres += c.kind == WorldCollider::Sphere && std::fabs(c.radius - 5) < 1e-3f;
-            for (const WorldGravity& g : a.scene->world.gravity) planets += g.kind == WorldGravity::Planet && std::fabs(g.radius - 15) < 1e-3f;
-            if (!a.openHomeIsFenv()) check(model, "World > Add > Planet adds a visible sphere");
-            check(spheres == 1 && planets == 1, "...with a walkable surface and planet gravity (kept across the reload)");
-            a.wKind = kGravity; a.wIndex = static_cast<int>(a.scene->world.gravity.size()) - 1;
-            a.frameWorld(a.wKind, a.wIndex);
-            return 20;
-        });
-        stages.push_back([this] { screenshot("07_planet"); return 1; });
         // ── A background sound: added, undone, saved with the edits, back on reopening, packed in a .fenv
         stages.push_back([this] {
             std::error_code ec;
@@ -8136,11 +8108,11 @@ struct SelfTest {
     struct SavedFile { fs::path path; bool existed; std::string bytes; };
     std::vector<SavedFile> saved;
 
-    std::set<std::wstring> modelsBefore;
-    bool planetMade = false;
     fs::path soundWav, soundSaved, soundFenv;
     fs::path imageFenv;
     fs::path bundleFile;
+    int drawObj = -1;                                  // the Draw Floor test's object
+    float invisibleWallAt[3] = {};                     // the invisible-wall test's spot (on the spawn's floor)
     size_t libraryBefore = 0;                          // My Environments' count before the bundle is unpacked into it
     std::string titleWas, imageWas;
     std::array<int, 4> genCounts{};                    // Auto-generate's walls, objects, wall spots, seats + hotspots (first run)
@@ -8148,13 +8120,6 @@ struct SelfTest {
     size_t linkedBefore = 0;                           // mesh-linked surfaces before Make Walkable Floors (the home links its own)          // the background-sound test's files (removed when it ends)
 
     void finish() {
-        if (planetMade) {   // files the planet test generated (only those: not planets the user made)
-            std::error_code ec;
-            std::vector<fs::path> made;
-            for (const auto& e : fs::directory_iterator(dataDir() / L"models", ec))
-                if (!modelsBefore.count(e.path().wstring()) && e.path().filename().wstring().rfind(L"planet-", 0) == 0) made.push_back(e.path());
-            for (const fs::path& f : made) fs::remove(f, ec);
-        }
         for (const SavedFile& f : saved) {
             std::error_code ec;
             if (f.existed) std::ofstream(f.path, std::ios::binary) << f.bytes;

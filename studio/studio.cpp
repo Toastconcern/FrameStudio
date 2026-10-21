@@ -19,6 +19,7 @@
 #include "world_gen.h"
 #include "surface_mesh.h"
 #include "fenv.h"
+#include "fenv_bundle.h"
 #include "scene_bake.h"
 #include "anim_bake.h"
 #include "visibility_bake.h"
@@ -42,7 +43,9 @@ extern "C" void stbi_image_free(void* retval_from_stbi_load);
 #include <dwmapi.h>
 #include <shellapi.h>
 #else
+#ifndef GLFW_INCLUDE_NONE   // (CMake defines it too)
 #define GLFW_INCLUDE_NONE
+#endif
 #include <GLFW/glfw3.h>
 #include <dlfcn.h>
 #include <backends/imgui_impl_glfw.h>
@@ -1200,6 +1203,7 @@ struct Studio {
     }
 
     void open(std::vector<std::string> paths, bool pair = true) {
+        if (paths.size() == 1 && isFenvBundlePath(paths[0])) { openBundle(paths[0]); return; }   // a bundle: its environments, listed
         if (paths.empty() || loadState == 1 || saving) return;
         if (pair) carry = Carry();                                     // another environment: nothing carries over
         if (pair && !pairVista(paths)) return;                         // asked which vista: opens from the picker
@@ -1313,9 +1317,9 @@ struct Studio {
 
     // Pick the footprint, or the footprint and its vista together (Ctrl-click both).
     void openDialog() {
-        const std::vector<std::string> picked = platform::openFiles("Open a home (footprint + vista together), an environment (.fenv) or models",
-            {{"Homes, environments and models", {"*.apk", "*.fenv", "*.glb", "*.gltf", "*.fbx", "*.obj"}}, {"Meta home", {"*.apk"}},
-             {"Frame environment", {"*.fenv"}}, {"Model from Blender / Unity", {"*.glb", "*.gltf", "*.fbx", "*.obj"}}}, true);
+        const std::vector<std::string> picked = platform::openFiles("Open a home (footprint + vista together), an environment (.fenv), a bundle or models",
+            {{"Homes, environments and models", {"*.apk", "*.fenv", "*.fbundle", "*.glb", "*.gltf", "*.fbx", "*.obj"}}, {"Meta home", {"*.apk"}},
+             {"Frame environment", {"*.fenv"}}, {"Environment bundle", {"*.fbundle"}}, {"Model from Blender / Unity", {"*.glb", "*.gltf", "*.fbx", "*.obj"}}}, true);
         if (picked.empty()) return;
         open(picked);
     }
@@ -1363,6 +1367,7 @@ struct Studio {
             if (saveFailed.exchange(false)) { dirty = true; updateTitle(); }
         }
         if (!saving && saveQueued && scene && !uploading) { saveQueued = false; saveToLibrary(); }   // a Save asked for mid auto-save
+        if (!bundleBusy && bundler.joinable()) { bundler.join(); bundleFinished(); }
         if (scene && dirty && !saving && !uploading && loadState == 0 && std::chrono::steady_clock::now() - autosavedAt > std::chrono::minutes(5)) {
             autosaveVersion();
             autosavedAt = std::chrono::steady_clock::now();
@@ -4091,6 +4096,20 @@ struct Studio {
             ImGui::TextDisabled("%s", walkSaved() ? "Walking: the walkable area saved with the home" : "Walking: the walkable area Frame Home works out at load");
             ImGui::EndMenu();
         }
+        if (ImGui::BeginMenu("Bundle")) {
+            if (ImGui::MenuItem("New Bundle", nullptr, false, !bundleBusy)) newBundle();
+            if (ImGui::MenuItem("Open Bundle\u2026", nullptr, false, !bundleBusy)) openBundleDialog();
+            ImGui::Separator();
+            if (ImGui::MenuItem("Add the Open Environment", nullptr, false, !openEnvFile().empty() && !bundleBusy)) addToBundle({openEnvFile()});
+            if (ImGui::MenuItem("Add Environments\u2026", nullptr, false, !bundleBusy)) addToBundleDialog();
+            ImGui::Separator();
+            if (ImGui::MenuItem("Save Bundle", nullptr, false, !bundleMembers.empty() && !bundleBusy)) { if (bundleFile.empty()) saveBundleDialog(); else saveBundle(bundleFile); }
+            if (ImGui::MenuItem("Save Bundle As\u2026", nullptr, false, !bundleMembers.empty() && !bundleBusy)) saveBundleDialog();
+            if (ImGui::MenuItem("Install on Steam Frame\u2026", nullptr, false, !bundleFile.empty() && !bundleDirty)) installBundle();
+            ImGui::Separator();
+            if (ImGui::MenuItem("Bundle Panel")) showInspectorTab(InspectorTab::Bundle);
+            ImGui::EndMenu();
+        }
         if (ImGui::BeginMenu("Headset")) {
             if (ImGui::MenuItem("Send to Frame", nullptr, false, scene != nullptr && !sending)) sendToFrame();
             ImGui::Separator();
@@ -4976,7 +4995,7 @@ struct Studio {
     }
 
     // ── The Inspector (right): the selection's and the environment's settings, one tab each ──
-    enum class InspectorTab { Selection, World, Environment, Sound, Headset };
+    enum class InspectorTab { Selection, World, Environment, Bundle, Headset };
     InspectorTab inspectorTab = InspectorTab::Selection;
     int lastSelected = -1, lastWorldKind = -1, lastWorldIndex = -1;   // selecting something new shows its tab
 
@@ -4996,15 +5015,24 @@ struct Studio {
         static const struct { InspectorTab tab; const char* name; const char* tip; } kTabs[] = {
             {InspectorTab::Selection, "Selected", "The object or world item you selected"},
             {InspectorTab::World, "World", "Where you can walk: the walkable area and its settings"},
-            {InspectorTab::Environment, "Environment", "Its name, picture, what it's made of, and its headset settings"},
-            {InspectorTab::Sound, "Sound", "Its ambience, and a background sound of your own"},
+            {InspectorTab::Environment, "Environment", "Its name, picture, sound, what it's made of, and its headset settings"},
+            {InspectorTab::Bundle, "Bundle", "Several environments packed into one file, to share or install together"},
             {InspectorTab::Headset, "Headset", "Send it to the Steam Frame, or install Frame Home there"},
         };
         ImGui::BeginChild("inspector", ImVec2(0, height), ImGuiChildFlags_AlwaysUseWindowPadding);
-        if (ImGui::BeginTabBar("##inspectorTabs", ImGuiTabBarFlags_FittingPolicyResizeDown)) {
+        // Snug tabs, so all five names fit the Inspector's default width. ImGui sizes a tab with the padding at its
+        // BeginTabItem but draws its label with the padding at BeginTabBar: both get the same.
+        const ImVec2 tabPadding(4 * scale, ImGui::GetStyle().FramePadding.y);
+        ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, tabPadding);
+        const bool tabBar = ImGui::BeginTabBar("##inspectorTabs", ImGuiTabBarFlags_FittingPolicyResizeDown);
+        ImGui::PopStyleVar();
+        if (tabBar) {
             for (const auto& t : kTabs) {
                 const bool force = inspectorTab == t.tab && forceInspectorTab;
-                if (ImGui::BeginTabItem(t.name, nullptr, force ? ImGuiTabItemFlags_SetSelected : 0)) {
+                ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, tabPadding);
+                const bool open = ImGui::BeginTabItem(t.name, nullptr, force ? ImGuiTabItemFlags_SetSelected : 0);
+                ImGui::PopStyleVar();
+                if (open) {
                     if (!forceInspectorTab) inspectorTab = t.tab;
                     ImGui::EndTabItem();
                 }
@@ -5018,7 +5046,7 @@ struct Studio {
             case InspectorTab::Selection: selectionTab(); break;
             case InspectorTab::World: worldTab(); break;
             case InspectorTab::Environment: environmentTab(); break;
-            case InspectorTab::Sound: soundTab(); break;
+            case InspectorTab::Bundle: bundleTab(); break;
             case InspectorTab::Headset: headsetTab(); break;
         }
         ImGui::EndChild();
@@ -5348,6 +5376,7 @@ struct Studio {
             ImGui::TextDisabled("Or drop an .apk on the window.");
         }
 
+        soundSection();
         if (scene) {
             section("WORLD SETTINGS");
             {
@@ -5427,9 +5456,9 @@ struct Studio {
 
     }
 
-    // Sound: the home's own ambience and a background sound added to it.
-    void soundTab() {
-        if (!scene) { ImGui::TextDisabled("Open a home to start."); return; }
+    // The Environment tab's sound: the home's own ambience and a background sound added to it.
+    void soundSection() {
+        if (!scene) return;
         section("SOUND");
         fieldLabel("Sound");
         ImGui::Text("%s", scene->ambientSource.empty() ? "none of its own" : scene->ambientSource == "FMOD bank" ? "FMOD bank (ambience bed)" : "Ogg loop");
@@ -6424,7 +6453,8 @@ struct Studio {
     bool openHomeIsFenv() const { return homePaths.size() == 1 && isFenvPath(homePaths[0]); }
 
     void addInstallEnvDialog() {
-        const std::vector<std::string> picked = platform::openFiles("Environments to install on the Steam Frame", {{"Frame environments", {"*.fenv"}}}, true);
+        const std::vector<std::string> picked = platform::openFiles("Environments to install on the Steam Frame",
+            {{"Environments and bundles", {"*.fenv", "*.fbundle"}}, {"Frame environment", {"*.fenv"}}, {"Environment bundle", {"*.fbundle"}}}, true);
         for (const auto& f : picked)
             if (std::find(installEnvs.begin(), installEnvs.end(), f) == installEnvs.end()) installEnvs.push_back(f);
     }
@@ -6507,9 +6537,11 @@ struct Studio {
             if (const size_t at = out.rfind("frame-install: "); at != std::string::npos)
                 msg = lastLine(out.substr(at + 15, out.find('\n', at) == std::string::npos ? std::string::npos : out.find('\n', at) - at - 15));
             if (rc != 0) return done("Failed: " + msg);
-            if (!uninstall && !envs.empty()) {   // the first environment is the one shown
+            // The first environment is the one shown (a bundle's are named once the headset unpacks it).
+            const auto shown = std::find_if(envs.begin(), envs.end(), [](const std::string& e) { return !isFenvBundlePath(e); });
+            if (!uninstall && shown != envs.end()) {
                 out.clear();
-                if (run(ssh + L"\"printf '" + widen(frameName(envs.front())) + L"\\n' > frame-home/current\"", L"", out) != 0)
+                if (run(ssh + L"\"printf '" + widen(frameName(*shown)) + L"\\n' > frame-home/current\"", L"", out) != 0)
                     return done("Installed, but couldn't choose the first environment: " + lastLine(out));
             }
             if (msg.empty()) msg = uninstall ? "SteamVR's environment restored" : "Installed";
@@ -6545,7 +6577,7 @@ struct Studio {
         }
         if (remove >= 0) installEnvs.erase(installEnvs.begin() + remove);
         if (installEnvs.empty() && !scene) ImGui::TextDisabled("None yet: Frame Home alone (it keeps the environments already on the headset).");
-        if (ImGui::Button("Add .fenv\u2026")) addInstallEnvDialog();
+        if (ImGui::Button("Add .fenv or .fbundle\u2026")) addInstallEnvDialog();
         ImGui::Spacing();
         ImGui::Separator();
         pushPrimary();
@@ -6556,6 +6588,414 @@ struct Studio {
         ImGui::Spacing();
         ImGui::TextWrapped("%s", getInstallStatus().c_str());
         ImGui::PopTextWrapPos();
+    }
+
+    // ── Bundles (Inspector › Bundle, the Bundle menu): several environments packed into one .fbundle ──
+    // Each member stays its own environment; on the headset Frame Home unpacks a bundle into them. A member is a .fenv
+    // on disk, or one inside the bundle that was opened (unpacked when it's needed: opened, saved into another bundle).
+    struct BundleMember {
+        std::string path;                    // the .fenv, or the opened bundle
+        std::string member;                  // inside that bundle: its file there; empty for a .fenv on disk
+        std::string name;                    // what the headset calls it
+        uint64_t size = 0;
+        VkImageView thumbView = VK_NULL_HANDLE;
+        VkDescriptorSet thumb = VK_NULL_HANDLE;
+        float thumbAspect = 0;               // its picture's height / width; 0: not read yet, < 0: it has none
+    };
+    std::vector<BundleMember> bundleMembers;
+    std::string bundleFile;                  // the .fbundle opened or last saved; empty for a new one
+    std::string bundleName;
+    bool bundleDirty = false;
+    std::thread bundler;                     // saving and unpacking, off the UI thread
+    std::atomic<bool> bundleBusy{false};
+    std::string bundleStatus;                // (statusMutex)
+    std::vector<std::string> bundleOpenLater;   // a member unpacked to open: opened by the UI thread (statusMutex)
+
+    void setBundleStatus(const std::string& s) { std::lock_guard<std::mutex> l(statusMutex); bundleStatus = s; }
+
+    // Thumbnails are GPU pictures: freed together, once the frames that drew them are done.
+    void releaseBundleThumbs(std::vector<BundleMember>& members) {
+        bool any = false;
+        for (const auto& m : members) any |= m.thumbView != VK_NULL_HANDLE;
+        if (!any) return;
+        vkDeviceWaitIdle(renderer.device());
+        for (auto& m : members) {
+            if (m.thumb) ImGui_ImplVulkan_RemoveTexture(m.thumb);
+            if (m.thumbView) renderer.releasePicture(m.thumbView);
+            m.thumb = VK_NULL_HANDLE;
+            m.thumbView = VK_NULL_HANDLE;
+            m.thumbAspect = 0;
+        }
+    }
+
+    // Its picture, read from the .fenv (or from inside the bundle) the first time the row is drawn, shrunk to 160 px.
+    void loadBundleThumb(BundleMember& m) {
+        m.thumbAspect = -1;
+        FenvManifest fm;
+        std::vector<uint8_t> png;
+        const bool ok = m.member.empty() ? fenvReadManifest(m.path, fm, &png) : fenvBundleReadEnvironment(m.path, m.member, fm, &png);
+        if (!ok || png.empty()) return;
+        int w = 0, h = 0, c = 0;
+        unsigned char* px = stbi_load_from_memory(png.data(), static_cast<int>(png.size()), &w, &h, &c, 4);
+        if (!px) return;
+        const int tw = std::min(160, w), th = std::max(1, h * tw / std::max(1, w));
+        std::vector<u8> small(static_cast<size_t>(tw) * th * 4);
+        for (int y = 0; y < th; ++y)
+            for (int x = 0; x < tw; ++x) {   // box filter over the source pixels each covers
+                const int x0 = x * w / tw, x1 = std::max(x0 + 1, (x + 1) * w / tw), y0 = y * h / th, y1 = std::max(y0 + 1, (y + 1) * h / th);
+                uint32_t acc[4] = {}, n = 0;
+                for (int yy = y0; yy < y1; ++yy)
+                    for (int xx = x0; xx < x1; ++xx, ++n)
+                        for (int k = 0; k < 4; ++k) acc[k] += px[(static_cast<size_t>(yy) * w + xx) * 4 + k];
+                for (int k = 0; k < 4; ++k) small[(static_cast<size_t>(y) * tw + x) * 4 + k] = static_cast<u8>(k == 3 ? 255 : acc[k] / n);
+            }
+        stbi_image_free(px);
+        m.thumbView = renderer.createPicture(small.data(), static_cast<uint32_t>(tw), static_cast<uint32_t>(th));
+        if (!m.thumbView) return;
+        m.thumb = ImGui_ImplVulkan_AddTexture(viewSampler, m.thumbView, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        m.thumbAspect = static_cast<float>(th) / static_cast<float>(tw);
+    }
+
+    // Unsaved changes to the bundle: true when it's fine to drop them.
+    bool confirmBundleDiscard() {
+        if (!bundleDirty || bundleMembers.empty()) return true;
+        const platform::Answer a = platform::ask("Frame Studio", "Save the bundle \"" + shownBundleName() + "\" first?", true);
+        if (a == platform::Answer::Cancel) return false;
+        if (a == platform::Answer::Yes) { saveBundleDialog(); return false; }   // saving runs in the background: try again after
+        return true;
+    }
+
+    std::string shownBundleName() const { return bundleName.empty() ? std::string("New bundle") : bundleName; }
+
+    void newBundle() {
+        if (bundleBusy || !confirmBundleDiscard()) return;
+        releaseBundleThumbs(bundleMembers);
+        bundleMembers.clear();
+        bundleFile.clear();
+        bundleName.clear();
+        bundleDirty = false;
+        setBundleStatus("");
+        showInspectorTab(InspectorTab::Bundle);
+    }
+
+    void openBundle(const std::string& path) {
+        if (bundleBusy || !confirmBundleDiscard()) return;
+        FenvBundleManifest bm;
+        std::string err;
+        if (!fenvBundleReadManifest(path, bm, &err)) {
+            platform::message("Frame Studio", "Couldn't open the bundle " + narrow(fs::path(widen(path)).filename().wstring()) + (err.empty() ? "" : ": " + err),
+                              platform::Icon::Warning);
+            return;
+        }
+        releaseBundleThumbs(bundleMembers);
+        bundleMembers.clear();
+        for (const auto& e : bm.environments) {
+            BundleMember m;
+            m.path = path;
+            m.member = e.file;
+            m.name = e.name;
+            m.size = e.size;
+            bundleMembers.push_back(std::move(m));
+        }
+        bundleFile = path;
+        bundleName = bm.name.empty() ? narrow(fs::path(widen(path)).stem().wstring()) : bm.name;
+        bundleDirty = false;
+        setBundleStatus("");
+        showInspectorTab(InspectorTab::Bundle);
+    }
+
+    void openBundleDialog() {
+        const std::vector<std::string> picked = platform::openFiles("Open an environment bundle", {{"Environment bundle", {"*.fbundle"}}}, false);
+        if (!picked.empty()) openBundle(picked.front());
+    }
+
+    // Adds .fenv files (one already in the bundle isn't added twice).
+    void addToBundle(const std::vector<std::string>& paths) {
+        for (const auto& p : paths) {
+            if (!isFenvPath(p)) continue;
+            bool there = false;
+            for (const auto& m : bundleMembers) there |= m.member.empty() && fs::path(widen(m.path)) == fs::path(widen(p));
+            if (there) continue;
+            FenvManifest fm;
+            if (!fenvReadManifest(p, fm)) {
+                platform::message("Frame Studio", "This isn't an environment Frame Studio can read: " + narrow(fs::path(widen(p)).filename().wstring()), platform::Icon::Warning);
+                continue;
+            }
+            BundleMember m;
+            m.path = p;
+            m.name = fm.name.empty() ? narrow(fs::path(widen(p)).stem().wstring()) : fm.name;
+            std::error_code ec;
+            m.size = fs::file_size(fs::path(widen(p)), ec);
+            bundleMembers.push_back(std::move(m));
+            bundleDirty = true;
+        }
+        showInspectorTab(InspectorTab::Bundle);
+    }
+
+    void addToBundleDialog() {
+        addToBundle(platform::openFiles("Environments to add to the bundle", {{"Frame environments", {"*.fenv"}}}, true));
+    }
+
+    // The open environment as a .fenv: the file it was opened from or last saved to.
+    std::string openEnvFile() const { return openHomeIsFenv() ? homePaths[0] : envFile; }
+
+    void removeFromBundle(size_t i) {
+        std::vector<BundleMember> gone(bundleMembers.begin() + static_cast<std::ptrdiff_t>(i), bundleMembers.begin() + static_cast<std::ptrdiff_t>(i) + 1);
+        releaseBundleThumbs(gone);
+        bundleMembers.erase(bundleMembers.begin() + static_cast<std::ptrdiff_t>(i));
+        bundleDirty = true;
+    }
+
+    // Members inside a bundle are unpacked here when they're needed (a scratch folder, emptied each time).
+    fs::path bundleScratch() const { return dataDir() / L"bundle-unpacked"; }
+
+    // Opens one member: a .fenv straight away, one inside the bundle once it's unpacked.
+    void openBundleMember(size_t i) {
+        const BundleMember m = bundleMembers[i];
+        if (m.member.empty()) { open({m.path}); return; }
+        if (bundleBusy) return;
+        if (bundler.joinable()) bundler.join();
+        bundleBusy = true;
+        setBundleStatus("Unpacking " + m.name + "\u2026");
+        const fs::path dir = bundleScratch() / L"open";
+        bundler = std::thread([this, m, dir] {
+            std::error_code ec;
+            fs::remove_all(dir, ec);
+            fs::create_directories(dir, ec);
+            std::vector<std::string> out;
+            std::string err;
+            if (!fenvBundleExtract(m.path, narrow(dir.wstring()), out, err, m.member) || out.empty()) setBundleStatus("Couldn't unpack " + m.name + ": " + err);
+            else {
+                std::lock_guard<std::mutex> l(statusMutex);
+                bundleStatus.clear();
+                bundleOpenLater = out;
+            }
+            bundleBusy = false;
+        });
+    }
+
+    void saveBundleDialog() {
+        if (bundleBusy || bundleMembers.empty()) return;
+        std::string name = shownBundleName();
+        for (char& c : name) if (c == '+' || c == '/' || c == '\\' || c == ':') c = '-';
+        const std::string path = platform::saveFile("Save the bundle", name + ".fbundle", {{"Environment bundle", {"*.fbundle"}}}, "fbundle");
+        if (!path.empty()) saveBundle(path);
+    }
+
+    // Packs the members into `out` in the background. Members from inside a bundle are unpacked first (the bundle
+    // being replaced may be the one they're in).
+    void saveBundle(const std::string& out) {
+        if (bundleBusy || bundleMembers.empty()) return;
+        if (bundler.joinable()) bundler.join();
+        bundleBusy = true;
+        const std::vector<BundleMember> members = bundleMembers;
+        const std::string name = shownBundleName();
+        const fs::path scratch = bundleScratch() / L"save";
+        bundler = std::thread([this, members, name, out, scratch] {
+            std::error_code ec;
+            fs::remove_all(scratch, ec);
+            std::vector<std::string> files;
+            std::string err;
+            for (const auto& m : members) {
+                if (m.member.empty()) { files.push_back(m.path); continue; }
+                setBundleStatus("Unpacking " + m.name + "\u2026");
+                const fs::path dir = scratch / std::to_wstring(files.size());   // one folder each: same-named members stay apart
+                fs::create_directories(dir, ec);
+                std::vector<std::string> got;
+                if (!fenvBundleExtract(m.path, narrow(dir.wstring()), got, err, m.member) || got.empty()) {
+                    setBundleStatus("Couldn't save the bundle: unpacking " + m.name + " failed: " + err);
+                    bundleBusy = false;
+                    return;
+                }
+                files.push_back(got.front());
+            }
+            const bool ok = fenvBundleWrite(out, files, name, err, [this](uint64_t done, uint64_t total) {
+                char msg[96];
+                std::snprintf(msg, sizeof msg, "Saving the bundle\u2026 %.0f%%", total ? 100.0 * static_cast<double>(done) / static_cast<double>(total) : 100.0);
+                setBundleStatus(msg);
+            });
+            fs::remove_all(scratch, ec);
+            std::error_code sec;
+            const double mb = static_cast<double>(fs::file_size(fs::path(widen(out)), sec)) / 1048576.0;
+            char msg[512];
+            if (ok) std::snprintf(msg, sizeof msg, "Saved %s (%zu environments, %.0f MB)", narrow(fs::path(widen(out)).filename().wstring()).c_str(), files.size(), mb);
+            {
+                std::lock_guard<std::mutex> l(statusMutex);
+                bundleStatus = ok ? std::string(msg) : "Couldn't save the bundle: " + err;
+                if (ok) bundleSavedTo = out;
+            }
+            bundleBusy = false;
+        });
+    }
+    std::string bundleSavedTo;               // set by the saver (statusMutex); the UI thread then makes it the bundle's file
+
+    // Unpacks the opened bundle into My Environments.
+    void unpackBundle() {
+        if (bundleBusy || bundleFile.empty() || bundleDirty) return;
+        if (bundler.joinable()) bundler.join();
+        bundleBusy = true;
+        const std::string file = bundleFile;
+        const fs::path dir = libraryDir();
+        bundler = std::thread([this, file, dir] {
+            std::vector<std::string> out;
+            std::string err;
+            const bool ok = fenvBundleExtract(file, narrow(dir.wstring()), out, err, {}, [this](uint64_t done, uint64_t total) {
+                char msg[96];
+                std::snprintf(msg, sizeof msg, "Unpacking\u2026 %.0f%%", total ? 100.0 * static_cast<double>(done) / static_cast<double>(total) : 100.0);
+                setBundleStatus(msg);
+            });
+            setBundleStatus(ok ? "Unpacked into My Environments (" + std::to_string(out.size()) + (out.size() == 1 ? " environment)" : " environments)")
+                               : "Couldn't unpack the bundle: " + err);
+            bundleBusy = false;
+        });
+    }
+
+    // The saved bundle goes onto the install list, and the Headset tab opens to install it.
+    void installBundle() {
+        if (bundleFile.empty() || bundleDirty) return;
+        seedInstallEnvs();
+        if (std::find(installEnvs.begin(), installEnvs.end(), bundleFile) == installEnvs.end()) installEnvs.push_back(bundleFile);
+        showInspectorTab(InspectorTab::Headset);
+    }
+
+    // What the background work left for the UI thread: a member to open, a bundle file saved.
+    void bundleFinished() {
+        std::vector<std::string> openNow;
+        std::string saved;
+        {
+            std::lock_guard<std::mutex> l(statusMutex);
+            openNow.swap(bundleOpenLater);
+            saved.swap(bundleSavedTo);
+        }
+        if (!saved.empty()) {
+            bundleFile = saved;
+            bundleDirty = false;
+            if (bundleName.empty()) bundleName = narrow(fs::path(widen(saved)).stem().wstring());
+        }
+        if (!openNow.empty()) open(openNow);
+    }
+
+    // Inspector › Bundle.
+    void bundleTab() {
+        section("BUNDLE");
+        ImGui::PushTextWrapPos(0);
+        ImGui::TextDisabled("Several environments in one file, to share or install together. Each stays its own environment on the headset.");
+        ImGui::PopTextWrapPos();
+        ImGui::Spacing();
+        ImGui::BeginDisabled(bundleBusy);
+        fieldLabel("Name");
+        {
+            char nb[128];
+            std::snprintf(nb, sizeof nb, "%s", bundleName.c_str());
+            if (ImGui::InputTextWithHint("##bundlename", "New bundle", nb, sizeof nb)) { bundleName = nb; bundleDirty = true; }
+        }
+        if (!bundleFile.empty()) {
+            ImGui::TextDisabled("%s%s", narrow(fs::path(widen(bundleFile)).filename().wstring()).c_str(), bundleDirty ? " (changed)" : "");
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", bundleFile.c_str());
+        }
+
+        ImGui::SeparatorText("Environments");
+        if (bundleMembers.empty()) {
+            ImGui::PushTextWrapPos(0);
+            ImGui::TextDisabled("None yet. Add the open environment, environments from My Environments, or any .fenv.");
+            ImGui::PopTextWrapPos();
+        }
+        const float thumbW = 64 * scale, rowH = std::max(thumbW * 9 / 16, ImGui::GetTextLineHeight() * 2 + 4 * scale);
+        int remove = -1, openIt = -1, moveUp = -1;
+        uint64_t total = 0;
+        for (size_t i = 0; i < bundleMembers.size(); ++i) {
+            BundleMember& m = bundleMembers[i];
+            total += m.size;
+            if (m.thumbAspect == 0) loadBundleThumb(m);
+            ImGui::PushID(static_cast<int>(i));
+            const ImVec2 a = ImGui::GetCursorScreenPos();
+            ImDrawList* dl = ImGui::GetWindowDrawList();
+            const ImVec2 t1(a.x + thumbW, a.y + rowH);
+            if (m.thumb) {   // fitted into the slot, centred
+                const float h = std::min(rowH, thumbW * m.thumbAspect), w = h / m.thumbAspect;
+                const ImVec2 p((a.x + t1.x - w) * 0.5f, (a.y + t1.y - h) * 0.5f);
+                dl->AddImage((ImTextureID)m.thumb, p, ImVec2(p.x + w, p.y + h));
+            } else dl->AddRectFilled(a, t1, col(0x3f9a5c, 0.22f), 4 * scale);
+            const float tx = t1.x + 8 * scale, lh = ImGui::GetTextLineHeight();
+            const float right = ImGui::GetContentRegionMax().x + ImGui::GetWindowPos().x;
+            dl->PushClipRect(ImVec2(tx, a.y), ImVec2(right - 52 * scale, a.y + rowH), true);
+            dl->AddText(ImVec2(tx, a.y + rowH * 0.5f - lh - 1 * scale), col(kText), m.name.c_str());
+            char sub[64];
+            std::snprintf(sub, sizeof sub, "%.0f MB%s", static_cast<double>(m.size) / 1048576.0, m.member.empty() ? "" : " \u00b7 in the bundle");
+            dl->AddText(ImVec2(tx, a.y + rowH * 0.5f + 1 * scale), col(kDim), sub);
+            dl->PopClipRect();
+            if (ImGui::InvisibleButton("##row", ImVec2(std::max(1.0f, right - a.x - 52 * scale), rowH)) ) {}
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("%s\n%s\nDouble-click to open it", m.name.c_str(), m.member.empty() ? m.path.c_str() : (m.path + " \u203a " + m.member).c_str());
+                if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) openIt = static_cast<int>(i);
+            }
+            ImGui::SameLine(0, 4 * scale);
+            ImGui::BeginGroup();
+            ImGui::BeginDisabled(i == 0);
+            if (ImGui::SmallButton("\u25b2")) moveUp = static_cast<int>(i);
+            ImGui::EndDisabled();
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("Move up: the first one is the one shown after installing");
+            if (ImGui::SmallButton("\u2715")) remove = static_cast<int>(i);
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Take it out of the bundle (the file itself stays)");
+            ImGui::EndGroup();
+            ImGui::PopID();
+            ImGui::Dummy(ImVec2(0, 2 * scale));
+        }
+        if (moveUp > 0) { std::swap(bundleMembers[static_cast<size_t>(moveUp)], bundleMembers[static_cast<size_t>(moveUp) - 1]); bundleDirty = true; }
+        if (remove >= 0) removeFromBundle(static_cast<size_t>(remove));
+        if (openIt >= 0) openBundleMember(static_cast<size_t>(openIt));
+        if (!bundleMembers.empty()) ImGui::TextDisabled("%zu environment%s \u00b7 %.0f MB", bundleMembers.size(), bundleMembers.size() == 1 ? "" : "s", static_cast<double>(total) / 1048576.0);
+
+        ImGui::Spacing();
+        const std::string here = openEnvFile();
+        ImGui::BeginDisabled(here.empty());
+        if (ImGui::Button("Add the Open Environment", ImVec2(-1, 0))) addToBundle({here});
+        ImGui::EndDisabled();
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+            ImGui::SetTooltip("%s", here.empty() ? "Save it first (Ctrl+S): a bundle holds saved environments"
+                                                 : dirty ? "As it was last saved: save first (Ctrl+S) to include your latest changes" : here.c_str());
+        const float half = (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x) * 0.5f;
+        if (ImGui::Button("My Environments \u25be", ImVec2(half, 0))) ImGui::OpenPopup("##mine");
+        if (ImGui::BeginPopup("##mine")) {
+            const std::vector<std::string> mine = libraryEnvs();
+            if (mine.empty()) ImGui::TextDisabled("None yet: Save (Ctrl+S) puts what you make here");
+            for (size_t r = 0; r < mine.size(); ++r) {
+                ImGui::PushID(static_cast<int>(r));
+                if (ImGui::MenuItem(recentDetails({mine[r]}).title.c_str())) addToBundle({mine[r]});
+                ImGui::PopID();
+            }
+            ImGui::EndPopup();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Add .fenv\u2026", ImVec2(-1, 0))) addToBundleDialog();
+
+        ImGui::Spacing();
+        ImGui::Separator();
+        ImGui::BeginDisabled(bundleMembers.empty());
+        pushPrimary();
+        if (ImGui::Button(bundleFile.empty() ? "Save Bundle\u2026" : "Save Bundle", ImVec2(-1, ImGui::GetFrameHeight() * 1.4f))) {
+            if (bundleFile.empty()) saveBundleDialog(); else saveBundle(bundleFile);
+        }
+        ImGui::PopStyleColor(3);
+        if (ImGui::Button("Save Bundle As\u2026", ImVec2(-1, 0))) saveBundleDialog();
+        ImGui::EndDisabled();
+        const bool saved = !bundleFile.empty() && !bundleDirty;
+        ImGui::BeginDisabled(!saved);
+        if (ImGui::Button("Install on Steam Frame\u2026", ImVec2(-1, 0))) installBundle();
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+            ImGui::SetTooltip("%s", saved ? "Adds it to the Headset tab's install list: Frame Home unpacks it there into its environments"
+                                          : "Save the bundle first");
+        if (ImGui::Button("Unpack into My Environments", ImVec2(-1, 0))) unpackBundle();
+        ImGui::EndDisabled();
+        ImGui::EndDisabled();
+        std::string st;
+        { std::lock_guard<std::mutex> l(statusMutex); st = bundleStatus; }
+        if (!st.empty()) {
+            ImGui::Spacing();
+            ImGui::PushTextWrapPos(0);
+            ImGui::TextUnformatted(st.c_str());
+            ImGui::PopTextWrapPos();
+        }
     }
 
     // A world point on the viewport (false behind the camera).
@@ -7632,6 +8072,48 @@ struct SelfTest {
             a.sound = SoundState();
             return 1;
         });
+        // ── Bundles: the saved environment packed into a .fbundle, opened again and unpacked
+        stages.push_back([this] {
+            if (a.saving) return -1;
+            bundleFile = dataDir() / L"selftest" / L"selftest.fbundle";
+            std::error_code ec;
+            fs::remove(bundleFile, ec);
+            a.newBundle();
+            libraryBefore = a.libraryEnvs().size();
+            a.addToBundle({a.envFile, a.envFile});
+            check(a.bundleMembers.size() == 1 && a.bundleDirty && a.inspectorTab == Studio::InspectorTab::Bundle,
+                  "Bundle \u203a Add the Open Environment lists it once", std::to_string(a.bundleMembers.size()) + " listed");
+            a.bundleName = "Self-test bundle";
+            return 3;   // the tab draws it, reading its picture
+        });
+        stages.push_back([this] {
+            check(a.bundleMembers.size() == 1 && a.bundleMembers[0].thumbAspect > 0, "...with its picture");
+            screenshot("09_bundle");
+            a.saveBundle(narrow(bundleFile.wstring()));
+            return 2;
+        });
+        stages.push_back([this] {
+            if (a.bundleBusy || a.bundler.joinable()) return -1;
+            std::string err;
+            check(a.bundleFile == narrow(bundleFile.wstring()) && !a.bundleDirty && fenvBundleValidate(a.bundleFile, err), "Save Bundle writes a valid .fbundle",
+                  err.empty() ? narrow(bundleFile.filename().wstring()) : err);
+            a.openBundle(narrow(bundleFile.wstring()));
+            check(a.bundleMembers.size() == 1 && !a.bundleMembers[0].member.empty() && a.bundleName == "Self-test bundle", "Open Bundle lists what's in it",
+                  a.bundleMembers.empty() ? "" : a.bundleMembers[0].member);
+            a.unpackBundle();
+            return 2;
+        });
+        stages.push_back([this] {
+            if (a.bundleBusy || a.bundler.joinable()) return -1;
+            std::string st;
+            { std::lock_guard<std::mutex> l(a.statusMutex); st = a.bundleStatus; }
+            check(st.rfind("Unpacked into My Environments (1 ", 0) == 0 && a.libraryEnvs().size() == libraryBefore, "Unpack puts it in My Environments (the same file isn't copied twice)", st);
+            a.bundleDirty = false;
+            a.newBundle();
+            std::error_code ec;
+            fs::remove(bundleFile, ec);
+            return 2;
+        });
         // ── Edit > Settings: this PC's options, and the headset's read over ssh (nothing is written there)
         stages.push_back([this] { a.showSettings = true; a.headsetSettings(false); return 5; });
         stages.push_back([this] {
@@ -7658,6 +8140,8 @@ struct SelfTest {
     bool planetMade = false;
     fs::path soundWav, soundSaved, soundFenv;
     fs::path imageFenv;
+    fs::path bundleFile;
+    size_t libraryBefore = 0;                          // My Environments' count before the bundle is unpacked into it
     std::string titleWas, imageWas;
     std::array<int, 4> genCounts{};                    // Auto-generate's walls, objects, wall spots, seats + hotspots (first run)
     size_t collidersAfter = 0;
@@ -7779,6 +8263,9 @@ bool allowClose() {
     if (!g_app->confirmDiscard()) return false;
     if (g_app->installing)
         platform::message("Frame Studio", "Frame Home is still being installed on the headset. Frame Studio will close when the copy finishes.");
+    if (!g_app->confirmBundleDiscard()) return false;
+    if (g_app->bundleBusy)
+        platform::message("Frame Studio", "A bundle is still being written. Frame Studio will close when it's done.");
     if (g_app->saving)   // closing waits for it (an unfinished .fenv would be lost)
         platform::message("Frame Studio", "An environment is still being saved. Frame Studio will close as soon as it's written.");
     return true;
@@ -7970,7 +8457,7 @@ int runStudio(StudioWindow& window, const std::vector<std::string>& args) {
     if (const char* tab = std::getenv("FS_INSPECTOR_TAB")) {   // diagnostics / screenshots: start on this Inspector tab
         const std::string t = tab;
         app->showInspectorTab(t == "world" ? Studio::InspectorTab::World : t == "environment" ? Studio::InspectorTab::Environment
-                              : t == "sound" ? Studio::InspectorTab::Sound : t == "headset" ? Studio::InspectorTab::Headset
+                              : t == "sound" ? Studio::InspectorTab::Environment : t == "bundle" ? Studio::InspectorTab::Bundle : t == "headset" ? Studio::InspectorTab::Headset
                                                                                             : Studio::InspectorTab::Selection);
     }
     std::unique_ptr<SelfTest> selftest;
@@ -8075,6 +8562,7 @@ int runStudio(StudioWindow& window, const std::vector<std::string>& args) {
     if (app->tuner.joinable()) app->tuner.join();
     if (app->filesReader.joinable()) app->filesReader.join();
     if (app->installer.joinable()) app->installer.join();
+    if (app->bundler.joinable()) app->bundler.join();
     if (app->headsetThread.joinable()) app->headsetThread.join();
     if (app->headsetDebugThread.joinable()) app->headsetDebugThread.join();
     if (app->loadAbandoned) {   // a stopped loader may still be running and would touch the app as it's torn down
@@ -8439,7 +8927,7 @@ bool loadVulkan() {
 }
 
 int main(int argc, char** argv) {
-    std::freopen((dataDir() / "studio.log").c_str(), "w", stderr);
+    if (!std::freopen((dataDir() / "studio.log").c_str(), "w", stderr)) std::perror("studio.log");   // (logs to the terminal then)
     std::vector<std::string> args(argv + 1, argv + argc);
 #ifdef __APPLE__
     // Started from Finder, macOS may add a "-psn_..." process serial number argument: not a home.

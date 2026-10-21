@@ -337,6 +337,18 @@ void HslRenderer::destroy(Image& i) {
     i = Image{};
 }
 
+VkImageView HslRenderer::createPicture(const u8* rgba, uint32_t w, uint32_t h) {
+    Image i = createTexture(rgba, w, h, false);
+    if (!i.view) return VK_NULL_HANDLE;
+    pictures_.push_back(i);
+    return i.view;
+}
+
+void HslRenderer::releasePicture(VkImageView view) {
+    for (size_t k = 0; k < pictures_.size(); ++k)
+        if (pictures_[k].view == view) { destroy(pictures_[k]); pictures_.erase(pictures_.begin() + static_cast<std::ptrdiff_t>(k)); return; }
+}
+
 template <typename F> void HslRenderer::oneShot(F&& record) {
     if (recordInto_) {                          // streaming: ride along in the frame's command buffer, no stall
         record(recordInto_);
@@ -4266,6 +4278,8 @@ void HslRenderer::shutdown() {
     destroyGuide();
     destroyDebug();
     for (VkImageView v : layerViews_) if (v) vkDestroyImageView(device_, v, nullptr);
+    for (Image& i : pictures_) destroy(i);
+    pictures_.clear();
     for (Image* i : {&colorMs_, &depth_, &resolve_, &fdm_, &sub_, &white_, &black_, &nullTex_, &noMetal_, &flatNormal_, &whiteCube_, &white3D_, &shadowMap_}) destroy(*i);
     if (fovFb_) vkDestroyFramebuffer(device_, fovFb_, nullptr);
     if (fovPipe_) vkDestroyPipeline(device_, fovPipe_, nullptr);

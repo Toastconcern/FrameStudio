@@ -56,6 +56,7 @@ very largest homes may not fit.
 - Shape the walkable area: auto-generated surfaces, drawn floors, spawns, seats, hotspots, wall spots, gravity zones.
 - Add a background sound and a picture; set and calculate per-world settings.
 - Saves baked `.fenv` files and leaves out what can't be seen; sends them to the headset in one click.
+- Packs several environments into one `.fbundle` to share or install together ([bundles](docs/bundles.md)).
 - Debug views (wireframe, meshes, GPU cost, overdraw), a home report, and the headset's settings and debug page
   from your desk.
 

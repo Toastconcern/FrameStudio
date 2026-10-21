@@ -9,6 +9,6 @@
 | [Environments and .fenv](environments-and-fenv.md) | The `.fenv` format, converting homes with `fenv-tool`, per-world settings and tuning |
 | [Performance](performance.md) | How Frame Home reaches 120 fps, checking it, fixing stutter, Studio's own pacing |
 | [Frame Studio guide](studio-guide.md) | The Studio window, tools and panels |
-| [Bundles](bundles.md) | Several environments in one `.fbundle` file (being written) |
+| [Bundles](bundles.md) | Several environments in one `.fbundle` file |
 | [Building from source](building.md) | Building on each system, the CI, the headset side, the repository layout |
 | [Troubleshooting](troubleshooting.md) | Symptoms and fixes, logs, the self-test |

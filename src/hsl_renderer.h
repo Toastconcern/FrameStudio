@@ -61,6 +61,10 @@ public:
     void resize(uint32_t eyeWidth, uint32_t eyeHeight);
     // UNORM 2D view of one eye layer: the frame's sRGB bytes as-is, for display in a UI.
     VkImageView layerView(uint32_t layer) const { return layerViews_[layer]; }
+    // A picture for the UI (an environment's thumbnail): its RGBA8 bytes as-is, like layerView. Kept until
+    // releasePicture (once no frame in flight still draws it) or shutdown.
+    VkImageView createPicture(const u8* rgba, uint32_t w, uint32_t h);
+    void releasePicture(VkImageView view);
 
     // Texture streaming: deferred (still-compressed) textures are uploaded as ASTC when the GPU samples it,
     // otherwise decoded on background threads and swapped in a few per frame (render() does this).
@@ -271,6 +275,7 @@ private:
     Buffer createDeviceBuffer(const void* data, VkDeviceSize size, VkBufferUsageFlags usage);
     void destroy(Buffer& b);
     void destroy(Image& i);
+    std::vector<Image> pictures_;                               // createPicture's
     void retire(Buffer& b);
     VkCommandBuffer recordInto_ = VK_NULL_HANDLE;              // set while uploads ride in the frame's commands
     std::vector<Buffer> frameStaging_;                          // their staging, freed after that frame

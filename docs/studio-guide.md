@@ -9,9 +9,9 @@ the headset. This guide walks through the window and the everyday tasks. To inst
 
 ```
 ┌───────────────────────────────────────────────────────────────────────────┐
-│ File  Edit  View  World  Headset  Debug  Help                 menu bar     │
+│ File  Edit  View  World  Bundle  Headset  Debug  Help         menu bar     │
 ├────┬──────────────┬──────────────────────────────┬────────────────────────┤
-│ ✥  │ EXPLORER     │                              │ Selected World Envir… │
+│ ✥  │ EXPLORER     │                              │ Selected World Env… … │
 │ ⟳  │ Filter…      │                              │ ───────────────────── │
 │ ⤢  │ ▾ Root       │          3D VIEW             │      INSPECTOR         │
 │ ✎  │   ▾ folder   │                              │  (the chosen tab's     │
@@ -30,7 +30,7 @@ the headset. This guide walks through the window and the everyday tasks. To inst
 | **Tool strip** | left edge | the transform tools, Draw Floor, and how the gizmo and the camera behave |
 | **Explorer** | left | everything in the home: its objects (in the file's own folders, or grouped by kind) and its world items |
 | **3D view** | middle | the home as the headset draws it, with the gizmo and the walkable area on top |
-| **Inspector** | right | settings, in tabs: **Selected**, **World**, **Environment**, **Sound**, **Headset** |
+| **Inspector** | right | settings, in tabs: **Selected**, **World**, **Environment**, **Bundle**, **Headset** |
 | **Timeline** | bottom | plays the home's animations and sound; drag to scrub through the loop |
 | **Status bar** | very bottom | the home's name and format, what's selected, the frame rate, and whether the headset has it |
 
@@ -109,11 +109,14 @@ removes them all.
 
 ## The environment: name, picture, sound
 
-- **Environment** tab: the name it shows on the headset, its picture (**Choose...**, or a view taken when you
-  save), what it's made of, and its own headset settings: resolution, foveation, MSAA and frame rate.
+The **Environment** tab, top to bottom:
+
+- **Environment**: the name it shows on the headset, its picture (**Choose...**, or a view taken when you save), and
+  what it's made of.
+- **Sound**: the home's own ambience and a background sound of your own (MP3, Ogg, Opus, WAV or FLAC), with their
+  volumes. Drop a sound file on the window to add it. **Save Its Sound...** keeps the home's ambience as an Ogg file.
+- **World settings**: its own headset settings: resolution, foveation, MSAA and frame rate.
   **Calculate Best Settings** walks it on the headset and keeps the sharpest settings that hold 120 fps.
-- **Sound** tab: the home's own ambience and a background sound of your own (MP3, Ogg, Opus, WAV or FLAC). Drop a
-  sound file on the window to add it. **Save Its Sound...** keeps the home's ambience as an Ogg file.
 
 ## Saving
 
@@ -129,12 +132,19 @@ removes them all.
 Saved environments are *baked*: everything the headset needs, already in its own format. See
 [environments-and-fenv.md](environments-and-fenv.md).
 
+## Bundles
+
+A bundle (`.fbundle`) packs several saved environments into one file, to share or install together. Use the
+**Bundle** menu or the **Bundle** tab: **New Bundle**, add environments (the open one, from My Environments, or any
+`.fenv`), **Save Bundle...**, and **Install on Steam Frame...**. Opening a `.fbundle` lists what's in it; double-click
+one to open it, or **Unpack into My Environments**. See [bundles.md](bundles.md).
+
 ## Sending it to the headset
 
 The **Headset** tab (or the **Headset** menu):
 
 - **Send to Frame** makes the open environment the headset's current one, saved or not.
-- **Install Frame Home** puts Frame Home itself on the headset, with the environments you list under
+- **Install Frame Home** puts Frame Home itself on the headset, with the environments and bundles you list under
   **Environments to install**. **Restore SteamVR's Environment** takes it off again.
 - The **Headset** field is the headset's address: an SSH alias such as `frame`, or `steamos@<address>`.
   See [headset-setup.md](headset-setup.md) and [install-frame-home.md](install-frame-home.md).

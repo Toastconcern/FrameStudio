@@ -1,0 +1,13 @@
+project(acl_decompressor_root NONE)
+
+if(PLATFORM_ANDROID)
+	if(USE_SJSON)
+		add_subdirectory("${PROJECT_SOURCE_DIR}/main_android")
+	endif()
+elseif(PLATFORM_IOS)
+	if(USE_SJSON)
+		add_subdirectory("${PROJECT_SOURCE_DIR}/main_ios")
+	endif()
+else()
+	add_subdirectory("${PROJECT_SOURCE_DIR}/main_generic")
+endif()

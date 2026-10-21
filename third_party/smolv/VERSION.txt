@@ -1,0 +1,2 @@
+SMOL-V (https://github.com/aras-p/smol-v) source/smolv.{h,cpp} + LICENSE.txt
+Pinned commit: 55000efe742f56d8b51223b9ea7775a8f0501881

@@ -1,0 +1,107 @@
+# Builds Frame Studio for every computer it runs on, and the Frame Home installer, on each push. Each build is a
+# downloadable artifact of the run; a tag "v*" also publishes them all as a GitHub release.
+name: build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  linux:
+    name: Linux ${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: x64, runner: ubuntu-24.04, extra: "" }
+          - { arch: x86, runner: ubuntu-24.04, extra: "gcc-multilib g++-multilib" }
+          - { arch: arm64, runner: ubuntu-24.04-arm, extra: "" }
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tools and X11 headers
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build cmake libx11-dev libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev libxkbcommon-dev ${{ matrix.extra }}
+      - name: Build
+        run: sh scripts/build-studio.sh linux-${{ matrix.arch }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: FrameStudio-linux-${{ matrix.arch }}
+          path: dist/FrameStudio-linux-${{ matrix.arch }}.tar.gz
+
+  windows:
+    name: Windows ${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x64, x86, arm64]
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build (MSVC)
+        shell: cmd
+        run: studio\build_windows.bat ${{ matrix.arch }} "%GITHUB_WORKSPACE%\build\windows-${{ matrix.arch }}"
+      - name: Package
+        shell: pwsh
+        run: |
+          $name = "FrameStudio-windows-${{ matrix.arch }}"
+          $stage = "build/stage/$name"
+          New-Item -ItemType Directory -Force $stage | Out-Null
+          Copy-Item "build/windows-${{ matrix.arch }}/Frame Studio.exe" $stage
+          Copy-Item -Recurse "build/windows-${{ matrix.arch }}/frame" "$stage/frame"
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Compress-Archive -Path $stage -DestinationPath "dist/$name.zip" -Force
+      - uses: actions/upload-artifact@v4
+        with:
+          name: FrameStudio-windows-${{ matrix.arch }}
+          path: dist/FrameStudio-windows-${{ matrix.arch }}.zip
+
+  macos:
+    name: macOS ${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: arm64, runner: macos-14 }
+          - { arch: x64, runner: macos-13 }
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tools and MoltenVK (Vulkan on Metal, bundled into the app)
+        run: brew install ninja molten-vk
+      - name: Build
+        run: sh scripts/build-studio.sh macos-${{ matrix.arch }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: FrameStudio-macos-${{ matrix.arch }}
+          path: dist/FrameStudio-macos-${{ matrix.arch }}.zip
+
+  frame-home:
+    name: Frame Home installer
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Package
+        run: sh scripts/build-studio.sh frame-home
+      - uses: actions/upload-artifact@v4
+        with:
+          name: FrameHome-installer
+          path: dist/FrameHome-installer.zip
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [linux, windows, macos, frame-home]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "${{ github.ref_name }}" dist/* --repo "${{ github.repository }}" --title "Frame Studio ${{ github.ref_name }}" --generate-notes

@@ -1,0 +1,32 @@
+# Cross-building Frame Studio for Windows from Linux with llvm-mingw (https://github.com/mstorsjo/llvm-mingw):
+#   cmake -S studio -B build/windows-arm64 -DCMAKE_TOOLCHAIN_FILE=cmake/llvm-mingw.cmake -DWINDOWS_ARCH=aarch64 \
+#         -DLLVM_MINGW=/path/to/llvm-mingw
+# WINDOWS_ARCH: x86_64 (64-bit PCs), i686 (32-bit), aarch64 (Windows on ARM). LLVM_MINGW defaults to $LLVM_MINGW,
+# then ~/.local/opt/llvm-mingw.
+set(CMAKE_SYSTEM_NAME Windows)
+if(NOT WINDOWS_ARCH)
+    set(WINDOWS_ARCH x86_64)
+endif()
+set(WINDOWS_ARCH "${WINDOWS_ARCH}" CACHE STRING "x86_64, i686 or aarch64")
+if(WINDOWS_ARCH STREQUAL "aarch64")
+    set(CMAKE_SYSTEM_PROCESSOR ARM64)
+elseif(WINDOWS_ARCH STREQUAL "i686")
+    set(CMAKE_SYSTEM_PROCESSOR X86)
+else()
+    set(CMAKE_SYSTEM_PROCESSOR AMD64)
+endif()
+if(NOT LLVM_MINGW)
+    if(DEFINED ENV{LLVM_MINGW})
+        set(LLVM_MINGW "$ENV{LLVM_MINGW}")
+    else()
+        set(LLVM_MINGW "$ENV{HOME}/.local/opt/llvm-mingw")
+    endif()
+endif()
+set(LLVM_MINGW "${LLVM_MINGW}" CACHE PATH "llvm-mingw's folder")
+set(CMAKE_C_COMPILER "${LLVM_MINGW}/bin/${WINDOWS_ARCH}-w64-mingw32-clang")
+set(CMAKE_CXX_COMPILER "${LLVM_MINGW}/bin/${WINDOWS_ARCH}-w64-mingw32-clang++")
+set(CMAKE_RC_COMPILER "${LLVM_MINGW}/bin/${WINDOWS_ARCH}-w64-mingw32-windres")
+set(CMAKE_FIND_ROOT_PATH "${LLVM_MINGW}/${WINDOWS_ARCH}-w64-mingw32")
+set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)
+set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)
+set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)

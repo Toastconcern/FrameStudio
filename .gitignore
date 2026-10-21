@@ -1,0 +1,20 @@
+# build output
+/build*/
+/dist/
+studio/build*/
+tools/*/build*/
+# editor / OS clutter
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+# never commit homes, environments or keys
+*.apk
+*.fenv
+*.pem
+id_rsa*
+id_ed25519*
+*:Zone.Identifier
+# astcenc's own test framework (not built here)
+third_party/astcenc/Source/GoogleTest/

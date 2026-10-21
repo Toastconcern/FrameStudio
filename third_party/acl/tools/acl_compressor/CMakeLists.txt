@@ -1,0 +1,11 @@
+project(acl_compressor_root NONE)
+
+if(PLATFORM_ANDROID)
+	add_subdirectory("${PROJECT_SOURCE_DIR}/main_android")
+elseif(PLATFORM_IOS)
+	add_subdirectory("${PROJECT_SOURCE_DIR}/main_ios")
+elseif(PLATFORM_EMSCRIPTEN)
+	add_subdirectory("${PROJECT_SOURCE_DIR}/main_emscripten")
+else()
+	add_subdirectory("${PROJECT_SOURCE_DIR}/main_generic")
+endif()

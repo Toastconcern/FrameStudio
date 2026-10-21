@@ -1,0 +1,10 @@
+# Windows scripts keep Windows line endings (cmd.exe misreads others); shell scripts keep Unix ones.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+*.sh  text eol=lf
+install.sh text eol=lf
+# built files: as they are
+*.so  binary
+*.spv binary
+frame/payload/bin/* binary

@@ -9,7 +9,8 @@ area, add sounds and pictures, save environments and install them on the headset
 
 ## Downloads
 
-Every push builds everything (Actions → the latest run → Artifacts); tagged versions are on the Releases page.
+Every push builds everything (Actions → the run → Artifacts). The newest build of `main` is always on the Releases
+page as **Latest build**; tagged versions (`git tag v1.0 && git push --tags`) get their own release.
 
 | Computer | Frame Studio |
 |---|---|

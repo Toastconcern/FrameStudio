@@ -1915,6 +1915,7 @@ int runInstall(bool install) {
           << "      \"description\": \"Meta homes as SteamVR's environment\" } }\n"
           << "  } ]\n}\n";
     }
+    if (!homeos::steamVrRunning()) { LOG("SteamVR isn't running: the installer registers Frame Home in its config files"); return 3; }
     vr::EVRInitError ierr = vr::VRInitError_None;
     vr::VR_Init(&ierr, vr::VRApplication_Utility);
     if (ierr != vr::VRInitError_None) { LOG("VR_Init: %s (SteamVR not running)", vr::VR_GetVRInitErrorAsEnglishDescription(ierr)); return 3; }

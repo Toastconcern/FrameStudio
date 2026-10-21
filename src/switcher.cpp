@@ -1858,6 +1858,7 @@ int runInstall() {
                             << "\",\n    \"arguments\": \"\",\n    \"is_dashboard_overlay\": true,\n"
                                "    \"strings\": { \"en_us\": { \"name\": \"Environments\",\n"
                                "      \"description\": \"Switch SteamVR's environment (Frame Home)\" } }\n  } ]\n}\n";
+    if (!homeos::steamVrRunning()) { LOG("SteamVR isn't running: the installer registers the panel in its config files"); return 3; }
     vr::EVRInitError ierr = vr::VRInitError_None;
     vr::VR_Init(&ierr, vr::VRApplication_Utility);
     // 3: SteamVR not running — the installer registers the manifest in SteamVR's config files instead.
@@ -1877,6 +1878,7 @@ int runInstall() {
 // The panel off SteamVR: no longer started with it, its manifest gone, a running one closed.
 int runUninstall() {
     const fs::path manifest = rootDir() / "frame-switcher.vrmanifest";
+    if (!homeos::steamVrRunning()) return 3;          // (connecting would start it: the uninstaller edits its files)
     vr::EVRInitError ierr = vr::VRInitError_None;
     vr::VR_Init(&ierr, vr::VRApplication_Utility);
     if (ierr != vr::VRInitError_None) { LOG("VR_Init: %s (SteamVR not running)", vr::VR_GetVRInitErrorAsEnglishDescription(ierr)); return 3; }

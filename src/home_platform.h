@@ -266,6 +266,28 @@ inline int run(const std::vector<std::string>& args, int nice, bool wait) {
 
 inline void sleepMs(int ms) { std::this_thread::sleep_for(std::chrono::milliseconds(ms)); }
 
+// Is SteamVR running (its server)? Asked before connecting as a utility: on Windows, connecting starts SteamVR.
+inline bool steamVrRunning() {
+#ifdef _WIN32
+    bool found = false;
+    const HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snap == INVALID_HANDLE_VALUE) return false;
+    PROCESSENTRY32W e = {};
+    e.dwSize = sizeof e;
+    for (BOOL ok = Process32FirstW(snap, &e); ok && !found; ok = Process32NextW(snap, &e)) found = _wcsicmp(e.szExeFile, L"vrserver.exe") == 0;
+    CloseHandle(snap);
+    return found;
+#else
+    std::error_code ec;
+    for (const auto& e : std::filesystem::directory_iterator("/proc", ec)) {
+        std::string comm;
+        std::getline(std::ifstream(e.path() / "comm"), comm);
+        if (comm == "vrserver") return true;
+    }
+    return false;
+#endif
+}
+
 // Files by path, whatever the characters in it (Windows: the wide API; a user name like "José" is no problem).
 inline FILE* openFile(const std::filesystem::path& p, const char* mode) {
 #ifdef _WIN32

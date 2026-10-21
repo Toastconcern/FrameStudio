@@ -2,11 +2,13 @@
 # Frame > Install on Steam Frame. Needs ssh access to the headset (its developer key, or a password) and an ssh
 # client: Windows' own OpenSSH (Settings > Optional features) or Git for Windows'.
 #
-#   powershell -ExecutionPolicy Bypass -File install-frame-home.ps1 [-HostName HOST] [-Uninstall] [environment.fenv ...]
+#   powershell -ExecutionPolicy Bypass -File install-frame-home.ps1 [-HostName HOST] [-Uninstall] [environment.fenv | bundle.fbundle ...]
 #
 # HOST: the headset's ssh address (default "steamos@frame": an entry named frame in ~/.ssh/config, or the headset's
 # name on the network; an IP works too, e.g. steamos@192.168.1.50). Environments (.fenv) given are copied into its
-# selector as well; the first is the one shown. -Uninstall gives the environment back to SteamVR (files stay).
+# selector as well; the first .fenv is the one shown. Bundles (.fbundle) are copied as they are and the headset's
+# Environments panel unpacks them into their environments (they never change the one shown). -Uninstall gives the
+# environment back to SteamVR (files stay).
 param(
     [string]$HostName = "steamos@frame",
     [switch]$Uninstall,
@@ -64,9 +66,11 @@ if ($Uninstall) {
     }
     & $ssh $HostName "sed -i 's/\r`$//' frame-home/.install/frame/install.sh; sh frame-home/.install/frame/install.sh"
     if ($LASTEXITCODE -ne 0) { throw "The installer on the headset failed (see above)" }
-    if ($Environments.Count -gt 0 -and (Test-Path $Environments[0])) {   # the first is the one shown
-        $first = Frame-Name $Environments[0]
-        & $ssh $HostName "printf '%s\n' '$first' > frame-home/current"
+    # The first environment given is the one shown (a bundle's are only known once the headset unpacks it: skipped).
+    $first = $Environments | Where-Object { $_ -match "\.fenv$" } | Select-Object -First 1
+    if ($first -and (Test-Path $first)) {
+        $name = Frame-Name $first
+        & $ssh $HostName "printf '%s\n' '$name' > frame-home/current"
     }
 }
 Say "done"

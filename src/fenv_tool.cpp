@@ -6,7 +6,11 @@
 //       inputs: a home APK (HSL, Clay .opa, glTF .ovrscene), a footprint + its vista, models (.glb .gltf .fbx
 //       .obj). Every home is baked (scene.bin: opens several times faster; a Clay / glTF home's animation goes in as
 //       data, anim_bake.h). --keep-apks stores the source APKs as well.
-//   fenv-tool info file.fenv
+//   fenv-tool info <file.fenv | file.fbundle>   a bundle: its environments, their names and sizes
+//   fenv-tool bundle out.fbundle [--name NAME] file.fenv...   several environments in one file, to share or install
+//                                            together (fenv_bundle.h); each stays its own environment
+//   fenv-tool unbundle file.fbundle outdir   the bundle's environments as .fenv files (one there already is kept:
+//                                            the same one is skipped, a different one makes this "name 2.fenv")
 //   fenv-tool convert outdir <input>...      one .fenv per input ("a.apk+b.apk" pairs a footprint with a vista)
 //   fenv-tool upgrade file.fenv...           re-bake a .fenv's scene with this build, everything else kept (one that
 //                                            loads from its homes is baked: its APKs, models and world.json give way)
@@ -16,6 +20,7 @@
 //       the world's best settings on this headset (walked by frame-home --bench, paced at the display rate), stored in
 //       the .fenv (or <apk>.settings.json); prints them as JSON last
 #include "fenv.h"
+#include "fenv_bundle.h"
 #include "home_report.h"
 #include "tex_mips.h"
 #include "scene_bake.h"
@@ -128,7 +133,46 @@ int pack(const std::string& out, const std::vector<std::string>& inputs, std::st
     return 0;
 }
 
+// A bundle's environments: name, member file and size, each read from the bundle in place.
+int bundleInfo(const std::string& path) {
+    FenvBundleManifest bundle;
+    std::string err;
+    if (!fenvBundleReadManifest(path, bundle, &err)) { std::fprintf(stderr, "fenv-tool: %s\n", err.c_str()); return 1; }
+    std::printf("%s\n  bundle: %s, %zu environment%s\n", path.c_str(), bundle.name.c_str(), bundle.environments.size(), bundle.environments.size() == 1 ? "" : "s");
+    int rc = 0;
+    for (const FenvBundleEntry& e : bundle.environments) {
+        FenvManifest m;
+        std::vector<u8> thumb;
+        const bool readable = fenvBundleReadEnvironment(path, e.file, m, &thumb, &err);
+        std::printf("  %-36s %8.1f MB  %s%s\n", e.name.c_str(), e.size / 1048576.0, e.file.c_str(),
+                    !readable ? "  (damaged)" : thumb.empty() ? "" : "  (thumbnail)");
+        if (!readable) rc = 1;
+    }
+    return rc;
+}
+
+int bundle(const std::string& out, const std::vector<std::string>& inputs, const std::string& name) {
+    std::string err;
+    int shown = -10;
+    const bool ok = fenvBundleWrite(out, inputs, name, err, [&](uint64_t done, uint64_t total) {
+        const int percent = total ? static_cast<int>(done * 100 / total) : 100;
+        if (percent / 10 != shown / 10) { shown = percent; std::fprintf(stderr, "\r  %d%%", percent); }
+    });
+    std::fprintf(stderr, "\r       \r");
+    if (!ok) { std::fprintf(stderr, "fenv-tool: %s\n", err.c_str()); return 1; }
+    return bundleInfo(out);
+}
+
+int unbundle(const std::string& path, const std::string& outDir) {
+    std::vector<std::string> unpacked;
+    std::string err;
+    if (!fenvBundleExtract(path, outDir, unpacked, err)) { std::fprintf(stderr, "fenv-tool: %s\n", err.c_str()); return 1; }
+    for (const std::string& f : unpacked) std::printf("%s\n", f.c_str());
+    return 0;
+}
+
 int info(const std::string& path) {
+    if (isFenvBundlePath(path)) return bundleInfo(path);
     FenvManifest m;
     std::vector<u8> thumb;
     if (!fenvReadManifest(path, m, &thumb)) { std::fprintf(stderr, "fenv-tool: not a .fenv: %s\n", path.c_str()); return 1; }
@@ -392,6 +436,17 @@ int tune(const std::string& home, const std::string& benchArg, int seconds, doub
 
 int main(int argc, char** argv) {
     if (argc >= 3 && !std::strcmp(argv[1], "info")) return info(argv[2]);
+    if (argc >= 4 && !std::strcmp(argv[1], "bundle")) {
+        std::string name;
+        std::vector<std::string> inputs;
+        for (int i = 3; i < argc; ++i) {
+            if (!std::strcmp(argv[i], "--name") && i + 1 < argc) name = argv[++i];
+            else inputs.push_back(argv[i]);
+        }
+        if (!isFenvBundlePath(argv[2])) { std::fprintf(stderr, "fenv-tool bundle: the bundle's name must end in .fbundle: %s\n", argv[2]); return 2; }
+        return bundle(argv[2], inputs, name);
+    }
+    if (argc >= 4 && !std::strcmp(argv[1], "unbundle")) return unbundle(argv[2], argv[3]);
     if (argc >= 3 && !std::strcmp(argv[1], "upgrade")) {
         for (int i = 2; i < argc; ++i) if (!std::strcmp(argv[i], "--no-optimize")) g_optimize = false;
         int rc = 0;
@@ -467,7 +522,10 @@ int main(int argc, char** argv) {
 #endif
     std::fprintf(stderr,
                  "usage:\n  fenv-tool pack out.fenv [--name NAME] [--edits edits.json] [--thumb thumb.png] [--keep-apks] [--fast] <home.apk|vista.apk|model>...\n"
-                 "  fenv-tool info file.fenv\n  fenv-tool convert outdir <home.apk | footprint.apk+vista.apk | model>...\n"
+                 "  fenv-tool info <file.fenv | file.fbundle>\n"
+                 "  fenv-tool bundle out.fbundle [--name NAME] file.fenv...   several environments in one file\n"
+                 "  fenv-tool unbundle file.fbundle outdir   its environments as .fenv files\n"
+                 "  fenv-tool convert outdir <home.apk | footprint.apk+vista.apk | model>...\n"
                  "  fenv-tool upgrade file.fenv...   re-bake with this build (keeps world, edits, sound, picture)\n"
                  "  fenv-tool report [--json] <home.apk | home.fenv | footprint.apk+vista.apk>...   what it costs and what's wrong with it\n"
                  "  fenv-tool settings <home.fenv | home.apk> [JSON | --clear]   a world's own settings, shown or set\n"

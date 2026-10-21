@@ -1,6 +1,6 @@
 @echo off
-rem Installs Frame Home on the Steam Frame (no Frame Studio needed). Double-click it, or drop .fenv environments on
-rem it to copy them to the headset too. Asks for the headset's address the first time (default: frame).
+rem Installs Frame Home on the Steam Frame (no Frame Studio needed). Double-click it, or drop .fenv environments or
+rem .fbundle bundles on it to copy them to the headset too. Asks for the headset's address the first time (default: frame).
 setlocal
 set "HOSTFILE=%APPDATA%\FrameStudio\frame-host.txt"
 set "FRAMEHOST="

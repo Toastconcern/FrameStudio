@@ -1,6 +1,7 @@
 // frame-switcher — the Steam Frame's environment switcher: a SteamVR dashboard panel listing every environment
 // in ~/frame-home/envs (Frame environments .fenv, home APKs, and footprint + vista pairs from pairs.txt) with
-// thumbnails. Point and click one: ~/frame-home/current changes and Frame Home switches to it live.
+// thumbnails. Point and click one: ~/frame-home/current changes and Frame Home switches to it live. A bundle of
+// environments (.fbundle) put there is unpacked into its .fenv files, which the panel then lists one by one.
 //
 //   frame-switcher                 the dashboard panel (SteamVR starts it: see --install)
 //   frame-switcher --install       register with SteamVR and start it with SteamVR from now on
@@ -8,8 +9,10 @@
 //   frame-switcher --set NAME      switch (NAME: the file name, or a number from --list)
 //   frame-switcher --thumbs        render missing thumbnails (frame-home --snapshot) into envs/.thumbs
 //   frame-switcher --delete NAME   delete an environment (like the panel's delete button; NAME as for --set)
+//   frame-switcher --unpack-bundles   unpack the bundles (.fbundle) in envs now (the panel does it by itself)
 //   frame-switcher --test-delete DIR   self-check of deleting, in a fake root made in DIR (must not exist yet)
 #include "fenv.h"
+#include "fenv_bundle.h"
 #include "overlay_texture.h"
 #include "overlays.h"
 #include "perf_settings.h"
@@ -36,6 +39,7 @@
 #include <filesystem>
 #include <fstream>
 #include <map>
+#include <set>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -1433,8 +1437,35 @@ std::string statsLine() {
 
 volatile sig_atomic_t g_quit = 0;
 
+// Bundles (.fbundle, fenv_bundle.h) in envs/ become the environments they carry: each is unpacked beside them as
+// its own .fenv (an environment already there is kept: the same one is skipped, a different one of the same name
+// makes this one "<name> 2.fenv"), then the bundle is deleted, as everything it holds is in envs/ now. One that
+// can't be unpacked (damaged, or still being copied in) stays and is tried again once its size or time changes.
+void unpackBundles() {
+    static std::set<std::string> failed;                // "<file>|<size>|<time>" of bundles that didn't unpack
+    std::error_code ec;
+    const fs::path envs = rootDir() / "envs";
+    for (const auto& e : fs::directory_iterator(envs, ec)) {
+        if (!e.is_regular_file(ec) || !isFenvBundlePath(e.path().string())) continue;
+        const std::string state = e.path().filename().string() + "|" + std::to_string(e.file_size(ec)) + "|" +
+                                  std::to_string(static_cast<long long>(e.last_write_time(ec).time_since_epoch().count()));
+        if (failed.count(state)) continue;
+        std::vector<std::string> unpacked;
+        std::string err;
+        const auto t0 = std::chrono::steady_clock::now();
+        if (!fenvBundleExtract(e.path().string(), envs.string(), unpacked, err)) {
+            LOG("can't unpack the bundle %s: %s", e.path().filename().c_str(), err.c_str());
+            failed.insert(state);
+            continue;
+        }
+        fs::remove(e.path(), ec);
+        LOG("unpacked the bundle %s into %zu environments (%.1f s)", e.path().filename().c_str(), unpacked.size(),
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+    }
+}
+
 // New environments are unpacked into the .fenv cache in the background as soon as they appear (a big one takes
-// ~10 s on the Frame), so switching to one is as quick as switching back to it.
+// ~10 s on the Frame), so switching to one is as quick as switching back to it. Bundles are opened up first.
 void prepareEnvironments() {
     static std::atomic<bool> busy{false}, again{false};
     again = true;                                       // files added while a run is going get a run of their own
@@ -1443,6 +1474,7 @@ void prepareEnvironments() {
         setpriority(PRIO_PROCESS, 0, 15);
         for (;;) {
         while (again.exchange(false)) try {
+        unpackBundles();
         std::error_code ec;
         for (const auto& e : fs::directory_iterator(rootDir() / "envs", ec)) {
             if (e.path().extension() != ".fenv") continue;
@@ -1904,6 +1936,7 @@ int main(int argc, char** argv) {
     const std::string a = argc > 1 ? argv[1] : "";
     if (a == "--install") return runInstall();
     if (a == "--thumbs") return runThumbs();
+    if (a == "--unpack-bundles") { unpackBundles(); return 0; }
     if (a == "--test-delete" && argc > 2) return runTestDelete(argv[2]);
     if (a == "--render" && argc > 2) {   // the panel as it looks now, to a PPM (no SteamVR needed)
         // frame-switcher --render out.ppm [hover] [page] [scroll px] [switching card]

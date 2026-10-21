@@ -8,7 +8,7 @@ Before you start, the headset needs developer mode and SSH: see [headset-setup.m
 
 ## Way 1: from Frame Studio
 
-1. Open the Inspector's **Headset** tab (on the right), or choose **Headset > Install on Steam Frame...**, which opens it.
+1. Open the **Headset** tab in Properties (on the right), or choose **Headset > Install on Steam Frame...**, which opens it.
 2. In **Headset**, type the headset's address: an SSH alias such as `frame`, or `steamos@<address>`, for example
    `steamos@192.168.1.50`. Studio remembers it.
 3. Under **Environments to install**, choose what to copy along:

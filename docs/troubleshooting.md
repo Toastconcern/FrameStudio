@@ -32,11 +32,12 @@ If Studio starts but says it couldn't start Vulkan, the message names the `studi
 
 ## Blank or black view
 
-- With nothing open, Studio shows its start screen. Open a home with **File > Open Home...**.
+- With nothing open, Studio shows its start screen. Open a home with **File > Open...**.
 - A big home takes a while to load; textures arrive after the shapes.
-- Check that things aren't hidden: **View > Show Everything**, and **Edit > Unhide All** (Alt+H). **Show Only
-  Selected** (I) hides everything else; press I or Esc to show everything again.
-- Make sure **Debug** is set to **Normal** and nothing is ticked under **Debug > Leave Out**.
+- Check that things aren't hidden: **View > Show Everything**, and **Select > Reveal Hidden** (Alt+H). **Local
+  View** (Numpad / or I) shows only the selection; press it again or Esc to show everything.
+- Make sure the view's shading is **Material** (the sphere buttons at the right of the 3D Viewport's header) and
+  nothing is ticked under **▾ > Leave Out**.
 - Use **View > Frame All** (Home key) to bring the whole home into view.
 
 ## Dialogs don't appear on Linux

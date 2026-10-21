@@ -13,7 +13,7 @@ headset runs, and lets you edit, save and send them to the headset.
 2. **Prepare the headset** once: developer mode, SSH and a key. See [Preparing the Steam Frame](docs/headset-setup.md).
 3. **Install Frame Home**: in Studio, **Headset > Install on Steam Frame...**, then **Install Frame Home**.
    See [Installing Frame Home](docs/install-frame-home.md).
-4. **Open a home**: **File > Open Home...** and pick a Meta home `.apk`, a `.fenv` or a model.
+4. **Open a home**: **File > Open...** and pick a Meta home `.apk`, a `.fenv` or a model.
 5. **Send it**: **Headset > Send to Frame**. Put the headset on: you are standing in it.
 
 ## Downloads
@@ -106,7 +106,8 @@ Frame Studio and Frame Home are licensed under the **GNU Affero General Public L
 You may use, study, change and share them; if you share a changed version, or run one for others over a network,
 its source must be available under the same license.
 
-Vendored libraries in `third_party/` keep their own licenses (in each folder). The home loaders in `third_party/qhe`
+Vendored libraries in `third_party/` keep their own licenses (in each folder); Studio's interface font, Inter, is under
+the SIL Open Font License (`third_party/inter/LICENSE.txt`). The home loaders in `third_party/qhe`
 started from Quest Home Editor and keep its MIT license for the original code; see
 [third_party/qhe/LICENSE.md](third_party/qhe/LICENSE.md).
 

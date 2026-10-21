@@ -115,10 +115,10 @@ Before you start, set up the headset once: [headset-setup.md](headset-setup.md).
 
 ### 1. Open a home
 
-1. Choose **File > Open Home...** (Ctrl+O), or drop files onto the Studio window.
+1. Choose **File > Open...** (Ctrl+O), or drop files onto the Studio window.
 2. Pick a Meta home (`.apk`), a `.fenv` environment, or a model.
    - To open a room together with its view outside (a "footprint" and a "vista"), select both files in the dialog.
-     You can also add a vista later with **File > Add Vista...**.
+     You can also add a vista later with **File > Import > Vista...**.
 3. Wait for the home to load. Studio shows its progress.
 
 ### 2. Look around
@@ -134,8 +134,9 @@ Before you start, set up the headset once: [headset-setup.md](headset-setup.md).
 
 **Help > Controls** (F1) lists every shortcut.
 
-To change something, select an object, then use **Edit > Move** (G), **Rotate** (R), **Scale** (S), **Hide
-Selected** (H) or **Delete Selected** (X). The selected object's details show in the Inspector on the right.
+To change something, select an object, then pick **Move** (G), **Rotate** (R) or **Scale** (S) in the toolbar on the
+left of the view and drag the gizmo, or use **Object > Show/Hide** (H) or **Object > Delete** (X). The selected
+object's details show in Properties, on the right. Shift+A adds things where you look; F3 finds any command.
 **Edit > Undo** (Ctrl+Z) takes any step back.
 
 ### 3. Save

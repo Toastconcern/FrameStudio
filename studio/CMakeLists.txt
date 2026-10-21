@@ -128,6 +128,7 @@ target_include_directories(frame-studio PRIVATE
     "${TP}/qhe"
     "${TP}/stb"
     "${TP}/miniaudio"
+    "${TP}/inter"
     "${TP}/acl/includes"
     "${TP}/rtm/includes"
     "${TP}/astcenc/Source"

@@ -6,9 +6,9 @@ files it holds, and the Environments panel lists each one separately.
 
 ## Making a bundle in Frame Studio
 
-Everything is in the **Bundle** menu and on the Inspector's **Bundle** tab.
+Everything is in **File > Bundle** and on the **Bundle** tab in Properties.
 
-1. **Bundle > New Bundle** starts an empty one, and the **Bundle** tab opens.
+1. **File > Bundle > New Bundle** starts an empty one, and the **Bundle** tab opens.
 2. Give it a **Name**. It's the bundle's own name; each environment keeps its name.
 3. Add environments:
    - **Add the Open Environment**: the environment you have open, as it was last saved. Save first (Ctrl+S) to
@@ -24,7 +24,7 @@ Everything is in the **Bundle** menu and on the Inspector's **Bundle** tab.
 
 ## Opening a bundle
 
-**Bundle > Open Bundle...**, **File > Open Home...**, or dropping a `.fbundle` on the window opens the bundle on the
+**File > Bundle > Open Bundle...**, **File > Open...**, or dropping a `.fbundle` on the window opens the bundle on the
 Bundle tab. Its environments are listed in place; nothing is unpacked yet.
 
 - Double-click an environment to open it. It is unpacked into a scratch folder first.

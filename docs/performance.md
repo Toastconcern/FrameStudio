@@ -27,7 +27,7 @@ lower Resolution"**, frames are late.
 
 The **Debug** page helps find what is slow:
 
-- **View > GPU cost** tints each mesh: green is cheap, red is costly.
+- The 3D Viewport's shading menu (▾ at the right of its header) **> GPU Cost** tints each mesh: green is cheap, red is costly.
 - **Costliest meshes** lists the most expensive ones.
 - **Leave out** See-through surfaces, Cut-out surfaces or Sky shows whether those are what's slow.
 
@@ -35,11 +35,11 @@ See [using-frame-home.md](using-frame-home.md#the-debug-page).
 
 ### From your computer
 
-- In Studio, **Edit > Settings...** shows "Now on the headset: ..." under the Steam Frame settings, read from the
+- In Studio, **Edit > Preferences...** shows "Now on the headset: ..." under the Steam Frame settings, read from the
   headset. **Read from Headset** refreshes it.
-- **Debug > Headset Debug...** shows and changes the headset's Debug page.
-- **Debug > Home Report...** lists what the open home costs and what's wrong with it.
-- Studio's own **Debug** views (Normal, Wireframe, Meshes, GPU Cost, Overdraw) and **Debug > Leave Out** work like the
+- **Headset > Headset Debug...** shows and changes the headset's Debug page.
+- **Window > Home Report...** lists what the open home costs and what's wrong with it.
+- Studio's viewport shading (Material, Wireframe, Solid, GPU Cost, Overdraw, and **Leave Out** in its ▾ menu) works like the
   headset's, but they measure your computer's GPU, not the headset's.
 
 On the headset, Frame Home writes its numbers to `~/frame-home/stats.json` every 2 seconds (GPU and CPU time per
@@ -90,7 +90,7 @@ Studio tries not to use your computer more than it needs to:
 - It draws at your display's refresh rate while its window has focus, and at 30 fps when it doesn't.
 - When nothing changes (no input for a second and nothing moving by itself), it stops drawing and waits for input.
   Playing animations, loading and saving keep it drawing.
-- **Edit > Settings...** under "This PC (Frame Studio)" has Viewport resolution, Anti-aliasing, Texture limit and
+- **Edit > Preferences...** under "This PC (Frame Studio)" has Viewport resolution, Anti-aliasing, Texture limit and
   Texture filtering for big homes on slower computers.
 
 Two environment variables help when measuring:

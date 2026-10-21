@@ -49,7 +49,7 @@ A home with a room and its vista is usually larger than either alone.
 
 ## Making a .fenv in Frame Studio
 
-1. Open a home: **File > Open Home...**.
+1. Open a home: **File > Open...**.
 2. Edit it if you like.
 3. **File > Save to My Environments** (Ctrl+S) or **File > Save As...**.
 
@@ -129,7 +129,7 @@ Prints the name, baked or wrapped, its sources and models, whether it has edits 
 ```
 
 Lists what the home is made of, what it costs, and problems found. It ends with exit code 3 when the home is broken.
-Studio shows the same under **Debug > Home Report...**.
+Studio shows the same under **Window > Home Report...**.
 
 ## Per-world settings
 

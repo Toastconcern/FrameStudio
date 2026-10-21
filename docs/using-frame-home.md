@@ -99,7 +99,7 @@ More details:
 
 ## Settings
 
-The **Settings** page has three groups. Frame Studio shows the same settings under **Edit > Settings...**, in the
+The **Settings** page has three groups. Frame Studio shows the same settings under **Edit > Preferences...**, in the
 "Steam Frame (Frame Home)" part, so you can change them from your computer too.
 
 Settings are stored in `~/frame-home/settings.json` on the headset. Frame Home reads it again whenever it changes.
@@ -168,4 +168,4 @@ Frame Home restarts.
 
 The GPU cost view times every draw, which makes the GPU a little slower while it is on.
 
-Studio can show and change the same page from your computer: **Debug > Headset Debug...**.
+Studio can show and change the same page from your computer: **Headset > Headset Debug...**.

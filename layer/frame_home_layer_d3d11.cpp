@@ -108,6 +108,8 @@ uint64_t fnv(const void* data, size_t n) {
 enum class Kind { None, Replace, Skip };
 std::unordered_map<uint64_t, Kind> g_shaderKinds;     // bytecode hash -> what to do
 
+std::unordered_map<uint64_t, std::string> g_shaderName;   // bytecode hash -> .fxo name, every pixel shader (diagnostic)
+
 void scanAuroraShaders() {
     wchar_t path[MAX_PATH] = {};
     GetModuleFileNameW(nullptr, path, MAX_PATH);       // ...\SteamVR\bin\win64\vrcompositor.exe
@@ -117,23 +119,19 @@ void scanAuroraShaders() {
     for (auto& e : fs::directory_iterator(shaders, ec)) {
         if (e.path().extension() != ".fxo") continue;
         const std::string name = e.path().filename().string();
-        const bool ps = name.find("_ps.fxo") != std::string::npos;
-        if (!ps || name.find("aurora") == std::string::npos) continue;
-        // Aurora's sky and horizon (what you look out at) we draw the home into; its floor and its stars (the motes
-        // "sky" that is really the floor's ground glow) we leave off, as the Vulkan layer does.
-        Kind k = Kind::Replace;
-        if (name.find("floor") != std::string::npos) k = Kind::Skip;
+        if (name.find("_ps.fxo") == std::string::npos) continue;
         const std::vector<char> b = readFile(e.path());
         if (b.empty()) continue;
-        g_shaderKinds[fnv(b.data(), b.size())] = k;
+        const uint64_t h = fnv(b.data(), b.size());
+        g_shaderName[h] = name;                        // every pixel shader, so a draw can be named (diagnostic)
+        if (name.find("aurora") == std::string::npos && name.find("motes") == std::string::npos) continue;
+        // Aurora's sky and horizon (what you look out at) we draw the home into; its floor and its stars (the motes
+        // "sky" that is really the floor's ground glow) we leave off, as the Vulkan layer does.
+        Kind k = name.find("floor") != std::string::npos || name.find("motes") != std::string::npos ? Kind::Skip : Kind::Replace;
+        g_shaderKinds[h] = k;
         (k == Kind::Replace ? replace : skip) += 1;
     }
-    // The motes (stars) use their own non-aurora pixel shader on the aurora vertex shader; skip by name too.
-    for (const char* n : {"distort_geom_motes_ps.fxo", "geom_motes_ps.fxo"}) {
-        const std::vector<char> b = readFile(shaders / n);
-        if (!b.empty()) { g_shaderKinds[fnv(b.data(), b.size())] = Kind::Skip; ++skip; }
-    }
-    logf("aurora shaders: %d replaced, %d skipped (from %s)", replace, skip, shaders.string().c_str());
+    logf("aurora shaders: %d replaced, %d skipped, %zu pixel shaders named (from %s)", replace, skip, g_shaderName.size(), shaders.string().c_str());
 }
 
 // ── the home: shared state, the compositor's textures, and our draw resources ──────────────────────
@@ -175,6 +173,8 @@ struct HomeCb {                                        // matches the cbuffer in
 
 // Per command buffer? D3D's immediate context is one object; the pixel shader bound on it, tracked by PSSetShader.
 ID3D11PixelShader* g_boundPs = nullptr;
+std::unordered_map<ID3D11PixelShader*, std::string> g_psName;          // every recognised shader's .fxo name (diagnostic)
+std::unordered_map<ID3D11DeviceContext*, ID3D11PixelShader*> g_boundByCtx;   // the pixel shader bound on each context
 
 // Which slot to draw this compositor frame: picked at the first replaced draw and held briefly, so both eyes and
 // every aurora piece in the frame show the same home frame (frameSlot in the Vulkan layer).
@@ -336,18 +336,40 @@ std::unordered_map<ID3D11PixelShader*, Kind> g_psKind;   // shaders the composit
 HRESULT STDMETHODCALLTYPE CreatePixelShader_hook(ID3D11Device* dev, const void* code, SIZE_T len, ID3D11ClassLinkage* link, ID3D11PixelShader** out) {
     const HRESULT hr = g_realCreatePixelShader(dev, code, len, link, out);
     if (SUCCEEDED(hr) && out && *out && code && len) {
-        auto it = g_shaderKinds.find(fnv(code, len));
-        if (it != g_shaderKinds.end()) {
-            std::lock_guard<std::mutex> l(g_shaderMutex);
-            g_psKind[*out] = it->second;
-        }
+        const uint64_t h = fnv(code, len);
+        std::lock_guard<std::mutex> l(g_shaderMutex);
+        if (auto it = g_shaderKinds.find(h); it != g_shaderKinds.end()) g_psKind[*out] = it->second;
+        if (auto it = g_shaderName.find(h); it != g_shaderName.end()) g_psName[*out] = it->second;
     }
     return hr;
 }
 
 void STDMETHODCALLTYPE PSSetShader_hook(ID3D11DeviceContext* ctx, ID3D11PixelShader* ps, ID3D11ClassInstance* const* inst, UINT n) {
     if (ctx == g_context) g_boundPs = ps;
+    { std::lock_guard<std::mutex> l(g_shaderMutex); g_boundByCtx[ctx] = ps; }   // per context (the environment may use a deferred one)
     g_realPSSetShader(ctx, ps, inst, n);
+}
+
+// Diagnostic: the first time each known pixel shader is drawn, note it and the context, so one headset session shows
+// exactly what the compositor draws the environment with (and whether it's our immediate context or another).
+std::unordered_set<std::string> g_seenHere, g_seenOther;
+std::atomic<int> g_seenCount{0};
+void noteDraw(ID3D11DeviceContext* ctx) {
+    static std::atomic<uint64_t> calls{0};
+    if (g_off || calls.fetch_add(1, std::memory_order_relaxed) > 500000 || g_seenCount.load(std::memory_order_relaxed) >= 200) return;   // a few seconds of draws, then nothing
+    std::string name;
+    {
+        std::lock_guard<std::mutex> l(g_shaderMutex);
+        auto b = g_boundByCtx.find(ctx);
+        if (b == g_boundByCtx.end() || !b->second) return;
+        auto it = g_psName.find(b->second);
+        if (it == g_psName.end()) return;
+        auto& seen = ctx == g_context ? g_seenHere : g_seenOther;
+        if (!seen.insert(it->second).second) return;
+        name = it->second;
+        ++g_seenCount;
+    }
+    logf("compositor draws %s%s", name.c_str(), ctx == g_context ? "" : " (on another context, not the one we track)");
 }
 
 // What the compositor's about-to-draw pixel shader means for us (no texture access: that's under g_texMutex).
@@ -379,6 +401,7 @@ struct HomeBind {
 // The texture lock is held across a replaced draw so the pipe thread can't free the texture under it.
 template <typename Draw>
 void replaceDraw(ID3D11DeviceContext* ctx, Draw&& draw) {
+    noteDraw(ctx);                                   // diagnostic: what the compositor draws, and on which context
     const Kind k = classify(ctx);
     if (k == Kind::None) { draw(); return; }
     if (k == Kind::Skip) { g_skipped.fetch_add(1, std::memory_order_relaxed); return; }
@@ -557,8 +580,10 @@ void watchOff() {
         // A heartbeat (every 5 s) of what the layer is doing, for testing without a headset to look through.
         if (++sec % 5 == 0) {
             const uint64_t r = g_replaced.exchange(0), s = g_skipped.exchange(0);
-            if (r || s) logf("drew the home over %llu aurora draws, left %llu undrawn (last 5 s); connected=%d",
-                             (unsigned long long)r, (unsigned long long)s, g_connected.load() ? 1 : 0);
+            size_t here, other;
+            { std::lock_guard<std::mutex> l(g_shaderMutex); here = g_seenHere.size(); other = g_seenOther.size(); }
+            logf("heartbeat: home over %llu aurora draws, %llu undrawn (5 s); distinct shaders drawn here=%zu other=%zu; connected=%d",
+                 (unsigned long long)r, (unsigned long long)s, here, other, g_connected.load() ? 1 : 0);
         }
     }
 }

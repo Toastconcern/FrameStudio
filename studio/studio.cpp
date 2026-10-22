@@ -443,21 +443,86 @@ ImVec4 hex(uint32_t rgb, float a = 1.0f) {
     return ImVec4(((rgb >> 16) & 0xFF) / 255.0f, ((rgb >> 8) & 0xFF) / 255.0f, (rgb & 0xFF) / 255.0f, a);
 }
 
-// Frame Studio's own dark palette, laid out the way Blender works: areas on a near-black gutter, each with a header
-// strip, panels on lighter boxes. Cool neutral greys, one blue for selection and the action a panel is for, and
-// orange as Frame Studio's mark (the brand, the selected mesh, the active object).
-constexpr uint32_t kPanel = 0x2b2d31, kList = 0x232528, kListAlt = 0x26282c, kBar = 0x1c1d20, kWidget = 0x3c3f45;
-constexpr uint32_t kWidgetHover = 0x4a4e55, kWidgetActive = 0x55595f;
-constexpr uint32_t kBlue = 0x3f7bd6, kBlueHover = 0x528ae0, kBlueActive = 0x346ac0, kSelect = 0x2e4a78;
-constexpr uint32_t kOrange = 0xffa033, kText = 0xe3e5e8, kDim = 0x8b9097, kHeading = 0xb9bec6;
-constexpr uint32_t kLine = 0x3a3d43, kSplit = 0x131416;              // hairlines between things, and the gutter between areas
-constexpr uint32_t kHeader = 0x25272b, kPanelBox = 0x33363c;          // an area's header strip; a Properties panel
-constexpr uint32_t kViewBg = 0x393b40;                                // the 3D viewport behind the home
-constexpr uint32_t kToolBg = 0x24262a, kToolHover = 0x3d4047;        // the viewport's toolbar and navigation buttons
-constexpr uint32_t kDanger = 0x7a3434, kDangerHover = 0x9a4040;      // Delete, Remove, Cancel the load
-constexpr uint32_t kGo = 0x2f8a4a, kGoHover = 0x3aa35a;              // Draw Floor, the chosen walk preset
+// Frame Studio's palette, laid out the way Blender works: areas on a near-black gutter, each with a header strip,
+// panels on lighter boxes. The values are a theme's (see ThemeDef / applyThemeDef below) — the themes and their
+// colours come from MetaDB (toastconcern.github.io). Runtime, not constexpr, so a theme can be switched live;
+// everything drawn reads these, so changing them re-colours the whole editor.
+uint32_t kPanel = 0x1c1c1c, kList = 0x191919, kListAlt = 0x1e1e1e, kBar = 0x151515, kWidget = 0x2b2b2b;
+uint32_t kWidgetHover = 0x373737, kWidgetActive = 0x3d3d3d;
+uint32_t kBlue = 0x2f6fe0, kBlueHover = 0x4886ef, kBlueActive = 0x265cbb, kSelect = 0x293a5a;
+uint32_t kOrange = 0xffa033, kText = 0xe6e6e6, kDim = 0x9a9a9a, kHeading = 0xc3c3c3;
+uint32_t kLine = 0x2f2f2f, kSplit = 0x0e0e0e;                       // hairlines between things, and the gutter between areas
+uint32_t kHeader = 0x1a1a1a, kPanelBox = 0x242424;                   // an area's header strip; a Properties panel
+uint32_t kViewBg = 0x2c2c2c;                                         // the 3D viewport behind the home
+uint32_t kToolBg = 0x191919, kToolHover = 0x202020;                 // the viewport's toolbar and navigation buttons
+uint32_t kDanger = 0x4a2420, kDangerHover = 0xd4463a;               // Delete, Remove, Cancel the load
+uint32_t kGo = 0x245c33, kGoHover = 0x74c98c;                       // Draw Floor, the chosen walk preset
+uint32_t kPopup = 0x181818, kFieldActive = 0x151515;                // a dropdown's background; a field being typed in
+uint32_t kScroll = 0x4a4a4a, kScrollHover = 0x5c5c5c, kScrollActive = 0x6d6d6d, kRowAlt = 0x242424;
 
 ImU32 col(uint32_t rgb, float a = 1.0f) { return ImGui::ColorConvertFloat4ToU32(hex(rgb, a)); }
+
+// Blend two packed RGB colours (t: 0 = a, 1 = b). Used to derive the editor's many greys from a theme's few tokens.
+uint32_t mix(uint32_t a, uint32_t b, float t) {
+    auto ch = [&](int sh) { const int x = (a >> sh) & 0xFF, y = (b >> sh) & 0xFF; return static_cast<uint32_t>(std::lround(x + (y - x) * t)) & 0xFF; };
+    return (ch(16) << 16) | (ch(8) << 8) | ch(0);
+}
+
+// A theme, as MetaDB (toastconcern.github.io) defines it: a handful of tokens the whole editor is derived from.
+struct ThemeDef {
+    const char* name;
+    uint32_t bg, panel, field, border, line, hover, text, muted, link, blue, blueHi, green, red, warn, warnHi;
+};
+// The MetaDB themes (css/style.css :root[data-theme]). Dark first (the default).
+const ThemeDef kThemes[] = {
+    {"Dark",        0x151515, 0x1c1c1c, 0x1c1c1c, 0x3d3d3d, 0x2f2f2f, 0x202020, 0xe6e6e6, 0x9a9a9a, 0x7fb3f2, 0x2f6fe0, 0x4886ef, 0x74c98c, 0xef8078, 0xc2352a, 0xd4463a},
+    {"Midnight",    0x0e1626, 0x152034, 0x152034, 0x3d5177, 0x243350, 0x1b2840, 0xb8c2d4, 0x8794ab, 0x8fbcf5, 0x2f6fe0, 0x4886ef, 0x7fd396, 0xf08b83, 0xc2352a, 0xd4463a},
+    {"Forest",      0x102a1c, 0x17351f, 0x17351f, 0x4f8a63, 0x2e5138, 0x1e4128, 0xdcefdd, 0x9dc0a4, 0x93dfa9, 0x2e7d4a, 0x25683c, 0x8ade9f, 0xf79184, 0xb3382a, 0x962c20},
+    {"Forest Deep", 0x0e1611, 0x151f18, 0x151f18, 0x4d7a5c, 0x2b3a31, 0x1b271e, 0xd7e3d8, 0x94a998, 0x8ccfa2, 0x2c7548, 0x23603a, 0x85d398, 0xef8a80, 0xb3382a, 0x962c20},
+    {"Ember",       0x2e1f16, 0x3a2820, 0x3a2820, 0x96795e, 0x573c2a, 0x452f24, 0xf4e2cf, 0xc0a48b, 0xf2ad60, 0xa35516, 0x8a4611, 0x93d193, 0xf79184, 0xb3382a, 0x962c20},
+    {"Terminal",    0x030a05, 0x0a1a0e, 0x0a1a0e, 0x3f7a4c, 0x17361f, 0x102616, 0x6fe887, 0x4fb567, 0x8dfba6, 0x186b2f, 0x125223, 0x79e089, 0xff8f80, 0xa8291d, 0x8a2018},
+    {"Contrast",    0x000000, 0x121212, 0x121212, 0x8a8a8a, 0x606060, 0x1e1e1e, 0xffffff, 0xd4d4d4, 0x9ecbff, 0x1d5fd6, 0x174fb4, 0x8ae8a3, 0xff9b93, 0xc2352a, 0xa02219},
+    {"Paper",       0xf2e7d3, 0xfdf6e8, 0xfdf6e8, 0x8a785f, 0xcdb99a, 0xe6d7ba, 0x2b2620, 0x665b4c, 0x1f5591, 0x2f5d96, 0x24507f, 0x2b6136, 0xa3291a, 0xa3291a, 0x872015},
+    {"Light",       0xffffff, 0xfafafa, 0xffffff, 0xc4c4c4, 0xe0e0e0, 0xf6f6f6, 0x1a1a1a, 0x6b6b6b, 0x1a4f9c, 0x1a5fd0, 0x144ba8, 0x1f6b34, 0xa32218, 0xa32218, 0x8a1d14},
+};
+constexpr int kThemeCount = static_cast<int>(sizeof(kThemes) / sizeof(kThemes[0]));
+int g_theme = 0;   // the chosen theme (index into kThemes), saved in studio-settings.txt
+
+// Derives the whole palette above from a theme's tokens, so a few colours colour the whole editor.
+void applyThemeColors(const ThemeDef& t) {
+    kBar = t.bg;
+    kSplit = mix(t.bg, 0x000000, 0.18f);
+    kPanel = t.panel;
+    kList = mix(t.bg, t.panel, 0.55f);
+    kListAlt = mix(t.panel, t.hover, 0.6f);
+    kHeader = mix(t.bg, t.panel, 0.5f);
+    kPanelBox = mix(t.panel, t.hover, 0.7f);
+    kWidget = mix(t.panel, t.border, 0.30f);
+    kWidgetHover = mix(t.panel, t.border, 0.50f);
+    kWidgetActive = mix(t.panel, t.border, 0.68f);
+    kViewBg = mix(t.bg, t.border, 0.45f);
+    kToolBg = mix(t.bg, t.panel, 0.7f);
+    kToolHover = t.hover;
+    kLine = t.line;
+    kText = t.text;
+    kHeading = mix(t.muted, t.text, 0.55f);
+    kDim = t.muted;
+    kBlue = t.blue;
+    kBlueHover = t.blueHi;
+    kBlueActive = mix(t.blue, t.bg, 0.30f);
+    kSelect = mix(t.panel, t.blue, 0.40f);
+    kDanger = mix(t.panel, t.warn, 0.55f);
+    kDangerHover = t.warnHi;
+    kGo = mix(t.green, t.bg, 0.35f);
+    kGoHover = t.green;
+    kPopup = mix(t.bg, t.panel, 0.7f);
+    kFieldActive = mix(t.bg, t.panel, 0.35f);
+    kScroll = mix(t.panel, t.muted, 0.35f);
+    kScrollHover = mix(t.panel, t.muted, 0.52f);
+    kScrollActive = mix(t.panel, t.muted, 0.68f);
+    kRowAlt = mix(t.panel, t.text, 0.05f);
+    kOrange = 0xffa033;   // Frame Studio's mark and the selected-object outline stay orange (Blender's convention)
+}
 
 #include "inter_regular.h"           // Inter (SIL OFL 1.1: third_party/inter/LICENSE.txt), Blender's interface font
 #include "inter_semibold.h"
@@ -481,6 +546,7 @@ void pushDanger() {
 }
 
 void applyTheme(float scale) {
+    applyThemeColors(kThemes[std::clamp(g_theme, 0, kThemeCount - 1)]);   // the chosen theme's colours into the palette
     ImGuiStyle& s = ImGui::GetStyle();
     s.WindowRounding = 6;               // areas and floating windows: Blender's rounded corners
     s.ChildRounding = 4;
@@ -515,19 +581,19 @@ void applyTheme(float scale) {
     c[ImGuiCol_TextDisabled] = hex(kDim);
     c[ImGuiCol_WindowBg] = hex(kPanel);
     c[ImGuiCol_ChildBg] = hex(0, 0);
-    c[ImGuiCol_PopupBg] = hex(0x1f2023, 0.98f);
+    c[ImGuiCol_PopupBg] = hex(kPopup, 0.98f);
     c[ImGuiCol_Border] = hex(kLine);
     c[ImGuiCol_BorderShadow] = hex(0, 0);
     c[ImGuiCol_FrameBg] = hex(kWidget);
     c[ImGuiCol_FrameBgHovered] = hex(kWidgetHover);
-    c[ImGuiCol_FrameBgActive] = hex(0x1f2124);          // a field being typed in: dark
+    c[ImGuiCol_FrameBgActive] = hex(kFieldActive);      // a field being typed in: dark
     c[ImGuiCol_TitleBg] = c[ImGuiCol_TitleBgActive] = c[ImGuiCol_TitleBgCollapsed] = hex(kHeader);
     c[ImGuiCol_MenuBarBg] = hex(kBar);
     c[ImGuiCol_ScrollbarBg] = hex(0, 0);
-    c[ImGuiCol_ScrollbarGrab] = hex(0x4a4d53);
-    c[ImGuiCol_ScrollbarGrabHovered] = hex(0x5c6067);
-    c[ImGuiCol_ScrollbarGrabActive] = hex(0x6d7178);
-    c[ImGuiCol_CheckMark] = hex(0xffffff);
+    c[ImGuiCol_ScrollbarGrab] = hex(kScroll);
+    c[ImGuiCol_ScrollbarGrabHovered] = hex(kScrollHover);
+    c[ImGuiCol_ScrollbarGrabActive] = hex(kScrollActive);
+    c[ImGuiCol_CheckMark] = hex(kText);
     c[ImGuiCol_SliderGrab] = hex(kBlue);
     c[ImGuiCol_SliderGrabActive] = hex(kBlueHover);
     c[ImGuiCol_Button] = hex(kWidget);
@@ -553,7 +619,7 @@ void applyTheme(float scale) {
     c[ImGuiCol_TableHeaderBg] = hex(kHeader);
     c[ImGuiCol_TableBorderStrong] = c[ImGuiCol_TableBorderLight] = hex(kLine);
     c[ImGuiCol_TableRowBg] = hex(0, 0);
-    c[ImGuiCol_TableRowBgAlt] = hex(0xffffff, 0.025f);
+    c[ImGuiCol_TableRowBgAlt] = hex(kRowAlt);
     c[ImGuiCol_PlotHistogram] = hex(kBlue);
     c[ImGuiCol_PlotHistogramHovered] = hex(kBlueHover);
     c[ImGuiCol_TextSelectedBg] = hex(kBlue, 0.45f);
@@ -714,6 +780,7 @@ struct Studio {
                 else if (k == "msaa") studioPerf.msaa = static_cast<int>(v);
                 else if (k == "textureCap") studioPerf.textureCap = static_cast<int>(v);
                 else if (k == "anisotropy") studioPerf.anisotropy = static_cast<int>(v);
+                else if (k == "theme") g_theme = std::clamp(static_cast<int>(v), 0, kThemeCount - 1);
             }
             std::fclose(f);
         }
@@ -725,7 +792,7 @@ struct Studio {
 
     void saveStudioPerf() {
         if (FILE* f = platform::openFile((dataDir() / L"studio-settings.txt").c_str(), "wb")) {
-            std::fprintf(f, "viewScale=%.2f\nmsaa=%d\ntextureCap=%d\nanisotropy=%d\n", studioPerf.viewScale, studioPerf.msaa, studioPerf.textureCap, studioPerf.anisotropy);
+            std::fprintf(f, "viewScale=%.2f\nmsaa=%d\ntextureCap=%d\nanisotropy=%d\ntheme=%d\n", studioPerf.viewScale, studioPerf.msaa, studioPerf.textureCap, studioPerf.anisotropy, g_theme);
             std::fclose(f);
         }
         setTextureCap(static_cast<uint32_t>(studioPerf.textureCap));
@@ -6504,6 +6571,11 @@ struct Studio {
             for (int w = 0; w < kWorkspaces; ++w) if (ImGui::MenuItem(kWorkspaceName[w], nullptr, w == workspace)) setWorkspace(w);
             ImGui::EndMenu();
         }
+        if (ImGui::BeginMenu("Theme")) {   // the MetaDB (toastconcern.github.io) themes
+            for (int i = 0; i < kThemeCount; ++i)
+                if (ImGui::MenuItem(kThemes[i].name, nullptr, i == g_theme)) { g_theme = i; applyTheme(scale); saveStudioPerf(); }
+            ImGui::EndMenu();
+        }
         if (ImGui::MenuItem("Reset Layout")) { layoutWanted = true; viewMaximized = false; }
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("The workspace's areas back where they started");
         ImGui::Separator();
@@ -6895,6 +6967,12 @@ struct Studio {
         const float pad = 14 * scale, x0 = a.x + pad, x1 = b.x - pad, rulerH = ImGui::GetFrameHeight();
         dl->AddRectFilled(a, b, col(kList));
         dl->AddRectFilled(a, ImVec2(b.x, a.y + rulerH), col(kHeader));
+        if (!scene) {   // no home open: an empty timeline with a quiet hint — no ruler, no stray "0"
+            const char* hint = "Open a home to see its animation";
+            const ImVec2 ts = ImGui::CalcTextSize(hint);
+            dl->AddText(ImVec2((a.x + b.x) * 0.5f - ts.x * 0.5f, a.y + rulerH + (b.y - a.y - rulerH - ts.y) * 0.5f), col(kDim), hint);
+            return;
+        }
         const float len = std::max(0.1f, animLength);
         // the loop's range, lighter
         dl->AddRectFilled(ImVec2(x0, a.y + rulerH), ImVec2(x1, b.y), col(kListAlt));
@@ -9430,6 +9508,7 @@ int runStudio(StudioWindow& window, const std::vector<std::string>& args) {
     ii.ImageCount = g_wd.ImageCount;
     ii.MSAASamples = VK_SAMPLE_COUNT_1_BIT;
     ImGui_ImplVulkan_Init(&ii);
+    applyTheme(scale);   // again: window.initImGui() resets ImGui's style, so the saved theme is applied after it
 
     if (const char* tab = std::getenv("FS_INSPECTOR_TAB")) {   // diagnostics / screenshots: start on this Inspector tab
         const std::string t = tab;

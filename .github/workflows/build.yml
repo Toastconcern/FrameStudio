@@ -25,6 +25,7 @@ jobs:
           - { arch: x86, runner: ubuntu-24.04, extra: "gcc-multilib g++-multilib" }
           - { arch: arm64, runner: ubuntu-24.04-arm, extra: "" }
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - name: Tools and X11 headers
@@ -45,6 +46,7 @@ jobs:
       matrix:
         arch: [x64, x86, arm64]
     runs-on: windows-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - name: Build (MSVC)
@@ -75,6 +77,7 @@ jobs:
           - { arch: arm64, runner: macos-14 }
           - { arch: x64, runner: macos-13 }
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - name: Tools and MoltenVK (Vulkan on Metal, bundled into the app)
@@ -89,6 +92,7 @@ jobs:
   frame-home:
     name: Frame Home installer
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - name: Package
@@ -100,10 +104,14 @@ jobs:
 
   release:
     name: Publish
-    # (also when a platform failed: "latest" gets every build that worked; a version release needs them all)
+    # "latest" gets every build that finished (a failed or still-slow platform just isn't in it); a version release
+    # needs them all. We don't wait on macOS: its runners can sit in GitHub's queue for hours, and since a push
+    # cancels the previous run, waiting meant no run ever reached this job. Both Mac builds still upload and are
+    # attached whenever they finish in time.
     if: ${{ !cancelled() && (startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/main') }}
-    needs: [linux, windows, macos, frame-home]
+    needs: [linux, windows, frame-home]
     runs-on: ubuntu-24.04
+    timeout-minutes: 20
     permissions:
       contents: write
     env:

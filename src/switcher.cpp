@@ -546,6 +546,10 @@ struct Font {
         for (const char* p : paths) if (load(p, px)) return true;
         return false;
     }
+    bool load(const std::vector<std::string>& paths, float px) {
+        for (const std::string& p : paths) if (load(p.c_str(), px)) return true;
+        return false;
+    }
     const Glyph& glyph(int c) const {
         auto it = glyphs.find(c);
         if (it != glyphs.end()) return it->second;
@@ -1293,16 +1297,24 @@ struct Panel {
 
     // ── Actions ──
     void loadFonts() {
-        const char *bold = "/usr/share/fonts/noto/NotoSans-Bold.ttf", *semi = "/usr/share/fonts/noto/NotoSans-SemiBold.ttf",
-                   *medium = "/usr/share/fonts/noto/NotoSans-Medium.ttf", *regular = "/usr/share/fonts/noto/NotoSans-Regular.ttf",
-                   *dejaB = "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf", *deja = "/usr/share/fonts/TTF/DejaVuSans.ttf";
-        title.load({bold, dejaB, deja}, 44);
-        head.load({bold, semi, dejaB, deja}, 30);
-        body.load({semi, medium, bold, deja}, 26);
-        label.load({semi, medium, bold, deja}, 22);
-        small.load({regular, deja}, 20);
-        tiny.load({bold, semi, dejaB, deja}, 17);
-        glyphFont.load({bold, dejaB, deja}, 96);
+        // The Frame's fonts (SteamOS) first, then Windows' own (Segoe UI, Arial) so the panel has real text on a PC —
+        // without them nothing drew. Each weight tries its best match, then lighter/heavier stand-ins.
+        std::string win = "C:\\Windows\\Fonts\\";
+        if (const char* r = std::getenv("SystemRoot"); r && *r) win = std::string(r) + "\\Fonts\\";
+        const std::string lb = "/usr/share/fonts/noto/NotoSans-Bold.ttf", ls = "/usr/share/fonts/noto/NotoSans-SemiBold.ttf",
+                          lm = "/usr/share/fonts/noto/NotoSans-Medium.ttf", lr = "/usr/share/fonts/noto/NotoSans-Regular.ttf",
+                          ldB = "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf", ld = "/usr/share/fonts/TTF/DejaVuSans.ttf";
+        const std::string wb = win + "segoeuib.ttf", wsb = win + "segoeuisb.ttf", wr = win + "segoeui.ttf",
+                          wab = win + "arialbd.ttf", wa = win + "arial.ttf";
+        const std::vector<std::string> bold{lb, ldB, wb, wab, ld, wa}, semi{ls, lb, wsb, wb, ldB, wab},
+            medium{lm, ls, lb, wr, wsb, ld, wa}, regular{lr, wr, ld, wa}, heavy{lb, ldB, wb, wab, ld, wa};
+        title.load(bold, 44);
+        head.load(semi, 30);
+        body.load(medium, 26);
+        label.load(medium, 22);
+        small.load(regular, 20);
+        tiny.load(semi, 17);
+        glyphFont.load(heavy, 96);
     }
     // Saves the settings like Frame Home expects (whole file, renamed into place: it applies them live).
     void saveSettings(const PerfSettings& before) {

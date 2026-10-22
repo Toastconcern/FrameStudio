@@ -1,7 +1,7 @@
 #pragma once
 // SteamVR's panels (overlays) of every app. OpenVR can't list them, but a handle is (slot << 32 | serial) with both
 // small, so probing that range finds them all; a whole sweep takes about 0.1 s. Used to tell whether a hand points
-// at a panel (frame-switcher) and to dock free-floating panels on a home's wall spots (Frame Home).
+// at a panel (frame-switcher).
 #include <openvr.h>
 
 #include <cstring>

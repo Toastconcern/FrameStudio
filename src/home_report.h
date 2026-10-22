@@ -24,7 +24,7 @@ struct HomeReport {
     size_t seeThrough = 0, seeThroughTris = 0, cutout = 0, skinned = 0, animated = 0, lightmapped = 0, sky = 0, programs = 0;
     size_t textures = 0;                // distinct
     double textureMB = 0, decodedMB = 0, geometryMB = 0;   // compressed (as the GPU gets it when it can), decoded RGBA, vertices + indices
-    size_t spawns = 0, seats = 0, hotspots = 0, colliders = 0, wallSpots = 0, gravity = 0;
+    size_t spawns = 0, seats = 0, hotspots = 0, colliders = 0, gravity = 0;
     double walkArea = -1;               // m², < 0: no walkable area known
     double loadSec = 0;                 // set by the caller
     struct Mesh { size_t tris; int mesh; };
@@ -50,8 +50,8 @@ struct HomeReport {
         o += b;
         std::snprintf(b, sizeof b, "%zu textures: %.0f MB compressed, %.0f MB decoded; geometry %.0f MB\n", textures, textureMB, decodedMB, geometryMB);
         o += b;
-        std::snprintf(b, sizeof b, "world: %zu spawns, %zu seats, %zu hotspots, %zu surfaces, %zu wall spots, %zu gravity zones", spawns, seats, hotspots,
-                      colliders, wallSpots, gravity);
+        std::snprintf(b, sizeof b, "world: %zu spawns, %zu seats, %zu hotspots, %zu surfaces, %zu gravity zones", spawns, seats, hotspots,
+                      colliders, gravity);
         o += b;
         o += walkArea >= 0 ? "; walkable " + num(walkArea, 0) + " m²\n" : "\n";
         if (!biggestMeshes.empty()) o += "most triangles:\n";
@@ -72,7 +72,7 @@ struct HomeReport {
         n("meshes", meshes); n("triangles", triangles); n("vertices", vertices); n("seeThrough", seeThrough); n("seeThroughTris", seeThroughTris);
         n("cutout", cutout); n("skinned", skinned); n("animated", animated); n("lightmapped", lightmapped); n("programs", programs);
         n("textures", textures); n("textureMB", std::round(textureMB)); n("decodedMB", std::round(decodedMB)); n("geometryMB", std::round(geometryMB));
-        n("spawns", spawns); n("seats", seats); n("colliders", colliders); n("wallSpots", wallSpots); n("walkArea", std::round(walkArea));
+        n("spawns", spawns); n("seats", seats); n("colliders", colliders); n("walkArea", std::round(walkArea));
         n("loadSec", std::round(loadSec * 10) / 10);
         o += ",\"biggestMeshes\":[";
         for (size_t i = 0; i < biggestMeshes.size(); ++i) o += (i ? ",{\"name\":" : "{\"name\":") + q(meshName(biggestMeshes[i].mesh)) + ",\"tris\":" + num(biggestMeshes[i].tris, 0) + "}";
@@ -209,7 +209,7 @@ inline HomeReport makeHomeReport(const HslScene& s, const HomeWorld* walk = null
     // The world.
     const HomeWorld& w = walk ? *walk : s.world;
     r.spawns = w.spawns.size(); r.seats = w.seats.size(); r.hotspots = w.hotspots.size(); r.colliders = w.colliders.size();
-    r.wallSpots = w.wallSpots.size(); r.gravity = w.gravity.size();
+    r.gravity = w.gravity.size();
     const WalkGrid* g = walk ? walk->walkGridCache.get() : nullptr;
     float floorY = 0;
     if (w.spawns.empty() && w.gravity.empty() && (!g || !g->floorAt(0, 0, 0, 0.5f, 1.0f, floorY)))

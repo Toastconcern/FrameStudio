@@ -60,7 +60,7 @@ very largest homes may not fit.
 
 - Opens Meta homes (HSL, Clay, glTF), `.fenv` environments and Blender or Unity models; pairs rooms with vistas.
 - Move, rotate, scale, hide and delete objects, with undo and auto-saved versions.
-- Shape the walkable area: auto-generated surfaces, drawn floors, spawns, seats, hotspots, wall spots, gravity zones.
+- Shape the walkable area: auto-generated surfaces, drawn floors, spawns, seats, hotspots, gravity zones.
 - Add a background sound and a picture; set and calculate per-world settings.
 - Saves baked `.fenv` files and leaves out what can't be seen; sends them to the headset in one click.
 - Packs several environments into one `.fbundle` to share or install together ([bundles](docs/bundles.md)).

@@ -485,7 +485,7 @@ bool loadHslScene(const std::vector<std::string>& apkPaths, HslScene& scene, std
             HomeWorld& w = loaders[i]->world;
             auto add = [](auto& to, auto& from) { to.insert(to.end(), std::make_move_iterator(from.begin()), std::make_move_iterator(from.end())); };
             add(scene.world.spawns, w.spawns); add(scene.world.seats, w.seats); add(scene.world.hotspots, w.hotspots);
-            add(scene.world.colliders, w.colliders); add(scene.world.wallSpots, w.wallSpots);
+            add(scene.world.colliders, w.colliders);
             if (!scene.world.empty()) scene.world.origin = "meta";
         }
         for (auto& md : loaders[i]->meshes) {

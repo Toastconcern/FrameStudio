@@ -393,13 +393,13 @@ struct UndoStep {
 };
 
 // The world layer's kinds of things (Studio's world editor).
-enum WorldKind { kSpawn, kSeat, kHotspot, kCollider, kWallSpot, kGravity, kWorldKinds };
-const char* kWorldNames[kWorldKinds] = {"Spawns", "Seats", "Teleport Hotspots", "Walls & Surfaces", "Wall Spots", "Gravity Zones"};
+enum WorldKind { kSpawn, kSeat, kHotspot, kCollider, kGravity, kWorldKinds };
+const char* kWorldNames[kWorldKinds] = {"Spawns", "Seats", "Teleport Hotspots", "Walls & Surfaces", "Gravity Zones"};
 
 // What the viewport can show, each with its own switch (View > Show, the explorer's World headers).
-enum ShowCat { kShowSpawns, kShowSeats, kShowHotspots, kShowFloors, kShowWalls, kShowSolidMeshes, kShowTriggers, kShowWallSpots, kShowGravity, kShowWalkArea, kShowUnreached, kShowCats };
-const char* kShowNames[kShowCats] = {"Spawn points", "Seats", "Teleport hotspots", "Drawn floors", "Surface shapes", "Surface & collider meshes", "Triggers", "Wall spots", "Gravity zones", "Walkable area", "Floors out of reach"};
-const uint32_t kShowColors[kShowCats] = {0x3fd2ff, 0x5fe07a, 0xffd84a, 0x4cd964, 0xff7a2e, 0xffa033, 0x9a9a9a, 0x5b8def, 0xc07aff, 0x2ec756, 0x808080};
+enum ShowCat { kShowSpawns, kShowSeats, kShowHotspots, kShowFloors, kShowWalls, kShowSolidMeshes, kShowTriggers, kShowGravity, kShowWalkArea, kShowUnreached, kShowCats };
+const char* kShowNames[kShowCats] = {"Spawn points", "Seats", "Teleport hotspots", "Drawn floors", "Surface shapes", "Surface & collider meshes", "Triggers", "Gravity zones", "Walkable area", "Floors out of reach"};
+const uint32_t kShowColors[kShowCats] = {0x3fd2ff, 0x5fe07a, 0xffd84a, 0x4cd964, 0xff7a2e, 0xffa033, 0x9a9a9a, 0xc07aff, 0x2ec756, 0x808080};
 
 // A gravity zone's kind (WorldGravity::Kind), as Studio names and explains it.
 const char* kGravityNames[3] = {"Direction", "Planet", "Walk on any surface"};
@@ -673,7 +673,7 @@ struct Studio {
     int wKind = -1, wIndex = -1;
     bool showWorld = true;
     // What the viewport shows. View only: the per-item eyes (hidden) are kept with the world layer.
-    bool showCat[kShowCats] = {true, true, true, true, true, false, false, true, true, true, true};
+    bool showCat[kShowCats] = {true, true, true, true, true, false, false, true, true, true};
     bool showMeshes = true;                 // the home's own objects
     bool isolating = false;                 // View > Show Only Selected (I)
     int isoObject = -1, isoKind = -1, isoIndex = -1;
@@ -991,8 +991,8 @@ struct Studio {
         ImGui::TextWrapped("%zu meshes, %.2f M triangles (%zu see-through, %zu cut-out, %zu animated), %zu shaders", r.meshes, r.triangles / 1e6, r.seeThrough,
                            r.cutout, r.animated, r.programs);
         ImGui::TextWrapped("%zu textures: %.0f MB compressed, %.0f MB decoded; geometry %.0f MB", r.textures, r.textureMB, r.decodedMB, r.geometryMB);
-        if (r.walkArea >= 0) ImGui::TextWrapped("%.0f m² to walk on; %zu spawns, %zu seats, %zu surfaces, %zu wall spots", r.walkArea, r.spawns, r.seats, r.colliders, r.wallSpots);
-        else ImGui::TextWrapped("%zu spawns, %zu seats, %zu surfaces, %zu wall spots", r.spawns, r.seats, r.colliders, r.wallSpots);
+        if (r.walkArea >= 0) ImGui::TextWrapped("%.0f m² to walk on; %zu spawns, %zu seats, %zu surfaces", r.walkArea, r.spawns, r.seats, r.colliders);
+        else ImGui::TextWrapped("%zu spawns, %zu seats, %zu surfaces", r.spawns, r.seats, r.colliders);
         if (ImGui::Button("Check Again")) report.reset();
         ImGui::SameLine();
         if (ImGui::Button("Copy as Text")) ImGui::SetClipboardText(r.text().c_str());
@@ -1131,7 +1131,7 @@ struct Studio {
         static const char* views[] = {"Normal", "Wireframe", "Meshes", "GPU cost", "Overdraw"};
         if (int p = choice("View##hd", views, 5, d.view, "What Frame Home draws: the environment, or how it's made and what it costs."); p >= 0) { d.view = p; changed = true; }
         static const char* wl[] = {"Hidden", "Shown"};
-        if (int p = choice("World layer##hd", wl, 2, d.world, "Where you can walk (green), surfaces and colliders, spawns, seats, wall spots and gravity zones."); p >= 0) {
+        if (int p = choice("World layer##hd", wl, 2, d.world, "Where you can walk (green), surfaces and colliders, spawns, seats and gravity zones."); p >= 0) {
             d.world = p; changed = true; }
         static const char* lo[] = {"Shown", "Left out"};
         if (int p = choice("See-through##hd", lo, 2, d.hideSeeThrough, "Glass, water, glow and fog."); p >= 0) { d.hideSeeThrough = p; changed = true; }
@@ -2961,7 +2961,7 @@ struct Studio {
         bool ok = false;
         int replaced = 0, kept = 0;
         bool spawnAdded = false;
-        int walls = 0, objects = 0, colliders = 0, seats = 0, spots = 0, hotspots = 0;   // world items made
+        int walls = 0, objects = 0, colliders = 0, seats = 0, hotspots = 0;   // world items made
         WalkReport walk;
         float ms = 0;
     } autoReport;
@@ -3006,11 +3006,10 @@ struct Studio {
         w.colliders.erase(std::remove_if(w.colliders.begin(), w.colliders.end(), [](const WorldCollider& c) { return isAuto(c.name); }), w.colliders.end());
         r.replaced = static_cast<int>(n0 - w.colliders.size());
         w.spawns.erase(std::remove_if(w.spawns.begin(), w.spawns.end(), [](const WorldPoint& p) { return p.name == "Auto spawn"; }), w.spawns.end());
-        // the walls, seats, wall spots and hotspots it made last time go too (yours stay)
+        // the walls, seats and hotspots it made last time go too (yours stay)
         auto autoPoint = [](const WorldPoint& p) { return isAuto(p.name); };
         w.seats.erase(std::remove_if(w.seats.begin(), w.seats.end(), autoPoint), w.seats.end());
         w.hotspots.erase(std::remove_if(w.hotspots.begin(), w.hotspots.end(), autoPoint), w.hotspots.end());
-        w.wallSpots.erase(std::remove_if(w.wallSpots.begin(), w.wallSpots.end(), [](const WorldWallSpot& s) { return isAuto(s.name); }), w.wallSpots.end());
         for (const Object& o : objects) if (!o.deleted && surfaceIndex(o) >= 0) ++r.kept;
         const auto t0 = std::chrono::steady_clock::now();
         {   // Everything that can be a floor is one: a mesh you stand on somewhere (the floor, stairs, a rug, a deck,
@@ -3166,9 +3165,8 @@ struct Studio {
         if (r.objects) { swatch(kShowColors[kShowSolidMeshes]); ImGui::Text("%d floor mesh%s made surfaces: walkable where flat, blocking where too steep", r.objects, r.objects == 1 ? "" : "es"); }
         if (r.colliders) { swatch(kRoleColors[WorldCollider::Object]); ImGui::Text("%d object%s given a collider: you don't walk through %s", r.colliders, r.colliders == 1 ? "" : "s", r.colliders == 1 ? "it" : "them"); }
         if (r.seats) { swatch(kShowColors[kShowSeats]); ImGui::Text("%d seat%s on the chairs, sofas and stools it found", r.seats, r.seats == 1 ? "" : "s"); }
-        if (r.spots) { swatch(kShowColors[kShowWallSpots]); ImGui::Text("%d wall spot%s for panels, on large flat walls", r.spots, r.spots == 1 ? "" : "s"); }
         if (r.hotspots) { swatch(kShowColors[kShowHotspots]); ImGui::Text("%d teleport hotspot%s spread over the floor", r.hotspots, r.hotspots == 1 ? "" : "s"); }
-        if (r.walls + r.objects + r.colliders + r.seats + r.spots + r.hotspots) ImGui::TextDisabled("They're all named \"Auto …\" in the World list: edit or delete any; running it again replaces them.");
+        if (r.walls + r.objects + r.colliders + r.seats + r.hotspots) ImGui::TextDisabled("They're all named \"Auto …\" in the World list: edit or delete any; running it again replaces them.");
         ImGui::Spacing();
         ImGui::PushStyleColor(ImGuiCol_Text, hex(kDim));
         if (r.kept) ImGui::Text(r.kept == 1 ? "1 object keeps the surface you gave it (Surface or Walk through)" : "%d objects keep the surfaces you gave them (Surface or Walk through)", r.kept);
@@ -3243,7 +3241,7 @@ struct Studio {
         if (ImGui::Button(walkSaved() ? "Auto-generate Again" : "Auto-generate Walkable Surfaces", ImVec2(-1, 0))) autoGenerate();
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("Bakes where you can walk from everything solid in the home and saves it with it (one undo step),\n"
-                              "and adds walls along its edges, seats on chairs and sofas, wall spots for panels and teleport hotspots.\n"
+                              "and adds walls along its edges, seats on chairs and sofas and teleport hotspots.\n"
                               "Floors need headroom; furniture, plants, railings and walls block; steps up to the step height connect;\n"
                               "seams are bridged; floors you can't reach from the start are left out. Object Surfaces override it.");
     }
@@ -3285,7 +3283,7 @@ struct Studio {
         updateTitle();
     }
 
-    // ── World layer (spawns, seats, hotspots, walls, wall spots, walkable areas) ──
+    // ── World layer (spawns, seats, hotspots, walls, walkable areas) ──
 
     int worldCount(int kind) const {
         if (!scene) return 0;
@@ -3295,7 +3293,6 @@ struct Studio {
             case kSeat: return static_cast<int>(w.seats.size());
             case kHotspot: return static_cast<int>(w.hotspots.size());
             case kCollider: return static_cast<int>(w.colliders.size());
-            case kWallSpot: return static_cast<int>(w.wallSpots.size());
             case kGravity: return static_cast<int>(w.gravity.size());
             default: return 0;
         }
@@ -3306,7 +3303,6 @@ struct Studio {
             case kSpawn: return kShowSpawns;
             case kSeat: return kShowSeats;
             case kHotspot: return kShowHotspots;
-            case kWallSpot: return kShowWallSpots;
             case kGravity: return kShowGravity;
             default: {
                 const WorldCollider& c = scene->world.colliders[i];
@@ -3321,7 +3317,6 @@ struct Studio {
     bool* worldHidden(int kind, int i) {
         if (WorldPoint* p = worldPoint(kind, i)) return &p->hidden;
         if (kind == kCollider) return &scene->world.colliders[i].hidden;
-        if (kind == kWallSpot) return &scene->world.wallSpots[i].hidden;
         if (kind == kGravity) return &scene->world.gravity[i].hidden;
         return nullptr;
     }
@@ -3347,7 +3342,6 @@ struct Studio {
             static const char* shape[] = {"box", "sphere", "capsule", "mesh"};
             return (c.name.empty() ? std::string("surface ") + std::to_string(i + 1) : c.name) + " (" + shape[std::clamp(c.kind, 0, 3)] + ")";
         }
-        if (kind == kWallSpot) { const WorldWallSpot& ws = scene->world.wallSpots[i]; return ws.name.empty() ? "wall spot " + std::to_string(i + 1) : ws.name; }
         if (kind == kGravity) {
             const WorldGravity& g = scene->world.gravity[i];
             return (g.name.empty() ? "gravity " + std::to_string(i + 1) : g.name) + " (" + kGravityNames[std::clamp(g.kind, 0, 2)] + ")";
@@ -3370,7 +3364,6 @@ struct Studio {
             std::memcpy(m, c.world, 64);
             return true;
         }
-        if (kind == kWallSpot) { std::memcpy(m, scene->world.wallSpots[i].world, 64); return true; }
         if (kind == kGravity) { std::memcpy(m, scene->world.gravity[i].world, 64); return true; }
         return false;
     }
@@ -3399,13 +3392,6 @@ struct Studio {
             if (c.kind == WorldCollider::Box) for (int k = 0; k < 3; ++k) c.half[k] = std::max(0.01f, b.half[k] * sc[k]);
             else if (c.kind == WorldCollider::Sphere) c.radius = std::max(0.01f, b.radius * (sc[0] + sc[1] + sc[2]) / 3);
             else { c.radius = std::max(0.01f, b.radius * (sc[0] + sc[2]) * 0.5f); c.length = std::max(0.0f, b.length * sc[1]); }
-        } else if (kind == kWallSpot) {
-            WorldWallSpot& ws = scene->world.wallSpots[i];
-            const WorldWallSpot& b = i < static_cast<int>(dragBase.wallSpots.size()) ? dragBase.wallSpots[i] : ws;
-            float sc[3];
-            unscale(m, ws.world, sc);
-            ws.width = std::max(0.05f, b.width * sc[0]);
-            ws.height = std::max(0.05f, b.height * sc[1]);
         } else if (kind == kGravity) {   // scaling resizes the region (box) or the pull (planet)
             WorldGravity& g = scene->world.gravity[i];
             const WorldGravity& b = i < static_cast<int>(dragBase.gravity.size()) ? dragBase.gravity[i] : g;
@@ -3500,11 +3486,6 @@ struct Studio {
             wIndex = combineTouching(static_cast<int>(w.colliders.size()) - 1);
             selected = -1;
             return;
-        } else if (kind == kWallSpot) {
-            WorldWallSpot ws;
-            ws.name = "Wall spot " + std::to_string(w.wallSpots.size() + 1);
-            translation(ws.world, x, y + 1.4f, z);
-            w.wallSpots.push_back(ws);
         }
         wKind = kind;
         wIndex = worldCount(kind) - 1;
@@ -3513,7 +3494,7 @@ struct Studio {
 
     // Points the camera at a world item (double-click in the explorer, F).
     void frameWorld(int kind, int i) {
-        float m[16], mn[3], mx[3];
+        float mn[3], mx[3];
         if (WorldPoint* p = worldPoint(kind, i)) {
             for (int k = 0; k < 3; ++k) { mn[k] = p->pos[k] - 1; mx[k] = p->pos[k] + 1; }
         } else if (kind == kCollider) {
@@ -3532,10 +3513,6 @@ struct Studio {
             const WorldGravity& g = scene->world.gravity[i];
             const float r = g.kind == WorldGravity::Planet ? g.radius : std::max({g.half[0], g.half[1], g.half[2]});
             for (int k = 0; k < 3; ++k) { mn[k] = g.world[12 + k] - r; mx[k] = g.world[12 + k] + r; }
-        } else if (kind == kWallSpot && worldMatrix(kind, i, m)) {
-            const WorldWallSpot& ws = scene->world.wallSpots[i];
-            const float r = std::max(ws.width, ws.height) * 0.5f;
-            for (int k = 0; k < 3; ++k) { mn[k] = m[12 + k] - r; mx[k] = m[12 + k] + r; }
         } else return;
         frameBounds(mn, mx);
     }
@@ -3556,7 +3533,6 @@ struct Studio {
             case kSeat: w.seats.erase(w.seats.begin() + wIndex); break;
             case kHotspot: w.hotspots.erase(w.hotspots.begin() + wIndex); break;
             case kCollider: w.colliders.erase(w.colliders.begin() + wIndex); break;
-            case kWallSpot: w.wallSpots.erase(w.wallSpots.begin() + wIndex); break;
             case kGravity: w.gravity.erase(w.gravity.begin() + wIndex); break;
         }
         if (isolating && isoKind == wKind) {   // keep Show Only Selected on the same item (or end it with it)
@@ -4715,7 +4691,7 @@ struct Studio {
                 }
             }
         }
-        // World: the home's spawns, seats, hotspots, walls and wall spots (Studio's own format, from Meta's when converted).
+        // World: the home's spawns, seats, hotspots and walls (Studio's own format, from Meta's when converted).
         if (scene && !objects.empty()) {
             int total = 0;
             for (int k = 0; k < kWorldKinds; ++k) total += worldCount(k);
@@ -5014,16 +4990,6 @@ struct Studio {
                     if (c.kind == WorldCollider::Sphere || c.kind == WorldCollider::Capsule) { fieldLabel("Radius"); ImGui::DragFloat("##wrad", &c.radius, 0.01f, 0.01f, 50.0f, "%.2f m"); track(); }
                     if (c.kind == WorldCollider::Capsule) { fieldLabel("Length"); ImGui::DragFloat("##wlen", &c.length, 0.01f, 0.0f, 50.0f, "%.2f m"); track(); }
                 }
-            } else if (wKind == kWallSpot) {
-                WorldWallSpot& ws = scene->world.wallSpots[wIndex];
-                float t[3], r[3], sc[3];
-                ImGuizmo::DecomposeMatrixToComponents(ws.world, t, r, sc);
-                bool moved = false;
-                fieldLabel("Location"); moved |= ImGui::DragFloat3("##wsloc", t, 0.01f, 0, 0, "%.2f m"); track();
-                fieldLabel("Rotation"); tidyZero(r, 0.001f); moved |= ImGui::DragFloat3("##wsrot", r, 0.5f, 0, 0, "%.0f\u00b0"); track();
-                if (moved) { sc[0] = sc[1] = sc[2] = 1; ImGuizmo::RecomposeMatrixFromComponents(t, r, sc, ws.world); }
-                fieldLabel("Width"); ImGui::DragFloat("##wwid", &ws.width, 0.01f, 0.1f, 20.0f, "%.2f m"); track();
-                fieldLabel("Height"); ImGui::DragFloat("##whei", &ws.height, 0.01f, 0.1f, 20.0f, "%.2f m"); track();
             }
             if (wKind == kGravity) {
                 WorldGravity& g = scene->world.gravity[wIndex];
@@ -5569,7 +5535,7 @@ struct Studio {
     }
 
     // The world layer drawn over the 3D view (x-ray: always visible): spawns cyan, seats green, hotspots yellow,
-    // walls red (triggers dim), wall spots blue, walkable areas green. The selected item is drawn brighter.
+    // walls red (triggers dim), walkable areas green. The selected item is drawn brighter.
     void drawWorld(ImDrawList* dl, const float* viewProj) {
         if (!scene || !showWorld) return;
         const HomeWorld& w = scene->world;
@@ -5778,15 +5744,6 @@ struct Studio {
                 x += (k ? ww : wf) + gap * 1.4f;
             }
         }
-        for (size_t i = 0; i < w.wallSpots.size(); ++i) {
-            if (!worldShown(kWallSpot, static_cast<int>(i))) continue;
-            const WorldWallSpot& ws = w.wallSpots[i];
-            const bool sel = wKind == kWallSpot && wIndex == static_cast<int>(i), hov = hoverKind == kWallSpot && hoverIndex == static_cast<int>(i);
-            float v[4][3];
-            const float hw = ws.width * 0.5f, hh = ws.height * 0.5f;
-            xf(ws.world, -hw, -hh, 0, v[0]); xf(ws.world, hw, -hh, 0, v[1]); xf(ws.world, hw, hh, 0, v[2]); xf(ws.world, -hw, hh, 0, v[3]);
-            for (int k = 0; k < 4; ++k) line(v[k], v[(k + 1) % 4], hov && !sel ? col(0xfff2b0) : col(0x5b8def, sel ? 1.0f : 0.8f), sel || hov ? th * 2 : th);
-        }
         // Gravity zones: the region, and arrows showing which way is down.
         for (size_t i = 0; i < w.gravity.size(); ++i) {
             if (!worldShown(kGravity, static_cast<int>(i))) continue;
@@ -5848,8 +5805,8 @@ struct Studio {
     }
 
     // The world item under a click: points and shape centres within a few pixels.
-    // The world item under a viewport pixel: a wall or surface box anywhere on it (a placed mesh on its triangles, a
-    // wall spot on its panel), a spawn, seat or hotspot within a finger's width of its marker (seats: the chair drawn),
+    // The world item under a viewport pixel: a wall or surface box anywhere on it (a placed mesh on its triangles),
+    // a spawn, seat or hotspot within a finger's width of its marker (seats: the chair drawn),
     // a gravity zone at its centre. Markers win over a box they're in front of. hit: the point grabbed (dragging keeps
     // it under the mouse).
     bool worldUnder(float mx, float my, const float* viewProj, int& kind, int& index, float hit[3]) {
@@ -5909,13 +5866,6 @@ struct Studio {
                 }
             }
             if (ok && t < bestT) { bestT = t; vk = kCollider; vi = static_cast<int>(i); }
-        }
-        for (size_t i = 0; i < w.wallSpots.size(); ++i) {               // the panel's rectangle
-            const WorldWallSpot& ws = w.wallSpots[i];
-            if (!worldShown(kWallSpot, static_cast<int>(i))) continue;
-            const float h[3] = {ws.width * 0.5f, ws.height * 0.5f, 0.05f};
-            float t;
-            if (boxHit(ws.world, h, t) && t < bestT) { bestT = t; vk = kWallSpot; vi = static_cast<int>(i); }
         }
         // markers: the nearest on screen within reach, unless a shape is well in front of it
         float bestPx = 20 * scale, depth = 0;
@@ -6679,8 +6629,6 @@ struct Studio {
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("A 2 x 2 m box: scale it into a floor, a step or a wall");
         if (ImGui::MenuItem("Invisible Wall", nullptr, false, on)) addInvisibleWall();
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("Stops the player, never drawn on the headset. Scale and turn it to fit;\nwhere it stands is no longer walkable.");
-        if (ImGui::MenuItem("Wall Spot", nullptr, false, on)) addWorld(kWallSpot);
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Where SteamVR's panels dock");
         ImGui::Separator();
         if (ImGui::BeginMenu("Gravity Zone", on)) {
             if (ImGui::MenuItem("Direction")) addGravity(WorldGravity::Direction);
@@ -7222,7 +7170,6 @@ struct Studio {
             {"Add Teleport Hotspot", "", on, [this] { addWorld(kHotspot); }},
             {"Add Surface", "", on, [this] { addWorld(kCollider); }},
             {"Add Invisible Wall", "", on, [this] { addInvisibleWall(); }},
-            {"Add Wall Spot", "", on, [this] { addWorld(kWallSpot); }},
             {"Add Gravity Zone", "", on, [this] { addGravity(WorldGravity::Direction); }},
             {"Import Models", "", on && !uploading, [this] { importModelDialog(); }},
             {"Add Vista", "", on && homePaths.size() == 1, [this] { addVistaDialog(); }},
@@ -8733,20 +8680,19 @@ struct SelfTest {
                           r.spawnAdded ? "added" : "kept");
             check(r.ok && r.walk.walkArea > 1 && a.walkSaved() && autos == r.objects + r.colliders && r.objects > 0 && r.colliders > 0, "Auto-generate bakes the walkable area and saves it with the home", d);
             check(a.surfaceMode(a.objects[obj]) == kSurfSolid && !a.autoMade(a.objects[obj]), "...and keeps the surface set by hand");
-            {   // the world items: walls (Wall-role boxes), objects' collision (meshes) and wall spots; no seats or hotspots
-                int walls = 0, objs = 0, seats = 0, spots = 0, hots = 0;
+            {   // the world items: walls (Wall-role boxes) and objects' collision (meshes); no seats or hotspots
+                int walls = 0, objs = 0, seats = 0, hots = 0;
                 for (const WorldCollider& c : a.scene->world.colliders) {
                     walls += c.name == "Auto wall" && c.role == WorldCollider::Wall && c.kind == WorldCollider::Box;
                     objs += (c.name.rfind("Auto surface", 0) == 0 && c.role == WorldCollider::Solid) || (c.name.rfind("Auto collider", 0) == 0 && c.role == WorldCollider::Object);
                 }
                 for (const WorldPoint& p : a.scene->world.seats) seats += p.name == "Auto seat";
-                for (const WorldWallSpot& p : a.scene->world.wallSpots) spots += p.name == "Auto wall spot";
                 for (const WorldPoint& p : a.scene->world.hotspots) hots += p.name == "Auto hotspot";
-                check(walls == 0 && r.walls == 0 && objs == r.objects + r.colliders && r.objects > 0 && spots == 0 && seats == 0 && hots == 0,
-                      "...and makes floor meshes surfaces and the other objects colliders (no walls, wall spots, seats or hotspots)",
-                      std::to_string(r.objects) + " surfaces, " + std::to_string(r.colliders) + " colliders, " + std::to_string(spots) + " wall spots, " + std::to_string(seats) +
+                check(walls == 0 && r.walls == 0 && objs == r.objects + r.colliders && r.objects > 0 && seats == 0 && hots == 0,
+                      "...and makes floor meshes surfaces and the other objects colliders (no walls, seats or hotspots)",
+                      std::to_string(r.objects) + " surfaces, " + std::to_string(r.colliders) + " colliders, " + std::to_string(seats) +
                           " seats, " + std::to_string(hots) + " hotspots");
-                genCounts = {walls, objs, spots, seats + hots};   // (objs: surfaces + colliders)
+                genCounts = {walls, objs, seats + hots};   // (objs: surfaces + colliders)
                 collidersAfter = a.scene->world.colliders.size();
             }
             firstGrid = a.scene->world.walkGrid;
@@ -8798,7 +8744,7 @@ struct SelfTest {
             for (const WorldPoint& p : a.scene->world.spawns) autoSpawns += p.name == "Auto spawn";
             const auto& r = a.autoReport;
             check(r.ok && a.scene->world.walkGrid == firstGrid && autoSpawns <= 1 && a.scene->world.colliders.size() == collidersAfter &&
-                  std::array<int, 4>{r.walls, r.objects + r.colliders, r.spots, r.seats + r.hotspots} == genCounts,
+                  std::array<int, 3>{r.walls, r.objects + r.colliders, r.seats + r.hotspots} == genCounts,
                   "re-running gives the same area and items (no duplicate spawns, surfaces, walls or objects)", std::to_string(a.scene->world.spawns.size()) + " spawns");
             if (a.autoUndoAt.x >= 0) click(a.autoUndoAt);   // the summary's Undo: just this run
             return 4;
@@ -9229,7 +9175,7 @@ struct SelfTest {
     float invisibleWallAt[3] = {};                     // the invisible-wall test's spot (on the spawn's floor)
     size_t libraryBefore = 0;                          // My Environments' count before the bundle is unpacked into it
     std::string titleWas, imageWas;
-    std::array<int, 4> genCounts{};                    // Auto-generate's walls, objects, wall spots, seats + hotspots (first run)
+    std::array<int, 3> genCounts{};                    // Auto-generate's walls, objects, seats + hotspots (first run)
     size_t collidersAfter = 0;
     size_t linkedBefore = 0;                           // mesh-linked surfaces before Make Walkable Floors (the home links its own)          // the background-sound test's files (removed when it ends)
 

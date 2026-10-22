@@ -164,8 +164,8 @@ int main(int argc, char** argv) {
             std::printf("   lost cells: %d\n", lost);
             std::printf("   re-baked with the walls and objects: %.1f m2 (was %.1f)\n", r2.walkArea, r.walkArea);
         }
-        std::printf("   generated in %.1f ms: %zu walls, %zu objects, %zu seats, %zu wall spots, %zu hotspots\n", std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(),
-                    gr.walls.size(), gr.objects.size(), gr.seats.size(), gr.spots.size(), gr.hotspots.size());
+        std::printf("   generated in %.1f ms: %zu walls, %zu objects, %zu seats, %zu hotspots\n", std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(),
+                    gr.walls.size(), gr.objects.size(), gr.seats.size(), gr.hotspots.size());
         auto line = [&](float x0, float z0, float x1, float z1, int R, int G, int B) {
             const int n = static_cast<int>(std::hypot(x1 - x0, z1 - z0) / g->p.cell * px) + 1;
             for (int i = 0; i <= n; ++i) {
@@ -192,12 +192,6 @@ int main(int argc, char** argv) {
                 const float xa = v[0], xb = v[3], za = v[2], zb = v[14];
                 line(xa, za, xb, za, 40, 160, 255); line(xb, za, xb, zb, 40, 160, 255); line(xb, zb, xa, zb, 40, 160, 255); line(xa, zb, xa, za, 40, 160, 255);
             }
-        for (const WorldWallSpot& w : gr.spots) {
-            const float hx = w.width * 0.5f, ux = w.world[0], uz = w.world[2];
-            line(w.world[12] - ux * hx, w.world[14] - uz * hx, w.world[12] + ux * hx, w.world[14] + uz * hx, 255, 230, 0);
-            line(w.world[12], w.world[14], w.world[12] + w.world[8] * 0.6f, w.world[14] + w.world[10] * 0.6f, 255, 230, 0);
-            std::printf("   wall spot %.1f x %.1f m at (%.2f %.2f %.2f)\n", w.width, w.height, w.world[12], w.world[13], w.world[14]);
-        }
         for (const WorldPoint& p : gr.seats) {
             const float fx = -std::sin(p.yaw), fz = -std::cos(p.yaw);
             line(p.pos[0] - 0.15f, p.pos[2], p.pos[0] + 0.15f, p.pos[2], 255, 0, 255);

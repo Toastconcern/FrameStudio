@@ -77,7 +77,7 @@ inline bool loadHslScene(const std::string& apkPath, HslScene& scene, std::strin
 
 // The world to walk in: the home's own (Meta's converted, or a .fenv's) when it has floors or walls; else floors and
 // walls taken from the drawn geometry (opaque, not the sky, not distant scenery) — Clay homes and homes like Theater
-// ship no collision at all. Spawns, seats and wall spots are kept either way.
+// ship no collision at all. Spawns and seats are kept either way.
 // The world carries its walkable area (walkGridCache): the one Frame Studio baked (world.json), else one baked here from
 // the drawn geometry plus the colliders (bakeWalkGrid). Gravity homes also get the geometry's floors and walls as
 // colliders while nothing blocks (the gravity walker reads colliders).

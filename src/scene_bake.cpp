@@ -177,8 +177,6 @@ void writeWorld(Writer& w, const HomeWorld& wd, const std::vector<MeshData>& mes
         w.str(c.mesh);
     }
     w.vec(wd.walkPositions); w.vec(wd.walkIndices);
-    w.u(static_cast<u32>(wd.wallSpots.size()));
-    for (const WorldWallSpot& ws : wd.wallSpots) { w.str(ws.name); w.fa(ws.world, 16); w.f(ws.width); w.f(ws.height); }
     w.u(static_cast<u32>(wd.gravity.size()));
     for (const WorldGravity& g : wd.gravity) { w.str(g.name); w.pod(g.kind); w.fa(g.world, 16); w.fa(g.half, 3); w.f(g.radius); w.pod(g.priority); }
     w.f(wd.fallLimit);
@@ -202,8 +200,8 @@ void readWorld(Reader& r, HomeWorld& wd, u32 version, std::vector<std::pair<size
         if (version >= 4) c.mesh = r.str();
     }
     wd.walkPositions = r.vec<float>(); wd.walkIndices = r.vec<u32>();
-    wd.wallSpots.resize(r.count(76));
-    for (WorldWallSpot& ws : wd.wallSpots) { if (r.bad) break; ws.name = r.str(); r.fa(ws.world, 16); ws.width = r.f(); ws.height = r.f(); }
+    if (version < 14)                    // wall spots, now removed: read past them
+        for (u32 n = r.count(76); n-- && !r.bad;) { float m[16]; r.str(); r.fa(m, 16); r.f(); r.f(); }
     if (version >= 6) {
         wd.gravity.resize(r.count(92));
         for (WorldGravity& g : wd.gravity) { if (r.bad) break; g.name = r.str(); g.kind = r.pod<int>(); r.fa(g.world, 16); r.fa(g.half, 3); g.radius = r.f(); g.priority = r.pod<int>(); }

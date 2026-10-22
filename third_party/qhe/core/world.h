@@ -1,7 +1,7 @@
 #pragma once
 // A home's world layer: where the player stands and can go — the parts of Meta's environment system that are not
 // drawn. Converted from Meta's components (SpawnPoint, AvatarSitting, LocomotionHotspot, Collider Box / Sphere /
-// Capsule / Mesh / ConvexMesh, WallPlacement) into one plain format that a .fenv stores as world.json, Frame Studio
+// Capsule / Mesh / ConvexMesh) into one plain format that a .fenv stores as world.json, Frame Studio
 // edits and Frame Home uses for the floor, the start position, walking, teleporting and sitting.
 // Everything is in world space, metres, +Y up.
 #include "core/tinyjson.h"
@@ -52,13 +52,6 @@ struct WorldCollider {
     bool trigger() const { return role == Trigger; }
 };
 
-struct WorldWallSpot {                  // where a panel or window can hang (WallPlacementComponent)
-    std::string name;
-    float world[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
-    float width = 1, height = 1;
-    bool hidden = false;                // Frame Studio's view only
-};
-
 // Which way is down. Without zones it's -Y everywhere (Meta's homes); a zone changes it inside its region:
 //   Direction: down is the zone frame's -Y — a room where a wall is the floor, a ceiling walk
 //   Planet:    down points at the zone's centre, within `radius` of it — walk all the way round a sphere
@@ -84,13 +77,12 @@ struct HomeWorld {
     std::vector<WorldCollider> colliders;
     std::vector<float> walkPositions;   // legacy walkable triangles (v1 files): read as one walkable-floor area
     std::vector<u32> walkIndices;
-    std::vector<WorldWallSpot> wallSpots;
     std::vector<WorldGravity> gravity;  // empty: down is -Y everywhere
     float fallLimit = 30;               // falling further than this (metres) puts you back at the spawn
     std::string origin;                 // "meta" (converted), "studio" (edited) or "" (none)
     std::string walkGrid;               // the walkable area Frame Studio baked (walkgrid.h encoding); "": Frame Home bakes one at load
     std::shared_ptr<const WalkGrid> walkGridCache;   // walkGrid decoded, or one just built (never saved)
-    bool empty() const { return spawns.empty() && seats.empty() && hotspots.empty() && colliders.empty() && walkIndices.empty() && wallSpots.empty() && gravity.empty() && walkGrid.empty(); }
+    bool empty() const { return spawns.empty() && seats.empty() && hotspots.empty() && colliders.empty() && walkIndices.empty() && gravity.empty() && walkGrid.empty(); }
 };
 
 namespace world_detail {
@@ -167,15 +159,7 @@ inline std::string worldToJson(const HomeWorld& w) {
     o += "],\n\"walkable\":{\"positions\":"; arr(o, w.walkPositions.data(), w.walkPositions.size());
     o += ",\"indices\":[";
     for (size_t k = 0; k < w.walkIndices.size(); ++k) { if (k) o += ','; o += std::to_string(w.walkIndices[k]); }
-    o += "]},\n\"wallSpots\":[";
-    for (size_t i = 0; i < w.wallSpots.size(); ++i) {
-        const WorldWallSpot& s = w.wallSpots[i];
-        if (i) o += ',';
-        o += "{\"name\":" + q(s.name) + ",\"world\":"; arr(o, s.world, 16); o += ",\"width\":"; num(o, s.width); o += ",\"height\":"; num(o, s.height);
-        if (s.hidden) o += ",\"hidden\":true";
-        o += '}';
-    }
-    o += "],\n\"gravity\":[";
+    o += "]},\n\"gravity\":[";
     for (size_t i = 0; i < w.gravity.size(); ++i) {
         const WorldGravity& g = w.gravity[i];
         if (i) o += ',';
@@ -219,14 +203,6 @@ inline bool worldFromJson(const std::string& json, HomeWorld& w) {
         w.walkPositions.resize(wk["positions"].size());
         readF(wk["positions"], w.walkPositions.data(), w.walkPositions.size());
         for (size_t k = 0; k < wk["indices"].size(); ++k) w.walkIndices.push_back(static_cast<u32>(wk["indices"][k].asFloat()));
-        for (size_t i = 0; i < d["wallSpots"].size(); ++i) {
-            const auto& v = d["wallSpots"][i];
-            WorldWallSpot s;
-            s.name = v["name"].asString(); readF(v["world"], s.world, 16);
-            s.width = static_cast<float>(v["width"].asFloat()); s.height = static_cast<float>(v["height"].asFloat());
-            s.hidden = v["hidden"].boolVal;
-            w.wallSpots.push_back(s);
-        }
         for (size_t i = 0; i < d["gravity"].size(); ++i) {
             const auto& v = d["gravity"][i];
             WorldGravity g;

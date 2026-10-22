@@ -157,7 +157,7 @@ Frame Home restarts.
 | Item | What it does |
 |---|---|
 | View | Normal, Wireframe (every triangle edge), Meshes (each in its own colour), GPU cost (green is cheap, red is costly), Overdraw (bright where surfaces pile up) |
-| World layer | Shows where you can walk (green), surfaces and colliders, spawns, seats, wall spots and gravity zones |
+| World layer | Shows where you can walk (green), surfaces and colliders, spawns, seats and gravity zones |
 | See-through surfaces | Leave out glass, water, glow and fog, to see whether they're what's slow |
 | Cut-out surfaces | Leave out leaves, grass and fences |
 | Sky | Leave out the sky |

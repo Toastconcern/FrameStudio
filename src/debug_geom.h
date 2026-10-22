@@ -1,6 +1,6 @@
 #pragma once
 // The world layer drawn over the home in the headset (the Debug page's "World layer"): the walkable area as Frame
-// Home walks it, the surfaces and colliders, spawns, seats, hotspots, wall spots and gravity zones, in the colours
+// Home walks it, the surfaces and colliders, spawns, seats, hotspots and gravity zones, in the colours
 // Frame Studio uses for them. Built once per home as guide geometry (guide_geom.h) and appended to the guide each
 // frame. Lines are thin crossed ribbons, so they read from any side without being rebuilt as you move.
 #include "guide_geom.h"
@@ -58,7 +58,7 @@ inline void marker(std::vector<GuideVertex>& o, const WorldPoint& p, float r, fl
 constexpr C kWalk{0.15f, 0.85f, 0.35f, 0.32f}, kWalkEdge{0.25f, 1.0f, 0.45f, 0.9f}, kBridged{0.95f, 0.75f, 0.2f, 0.25f};
 constexpr C kSolid{0.95f, 0.95f, 0.95f, 0.55f}, kObject{1.0f, 0.55f, 0.25f, 0.7f}, kTrigger{0.6f, 0.6f, 1.0f, 0.45f}, kWalkable{0.3f, 1.0f, 0.5f, 0.7f};
 constexpr C kSpawn{0.3f, 0.75f, 1.0f, 0.95f}, kSeat{1.0f, 0.8f, 0.25f, 0.95f}, kHotspot{0.85f, 0.45f, 1.0f, 0.95f};
-constexpr C kSpot{0.4f, 0.9f, 1.0f, 0.8f}, kGravity{1.0f, 0.35f, 0.6f, 0.6f};
+constexpr C kGravity{1.0f, 0.35f, 0.6f, 0.6f};
 
 // Everything, in world space. Mesh surfaces are drawn as their boundary-free wire (every edge) only up to a budget:
 // a mesh collider can be a whole room's geometry.
@@ -164,10 +164,6 @@ inline void build(const HomeWorld& w, const WalkGrid* g, std::vector<GuideVertex
         const P at{p.pos[0], p.pos[1], p.pos[2]};
         const P ex{p.pos[0] + p.exit[0], p.pos[1] + p.exit[1] + 0.02f, p.pos[2] + p.exit[2]};
         if (p.exit[0] != 0 || p.exit[2] != 0) { line(o, at, ex, guide::alpha(kSeat, 0.5f)); circle(o, ex, 0.12f, guide::alpha(kSeat, 0.7f)); }
-    }
-    for (const WorldWallSpot& s : w.wallSpots) {
-        const float h[3] = {s.width * 0.5f, s.height * 0.5f, 0.01f};
-        box(o, s.world, h, kSpot);
     }
     for (const WorldGravity& z : w.gravity) {
         if (z.kind == WorldGravity::Planet) circle(o, xf(z.world, {0, 0, 0}), z.radius, kGravity, 64);

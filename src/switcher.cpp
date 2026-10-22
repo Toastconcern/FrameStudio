@@ -902,7 +902,7 @@ struct Panel {
         "Hold still stops the environment's moving parts; animated environments then cost less.",
         "With the menu open the environment is only its backdrop. Half rate leaves the GPU to the menu and its apps.",
         "Wireframe: every triangle edge. Meshes: each in its own colour. GPU cost: green is cheap, red is costly. Overdraw: bright where surfaces pile up.",
-        "Where you can walk (green), surfaces and colliders, spawns, seats, wall spots and gravity zones.",
+        "Where you can walk (green), surfaces and colliders, spawns, seats and gravity zones.",
         "Glass, water, glow and fog. Leave them out to see whether they're what's slow.",
         "Leaves, grass and fences. Leave them out to see whether they're what's slow.",
         "The sky around the environment.",

@@ -24,7 +24,7 @@ There are two kinds:
 | `fenv.json` | every `.fenv` | The manifest: name, where the home came from (package and version of each `.apk`), and which other members are there. It also holds the environment's own settings. |
 | `scene.bin.lz` | baked | The baked scene, packed with LZMA (much smaller than ZIP's own packing for textures). It is unpacked once, into a cache, then loaded from there. |
 | `apks/...` | wrapped | The original Meta home files (a room, and maybe its vista) |
-| `world.json` | wrapped | The world layer: spawn points, seats, teleport hotspots, walkable surfaces, wall spots, gravity zones. A baked scene carries this inside `scene.bin`. |
+| `world.json` | wrapped | The world layer: spawn points, seats, teleport hotspots, walkable surfaces, gravity zones. A baked scene carries this inside `scene.bin`. |
 | `edits.json` | when you edited | What you changed in Studio: moved and deleted objects, the added sound and how loud the home's own sound plays |
 | a sound file | when you added one | The sound you added in Studio (`.ogg`, `.opus`, `.wav`, `.mp3`, `.flac`), named in `edits.json` |
 | `thumb.png` | usually | The picture the Environments panel shows |

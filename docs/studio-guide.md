@@ -114,7 +114,6 @@ edges, grey are floors you can't reach. **W** shows or hides it.
 | **Seat** | a place to sit: point at it and pull the trigger; its "stand up here" ring is where you get up |
 | **Teleport Hotspot** | a spot the teleport arc snaps to |
 | **Surface** | a box you can scale into a floor, a step or a wall |
-| **Wall Spot** | where SteamVR's panels dock |
 | **Invisible Wall** | stops you; never drawn on the headset. Scale and turn it to fit; where it stands is no longer walkable |
 | **Gravity Zone** | inside it, "down" is the zone's own: a direction, or any surface you stand on |
 

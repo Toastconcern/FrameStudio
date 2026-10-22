@@ -1,6 +1,6 @@
 // Renders a home headlessly (lavapipe: VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json) with its walkable area
 // and World > Auto-generate's items drawn over it as Frame Studio's guide pass does:
-//   walkable area green, walls red boxes, seats magenta posts + facing bar, wall spots yellow panels, hotspots cyan posts
+//   walkable area green, walls red boxes, seats magenta posts + facing bar, hotspots cyan posts
 // worldrender <apk[+vista]> <out-prefix> [size] [x,y,z,yaw,pitch ...]   (no views: four from above the area's corners)
 #include "hsl_renderer.h"
 #include "hsl_scene.h"
@@ -49,7 +49,7 @@ int main(int argc, char** argv) {
     w.walkGridCache = bakeWalkGrid(scene, w, WalkParams{});
     const WalkGrid& g = *w.walkGridCache;
     const GenResult gen = generateWorldItems(g, w, drawnWalkSources(scene, w, nullptr, nullptr, false));
-    std::printf("%zu walls, %zu seats, %zu wall spots, %zu hotspots\n", gen.walls.size(), gen.seats.size(), gen.spots.size(), gen.hotspots.size());
+    std::printf("%zu walls, %zu seats, %zu hotspots\n", gen.walls.size(), gen.seats.size(), gen.hotspots.size());
 
     std::vector<GuideVertex> v;
     auto vert = [&](const float* p, const float* c) { GuideVertex q; std::memcpy(q.pos, p, 12); std::memcpy(q.rgba, c, 16); v.push_back(q); };
@@ -63,7 +63,7 @@ int main(int argc, char** argv) {
         static const int f[12][3] = {{0,1,3},{0,3,2},{4,6,7},{4,7,5},{0,4,5},{0,5,1},{2,3,7},{2,7,6},{0,2,6},{0,6,4},{1,5,7},{1,7,3}};
         for (auto& t : f) tri(p[t[0]], p[t[1]], p[t[2]], col);
     };
-    const float green[4] = {0.1f, 0.85f, 0.3f, 0.35f}, red[4] = {1, 0.15f, 0.1f, 0.55f}, mag[4] = {1, 0, 1, 0.9f}, yel[4] = {1, 0.9f, 0, 0.6f}, cyan[4] = {0, 0.9f, 1, 0.9f};
+    const float green[4] = {0.1f, 0.85f, 0.3f, 0.35f}, red[4] = {1, 0.15f, 0.1f, 0.55f}, mag[4] = {1, 0, 1, 0.9f}, cyan[4] = {0, 0.9f, 1, 0.9f};
     g.outline([&](const float* a, const float* b, const float* c, bool) {
         const float A[3] = {a[0], a[1] + 0.03f, a[2]}, B[3] = {b[0], b[1] + 0.03f, b[2]}, C[3] = {c[0], c[1] + 0.03f, c[2]};
         tri(A, B, C, green);
@@ -76,7 +76,6 @@ int main(int argc, char** argv) {
         const float m2[16] = {fz,0,-fx,0, 0,1,0,0, fx,0,fz,0, p.pos[0] + fx * 0.2f, p.pos[1] + 0.02f, p.pos[2] + fz * 0.2f, 1}, h2[3] = {0.03f, 0.02f, 0.2f};
         box(m2, h2, mag);
     }
-    for (const WorldWallSpot& s : gen.spots) { const float h[3] = {s.width * 0.5f, s.height * 0.5f, 0.02f}; box(s.world, h, yel); }
     for (const WorldPoint& p : gen.hotspots) {
         const float m[16] = {1,0,0,0, 0,1,0,0, 0,0,1,0, p.pos[0], p.pos[1] + 0.75f, p.pos[2], 1}, h[3] = {0.05f, 0.75f, 0.05f};
         box(m, h, cyan);
@@ -122,11 +121,6 @@ int main(int argc, char** argv) {
             const WorldPoint& p = gen.seats[k];
             const float fx = -std::sin(p.yaw), fz = -std::cos(p.yaw);
             cams.push_back({p.pos[0] + fx * 1.6f, p.pos[1] + 1.1f, p.pos[2] + fz * 1.6f, p.yaw * 57.2958f + 180, -28});
-        }
-    if (mode == "spots")                                               // each wall spot from 2.5 m back
-        for (const WorldWallSpot& w : gen.spots) {
-            const float fx = w.world[8], fz = w.world[10];
-            cams.push_back({w.world[12] + fx * 2.5f, w.world[13], w.world[14] + fz * 2.5f, std::atan2(fx, fz) * 57.2958f, 0});
         }
     if (cams.empty() && mode.empty()) {   // an overview from high over the area, then eye-level views from spots across it, both ways
         float lo[2] = {1e9f, 1e9f}, hi[2] = {-1e9f, -1e9f}, y = 0; int n = 0;

@@ -224,7 +224,7 @@ public:
     // tag "local" = the player start (cyan), "remote" = other spawns (yellow).
     struct SpawnPt { std::string name, tag; float pos[3]={0,0,0}, euler[3]={0,0,0}; int meshIdx=-1; };
     std::vector<SpawnPt> spawnPts;
-    HomeWorld world;                   // spawns, seats, hotspots, colliders, wall spots (world space), from every HSTF
+    HomeWorld world;                   // spawns, seats, hotspots, colliders (world space), from every HSTF
 
     // Whether an HSTF entity draws anything (a MeshPlatformComponent): its colliders are then that thing's.
     static bool entityDrawn(const tinyjson::Value& ent) {
@@ -614,11 +614,6 @@ public:
                             world.seats.push_back(p);
                         } else if (cls.find("LocomotionHotspotComponent") != std::string::npos) {
                             WorldPoint p; point(p); world.hotspots.push_back(p);
-                        } else if (cls.find("WallPlacementComponent") != std::string::npos) {
-                            WorldWallSpot ws; ws.name = name; std::memcpy(ws.world, wm, 64);
-                            ws.width = d.has("propMaxWidth") ? static_cast<float>(d["propMaxWidth"].asFloat()) : 1.0f;
-                            ws.height = d.has("propMaxHeight") ? static_cast<float>(d["propMaxHeight"].asFloat()) : 1.0f;
-                            world.wallSpots.push_back(ws);
                         } else if (cls.find("Collider") != std::string::npos && cls.find("PlatformComponent") != std::string::npos) {
                             WorldCollider col; col.name = name; std::memcpy(col.world, wm, 64); col.role = trigger || hotspot || seat ? WorldCollider::Trigger : WorldCollider::Solid;
                             if (cls.find("ColliderBox") != std::string::npos) {
@@ -813,8 +808,8 @@ public:
             float identMat[16] = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
             loadHstfRec(*spacePath, 6, Transform{}, identMat, HstfDeltas{}, std::string());
             world.origin = world.empty() ? "" : "meta";
-            log("  World: %zu spawns, %zu seats, %zu hotspots, %zu colliders, %zu wall spots", world.spawns.size(), world.seats.size(),
-                world.hotspots.size(), world.colliders.size(), world.wallSpots.size());
+            log("  World: %zu spawns, %zu seats, %zu hotspots, %zu colliders", world.spawns.size(), world.seats.size(),
+                world.hotspots.size(), world.colliders.size());
         }
         // DEDUP empty-transform template duplicates. A mesh defined in a level .usda with NO transform lands
         // at the ORIGIN (it's the PROTOTYPE); a sibling entity of the SAME NAME placed by an .hstf carries the

@@ -11,7 +11,7 @@
 #include <string>
 #include <vector>
 
-constexpr u32 kSceneBakeVersion = 13;  // 2: world; 3: HDR maps as ASTC, binary world; 4: roles; 5: mesh refs; 6: gravity; 7: mesh paths; 8: ambience name; 9: compressed 8-bit lightmaps; 10: reflection cube as ASTC; 11: walkable area (and simplified colliders); 12: prepared and specialized shaders; 13: Clay / glTF CPU animation
+constexpr u32 kSceneBakeVersion = 14;  // 2: world; 3: HDR maps as ASTC, binary world; 4: roles; 5: mesh refs; 6: gravity; 7: mesh paths; 8: ambience name; 9: compressed 8-bit lightmaps; 10: reflection cube as ASTC; 11: walkable area (and simplified colliders); 12: prepared and specialized shaders; 13: Clay / glTF CPU animation; 14: wall spots removed
 
 struct VisibilityResult;
 struct ObjectEdit;

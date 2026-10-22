@@ -123,7 +123,7 @@ struct PerfSettings {
 // why a home looks or runs wrong, not for keeping: Frame Home clears the file each time it starts.
 struct DebugSettings {
     int view = 0;                       // HslRenderer::DebugView: 0 normal, 1 wireframe, 2 meshes, 3 GPU cost, 4 overdraw
-    int world = 0;                      // the world layer drawn over the home: walkable area, surfaces, spawns, seats, wall spots
+    int world = 0;                      // the world layer drawn over the home: walkable area, surfaces, spawns, seats
     int hideSeeThrough = 0, hideCutout = 0, hideSky = 0;   // leave those parts of the home out
     int shot = 0;                       // asks for a picture of what's shown (logs/frame-<time>.png): the time it was asked
                                         // (Unix seconds); one from before Frame Home started is old

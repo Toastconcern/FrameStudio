@@ -16,7 +16,6 @@
 #include "hsl_scene.h"
 #include "scene_bake.h"
 #include "locomotion.h"
-#include "panel_dock.h"
 #include "panorama.h"
 #include "core/audio.h"
 #include "env_export.h"
@@ -1087,8 +1086,6 @@ int runVr(const std::vector<std::string>& apks, bool system = false) {
     loco.setOptions(perf.walk, perf.teleport, perf.turn, perf.snapAngle, perf.moveSpeed);
     loco.setRingFallback(!r.guideAvailable());       // Frame Home draws the arc itself; the overlay ring only if it can't
     std::vector<GuideVertex> guideVerts;
-    PanelDock dock;                                  // SteamVR panels docking on the home's wall spots
-
     // Homes are parsed (and their textures decoded) on a worker thread and uploaded between frames,
     // so the headset keeps getting frames while a new home loads.
     const bool follow = apks.empty();                // environment mode: follow ~/frame-home/current
@@ -1415,7 +1412,6 @@ int runVr(const std::vector<std::string>& apks, bool system = false) {
                         LOG("report: %zu things to look at (logs/report.txt), first: %s", pendingReport.problems.size(), pendingReport.problems.front().what.c_str());
                     pendingReport = HomeReport();
                 }
-                dock.setWorld(scene->world);
                 LOG("showing %s (%zu spawns, %zu seats, %zu colliders)", shown.front().c_str(), scene->world.spawns.size(),
                     scene->world.seats.size(), scene->world.colliders.size());
             } else {
@@ -1691,7 +1687,6 @@ int runVr(const std::vector<std::string>& apks, bool system = false) {
         lastFrame = frameNow;
         Mat4 rig;
         loco.rig(rig.m);
-        dock.update(rig.m);
         const Mat4 headWorld = mul(rig, head);
         if (system && widenFixed <= 0) {
             // head turn rate (rad/s) from the rotation since the last frame: angle of R_prev^T * R
@@ -1890,7 +1885,6 @@ int runVr(const std::vector<std::string>& apks, bool system = false) {
     if (worker.joinable()) worker.join();
     if (soundJob.joinable()) soundJob.join();
     publisher.finish();
-    dock.stop();
     // SteamVR first: its client holds our Vulkan device for the frames it composited, and cleaning up after a
     // device we'd already destroyed crashed every exit (game launches, restarts).
     vr::VR_Shutdown();

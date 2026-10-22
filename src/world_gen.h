@@ -7,9 +7,8 @@
 // Off unless GenParams asks (guesses, and a wrong one is worse than none):
 //   walls      — Wall boxes on flat upright faces that are architecture (named a wall, or 2.4 m+ / up to the ceiling),
 //                and along drops inside a tall structure
-//   wall spots — the middle of a tall, solid stretch of wall with room to stand back from it (SteamVR panels)
 //   seats      — a top 35-62 cm over the floor with a backrest behind and floor in front, or a stool
-//   hotspots   — in front of wall spots, lookouts, the middles of open spaces
+//   hotspots   — lookouts, the middles of open spaces
 // Everything made is named "Auto …" (Frame Studio replaces them on a re-run).
 #include "walkgrid.h"
 
@@ -25,19 +24,18 @@ struct GenParams {
     float wallMinHeight = 0.9f;         // a wall is at least this tall over the floor in front of it (a railing)
     float wallMinRun = 0.6f;            // shortest wall (m)
     float seatLo = 0.35f, seatHi = 0.62f;   // a seat's top over the floor in front of it (m): low lounge sofas to thick cushions
-    int maxSpots = 5, maxHotspots = 12;
+    int maxHotspots = 12;
     // Seats and hotspots are guesses about how people use a place, and a wrong one (a seat on a planter's rim) is worse
-    // than none: off unless asked for. Auto-generate makes the floor, the walls, the objects' collision and wall spots.
+    // than none: off unless asked for. Auto-generate makes the floor, the walls and the objects' collision.
     bool seats = false, hotspots = false;
-    // Walls (boxes on faces judged to be walls) and wall spots are guesses too: off. Every mesh gets its own collision
+    // Walls (boxes on faces judged to be walls) are guesses too: off. Every mesh gets its own collision
     // instead (GenResult::objects), whatever it is.
-    bool walls = false, spots = false;
+    bool walls = false;
 };
 
 struct GenResult {
     std::vector<WorldCollider> walls, objects;
     std::vector<WorldPoint> seats, hotspots;
-    std::vector<WorldWallSpot> spots;
 };
 
 namespace world_gen_detail {
@@ -618,63 +616,6 @@ inline GenResult generateWorldItems(const WalkGrid& g, const HomeWorld& have, co
         for (WorldCollider& c : encl) out.walls.push_back(std::move(c));
     }
 
-    // ── Wall spots: the solid middle of a tall wall, with room to stand back from it ──
-    if (P.spots) {
-        const float sx = have.spawns.empty() ? 0.0f : have.spawns[0].pos[0], sz = have.spawns.empty() ? 0.0f : have.spawns[0].pos[2];
-        struct Cand { float score, x, y, z, ux, uz, fx, fz, width, height; };
-        std::vector<Cand> cands;
-        for (const Run& rn : runs) {
-            const Wall& w = *rn.w;
-            const float L = (rn.i1 - rn.i0 + 1) * kCell;
-            if (w.glass || w.hint == kHintBlocker || L < 1.6f || rn.top - rn.floor < 2.2f) continue;   // (a blocker wall: Meta's, not one to hang on)
-            const float width = std::min(L - 0.4f, 2.4f), height = std::clamp(rn.top - rn.floor - 1.0f, 0.9f, 1.4f);
-            const float bottom = rn.floor + 0.85f;
-            const int wc = static_cast<int>(std::ceil(width / kCell));
-            const float fx = w.nx * rn.side, fz = w.nz * rn.side, ux = -w.nz, uz = w.nx;
-            // slide along the wall from its middle until the panel sits on solid wall (no window, door or gap)
-            const int mid = (rn.i0 + rn.i1) / 2;
-            bool placed = false;
-            for (int off = 0; off <= (rn.i1 - rn.i0 - wc) / 2 + 1 && !placed; off += 2)
-                for (int sgn : {1, -1}) {
-                    const int c0 = mid + sgn * off - wc / 2, c1 = c0 + wc - 1;
-                    if (c0 < rn.i0 || c1 > rn.i1 || w.fill(c0, c1, bottom - 0.1f, bottom + height + 0.1f) < 0.97f) continue;
-                    const float s = w.s0 + (c0 + c1 + 1) * 0.5f * kCell, px = w.nx * w.d + ux * s, pz = w.nz * w.d + uz * s;
-                    // clear air in front at panel height (2.5 m straight out, 1.5 m across all of it), floor 2 m back
-                    bool clear = true;
-                    for (float t = 0.3f; t <= 2.5f && clear; t += 0.2f)
-                        for (float lat : {-width * 0.5f, -width * 0.25f, 0.0f, width * 0.25f, width * 0.5f})
-                            if ((lat == 0 || t <= 1.5f) && solidBetween(g, px + fx * t + ux * lat, pz + fz * t + uz * lat, rn.floor + 0.7f, rn.floor + 2.2f)) { clear = false; break; }
-                    if (!clear || !areaFloor(g, px + fx * 2.0f, pz + fz * 2.0f, rn.floor, 0.3f)) continue;
-                    // a wall round a space, not a slab standing between two paths (floor behind it too)
-                    bool divider = false;
-                    for (float t : {0.3f, 0.5f, 0.7f}) divider |= areaFloor(g, px - fx * t, pz - fz * t, rn.floor, 0.5f) != nullptr;
-                    if (divider) continue;
-                    const float toSpawn = std::hypot(sx - px, sz - pz), facing = ((sx - px) * fx + (sz - pz) * fz) / std::max(0.1f, toSpawn);
-                    cands.push_back({width + (facing > 0.3f && toSpawn < 9 ? 2.0f : 0.0f), px + fx * 0.02f, bottom + height * 0.5f, pz + fz * 0.02f, ux, uz, fx, fz, width, height});
-                    placed = true;
-                    break;
-                }
-        }
-        std::sort(cands.begin(), cands.end(), [](const Cand& a, const Cand& b) { return a.score > b.score; });
-        for (const Cand& c : cands) {
-            if (static_cast<int>(out.spots.size()) >= P.maxSpots) break;
-            bool close = false;
-            for (const WorldWallSpot& w : have.wallSpots) close |= std::hypot(w.world[12] - c.x, w.world[14] - c.z) < 1.5f && std::fabs(w.world[13] - c.y) < 1.5f;
-            for (const WorldWallSpot& w : out.spots) close |= std::hypot(w.world[12] - c.x, w.world[14] - c.z) < 3.0f;
-            if (close) continue;
-            // the frame: X along the wall, Y up, Z (= X x Y) out into the room
-            float ux = c.ux, uz = c.uz;
-            if (-uz * c.fx + ux * c.fz < 0) { ux = -ux; uz = -uz; }
-            WorldWallSpot w;
-            w.name = "Auto wall spot";
-            const float m[16] = {ux, 0, uz, 0, 0, 1, 0, 0, -uz, 0, ux, 0, c.x, c.y, c.z, 1};
-            std::copy_n(m, 16, w.world);
-            w.width = c.width;
-            w.height = c.height;
-            out.spots.push_back(w);
-        }
-    }
-
     // ── Seats: where on a seat-high top you'd sit — a backrest behind, floor in front — or a free-standing stool ──
     if (P.seats) {
         const float cs = g.p.cell;
@@ -994,23 +935,7 @@ inline GenResult generateWorldItems(const WalkGrid& g, const HomeWorld& have, co
             out.hotspots.push_back(p);
             taken.push_back({x, y, z});
         };
-        // 1. in front of each wall spot, looking at it
-        std::vector<const WorldWallSpot*> spots;
-        for (const WorldWallSpot& w : have.wallSpots) spots.push_back(&w);
-        for (const WorldWallSpot& w : out.spots) spots.push_back(&w);
-        for (const WorldWallSpot* w : spots)
-            for (float sgn : {1.0f, -1.0f}) {
-                const float fx = w->world[8] * sgn, fz = w->world[10] * sgn, fl = std::hypot(fx, fz);
-                if (fl < 0.5f) continue;
-                float x = w->world[12] + fx / fl * 2.2f, z = w->world[14] + fz / fl * 2.2f;
-                const WalkSpan* f = areaFloor(g, x, z, w->world[13] - 1.5f, 1.2f);
-                if (!f) continue;
-                const float y = f->hi;
-                if (!g.roomAt(x, y, z, 0.5f) || !free(x, y, z, 2.0f)) continue;
-                add(x, y, z, -fx / fl, -fz / fl);
-                break;
-            }
-        // 2. lookouts: where the area's edge is a drop with open air beyond it (a terrace's rail, a balcony)
+        // 1. lookouts: where the area's edge is a drop with open air beyond it (a terrace's rail, a balcony)
         {
             struct Edge { float x, y, z, ox, oz; };
             std::vector<Edge> view;
@@ -1041,7 +966,7 @@ inline GenResult generateWorldItems(const WalkGrid& g, const HomeWorld& have, co
                 ++lookouts;
             }
         }
-        // 3. the middles of open spaces (1.5 m or more from any edge, 6 m apart, five at most), facing the longest view
+        // 2. the middles of open spaces (1.5 m or more from any edge, 6 m apart, five at most), facing the longest view
         {
             std::vector<std::array<float, 4>> cand;
             for (int z = 0; z < g.nz; z += 2)

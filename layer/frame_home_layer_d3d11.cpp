@@ -21,6 +21,7 @@
 #endif
 #include <windows.h>
 #include <d3d11.h>
+#include <d3d11_1.h>
 #include <dxgi1_2.h>
 
 #include <atomic>
@@ -298,7 +299,7 @@ bool ensureResources() {
     return true;
 }
 
-void fillCb(int slot) {
+void fillCb(ID3D11DeviceContext* ctx, int slot) {   // mapped on the recording context (the environment's deferred one)
     if (!g_homeCb) return;
     const envshare::Slot& s = g_state->slot[slot];
     HomeCb cb = {};
@@ -309,15 +310,22 @@ void fillCb(int slot) {
     cb.params[0] = g_state->fade.load() / 1000.0f;
     cb.params[1] = g_state->show.load() ? 1.0f : 0.0f;
     D3D11_MAPPED_SUBRESOURCE m;
-    if (SUCCEEDED(g_context->Map(g_homeCb, 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) {
+    if (SUCCEEDED(ctx->Map(g_homeCb, 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) {
         std::memcpy(m.pData, &cb, sizeof cb);
-        g_context->Unmap(g_homeCb, 0);
+        ctx->Unmap(g_homeCb, 0);
     }
 }
 
-// ── the hooks: CreatePixelShader on the device, PSSetShader + the four draws on the context ─────────
+// ── the hooks: CreatePixelShader + CreateDeferredContext on the device, PSSetShader + the draws on contexts ─────────
+//
+// The compositor records the environment on a *deferred* context, which in D3D11 is a different object with its own
+// vtable than the immediate context — hooking the immediate one alone saw nothing. So we hook every context's vtable
+// (the immediate one, and each deferred one as the device makes it), keeping that vtable's own originals. A few
+// vtables at most (immediate, deferred), found per call by the context's vtable pointer.
 
 using PFN_CreatePixelShader = HRESULT(STDMETHODCALLTYPE*)(ID3D11Device*, const void*, SIZE_T, ID3D11ClassLinkage*, ID3D11PixelShader**);
+using PFN_CreateDeferredContext = HRESULT(STDMETHODCALLTYPE*)(ID3D11Device*, UINT, ID3D11DeviceContext**);
+using PFN_CreateDeferredContext1 = HRESULT(STDMETHODCALLTYPE*)(ID3D11Device1*, UINT, ID3D11DeviceContext1**);
 using PFN_PSSetShader = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, ID3D11PixelShader*, ID3D11ClassInstance* const*, UINT);
 using PFN_Draw = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT, UINT);
 using PFN_DrawIndexed = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT, UINT, INT);
@@ -325,11 +333,28 @@ using PFN_DrawInstanced = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT, U
 using PFN_DrawIndexedInstanced = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT, UINT, UINT, INT, UINT);
 
 PFN_CreatePixelShader g_realCreatePixelShader = nullptr;
-PFN_PSSetShader g_realPSSetShader = nullptr;
-PFN_Draw g_realDraw = nullptr;
-PFN_DrawIndexed g_realDrawIndexed = nullptr;
-PFN_DrawInstanced g_realDrawInstanced = nullptr;
-PFN_DrawIndexedInstanced g_realDrawIndexedInstanced = nullptr;
+PFN_CreateDeferredContext g_realCreateDeferredContext = nullptr;
+PFN_CreateDeferredContext1 g_realCreateDeferredContext1 = nullptr;
+
+// One per hooked context vtable, with that vtable's own original draw/PSSetShader functions.
+struct CtxHooks {
+    void* vtbl = nullptr;
+    PFN_PSSetShader psSetShader = nullptr;
+    PFN_Draw draw = nullptr;
+    PFN_DrawIndexed drawIndexed = nullptr;
+    PFN_DrawInstanced drawInstanced = nullptr;
+    PFN_DrawIndexedInstanced drawIndexedInstanced = nullptr;
+};
+CtxHooks g_ctxHooks[8];
+std::atomic<int> g_ctxHookCount{0};
+std::mutex g_hookMutex;
+
+CtxHooks* hooksFor(void* ctx) {
+    void* vt = *reinterpret_cast<void**>(ctx);
+    const int n = g_ctxHookCount.load(std::memory_order_acquire);
+    for (int i = 0; i < n; ++i) if (g_ctxHooks[i].vtbl == vt) return &g_ctxHooks[i];
+    return nullptr;
+}
 
 std::unordered_map<ID3D11PixelShader*, Kind> g_psKind;   // shaders the compositor made that we recognised
 
@@ -346,8 +371,8 @@ HRESULT STDMETHODCALLTYPE CreatePixelShader_hook(ID3D11Device* dev, const void* 
 
 void STDMETHODCALLTYPE PSSetShader_hook(ID3D11DeviceContext* ctx, ID3D11PixelShader* ps, ID3D11ClassInstance* const* inst, UINT n) {
     if (ctx == g_context) g_boundPs = ps;
-    { std::lock_guard<std::mutex> l(g_shaderMutex); g_boundByCtx[ctx] = ps; }   // per context (the environment may use a deferred one)
-    g_realPSSetShader(ctx, ps, inst, n);
+    { std::lock_guard<std::mutex> l(g_shaderMutex); g_boundByCtx[ctx] = ps; }   // per context (the environment uses a deferred one)
+    if (CtxHooks* h = hooksFor(ctx)) h->psSetShader(ctx, ps, inst, n);
 }
 
 // Diagnostic: the first time each known pixel shader is drawn, note it and the context, so one headset session shows
@@ -372,27 +397,32 @@ void noteDraw(ID3D11DeviceContext* ctx) {
     logf("compositor draws %s%s", name.c_str(), ctx == g_context ? "" : " (on another context, not the one we track)");
 }
 
-// What the compositor's about-to-draw pixel shader means for us (no texture access: that's under g_texMutex).
-Kind classify(ID3D11DeviceContext* ctx) {
-    if (g_off || ctx != g_context || !g_boundPs) return Kind::None;
+// The pixel shader bound on this context, and what it means for us (any context the device made, not just immediate).
+Kind classify(ID3D11DeviceContext* ctx, ID3D11PixelShader*& bound) {
+    bound = nullptr;
+    if (g_off) return Kind::None;
     std::lock_guard<std::mutex> l(g_shaderMutex);
-    auto it = g_psKind.find(g_boundPs);
+    auto b = g_boundByCtx.find(ctx);
+    if (b == g_boundByCtx.end() || !b->second) return Kind::None;
+    bound = b->second;
+    auto it = g_psKind.find(bound);
     return it == g_psKind.end() ? Kind::None : it->second;
 }
 
-// Binds the home over the compositor's state for one draw, then puts the shader back.
+// Binds the home over the compositor's state for one draw (on this context, through its own vtable), then restores.
 struct HomeBind {
     ID3D11DeviceContext* ctx;
+    CtxHooks* h;
     ID3D11PixelShader* restore;
     ID3D11ShaderResourceView* srv;
-    HomeBind(ID3D11DeviceContext* c, int slot, ID3D11PixelShader* r) : ctx(c), restore(r), srv(g_tex[slot].srv) {
-        g_realPSSetShader(ctx, g_homePs, nullptr, 0);
+    HomeBind(ID3D11DeviceContext* c, CtxHooks* hooks, int slot, ID3D11PixelShader* r) : ctx(c), h(hooks), restore(r), srv(g_tex[slot].srv) {
+        h->psSetShader(ctx, g_homePs, nullptr, 0);
         ctx->PSSetShaderResources(kSrvSlot, 1, &srv);
         ctx->PSSetConstantBuffers(kCbSlot, 1, &g_homeCb);
         ctx->PSSetSamplers(kSampSlot, 1, &g_sampler);
     }
     ~HomeBind() {
-        g_realPSSetShader(ctx, restore, nullptr, 0);   // the compositor's aurora shader back, so our tracking holds
+        h->psSetShader(ctx, restore, nullptr, 0);   // the compositor's aurora shader back, so our tracking holds
         healthy();
     }
 };
@@ -400,36 +430,46 @@ struct HomeBind {
 // Runs the compositor's draw, swapping the home in for an Aurora sky draw or dropping an Aurora floor/stars draw.
 // The texture lock is held across a replaced draw so the pipe thread can't free the texture under it.
 template <typename Draw>
-void replaceDraw(ID3D11DeviceContext* ctx, Draw&& draw) {
+void replaceDraw(ID3D11DeviceContext* ctx, CtxHooks* h, Draw&& draw) {
     noteDraw(ctx);                                   // diagnostic: what the compositor draws, and on which context
-    const Kind k = classify(ctx);
+    ID3D11PixelShader* bound = nullptr;
+    const Kind k = classify(ctx, bound);
     if (k == Kind::None) { draw(); return; }
     if (k == Kind::Skip) { g_skipped.fetch_add(1, std::memory_order_relaxed); return; }
     std::unique_lock<std::mutex> lock(g_texMutex);
     const int slot = frameSlot();
     if (slot < 0 || !ensureResources() || slot >= static_cast<int>(g_tex.size()) || !g_tex[slot].srv) { lock.unlock(); draw(); return; }
-    fillCb(slot);
+    fillCb(ctx, slot);
     if (!g_latchStamped) { g_latchStamped = true; g_state->sampledNs.store(g_latchNs); }
     g_replaced.fetch_add(1, std::memory_order_relaxed);
-    HomeBind b(ctx, slot, g_boundPs);
+    arm();   // only now (we actually swap Aurora) does a compositor crash without a healthy frame count as ours
+    HomeBind b(ctx, h, slot, bound);
     draw();
 }
 
 void STDMETHODCALLTYPE Draw_hook(ID3D11DeviceContext* ctx, UINT n, UINT start) {
-    replaceDraw(ctx, [&] { g_realDraw(ctx, n, start); });
+    CtxHooks* h = hooksFor(ctx);
+    if (!h) return;
+    replaceDraw(ctx, h, [&] { h->draw(ctx, n, start); });
 }
 void STDMETHODCALLTYPE DrawIndexed_hook(ID3D11DeviceContext* ctx, UINT n, UINT start, INT base) {
-    replaceDraw(ctx, [&] { g_realDrawIndexed(ctx, n, start, base); });
+    CtxHooks* h = hooksFor(ctx);
+    if (!h) return;
+    replaceDraw(ctx, h, [&] { h->drawIndexed(ctx, n, start, base); });
 }
 void STDMETHODCALLTYPE DrawInstanced_hook(ID3D11DeviceContext* ctx, UINT vpi, UINT inst, UINT sv, UINT si) {
-    replaceDraw(ctx, [&] { g_realDrawInstanced(ctx, vpi, inst, sv, si); });
+    CtxHooks* h = hooksFor(ctx);
+    if (!h) return;
+    replaceDraw(ctx, h, [&] { h->drawInstanced(ctx, vpi, inst, sv, si); });
 }
 void STDMETHODCALLTYPE DrawIndexedInstanced_hook(ID3D11DeviceContext* ctx, UINT ipi, UINT inst, UINT si, INT bv, UINT sinst) {
-    replaceDraw(ctx, [&] { g_realDrawIndexedInstanced(ctx, ipi, inst, si, bv, sinst); });
+    CtxHooks* h = hooksFor(ctx);
+    if (!h) return;
+    replaceDraw(ctx, h, [&] { h->drawIndexedInstanced(ctx, ipi, inst, si, bv, sinst); });
 }
 
-// Swaps one vtable entry for our hook, keeping the original. (Many instances share one class vtable, so hooking the
-// compositor's device and immediate context hooks them all; we gate on g_device/g_context anyway.)
+// Swaps one vtable entry for our hook, keeping the original. (All objects of a concrete class share one vtable, so
+// hooking the device's vtable, and each context vtable, covers every such object in the process.)
 template <typename T>
 void hookSlot(void* obj, int index, void* hook, T* real) {
     void** vtable = *reinterpret_cast<void***>(obj);
@@ -439,6 +479,49 @@ void hookSlot(void* obj, int index, void* hook, T* real) {
         vtable[index] = hook;
         VirtualProtect(&vtable[index], sizeof(void*), old, &old);
     }
+}
+void patchSlot(void** vtable, int index, void* hook) {
+    DWORD old = 0;
+    if (VirtualProtect(&vtable[index], sizeof(void*), PAGE_EXECUTE_READWRITE, &old)) {
+        vtable[index] = hook;
+        VirtualProtect(&vtable[index], sizeof(void*), old, &old);
+    }
+}
+
+// Hooks a context's vtable once (the immediate one, or a deferred one as the device makes it): remembers its own
+// originals, publishes the entry, then redirects PSSetShader and the four draws to our hooks.
+void hookContext(ID3D11DeviceContext* ctx) {
+    void* vt = *reinterpret_cast<void**>(ctx);
+    std::lock_guard<std::mutex> l(g_hookMutex);
+    for (int i = 0; i < g_ctxHookCount.load(); ++i) if (g_ctxHooks[i].vtbl == vt) return;
+    const int idx = g_ctxHookCount.load();
+    if (idx >= 8) return;
+    CtxHooks& h = g_ctxHooks[idx];
+    void** vtable = reinterpret_cast<void**>(vt);
+    h.vtbl = vt;
+    h.psSetShader = reinterpret_cast<PFN_PSSetShader>(vtable[9]);
+    h.drawIndexed = reinterpret_cast<PFN_DrawIndexed>(vtable[12]);
+    h.draw = reinterpret_cast<PFN_Draw>(vtable[13]);
+    h.drawIndexedInstanced = reinterpret_cast<PFN_DrawIndexedInstanced>(vtable[20]);
+    h.drawInstanced = reinterpret_cast<PFN_DrawInstanced>(vtable[21]);
+    g_ctxHookCount.store(idx + 1, std::memory_order_release);   // findable before the slots point at our hooks
+    patchSlot(vtable, 9, reinterpret_cast<void*>(PSSetShader_hook));
+    patchSlot(vtable, 12, reinterpret_cast<void*>(DrawIndexed_hook));
+    patchSlot(vtable, 13, reinterpret_cast<void*>(Draw_hook));
+    patchSlot(vtable, 20, reinterpret_cast<void*>(DrawIndexedInstanced_hook));
+    patchSlot(vtable, 21, reinterpret_cast<void*>(DrawInstanced_hook));
+    logf("hooked context vtable #%d (draws on it are seen now)", idx + 1);
+}
+
+HRESULT STDMETHODCALLTYPE CreateDeferredContext_hook(ID3D11Device* dev, UINT flags, ID3D11DeviceContext** out) {
+    const HRESULT hr = g_realCreateDeferredContext(dev, flags, out);
+    if (SUCCEEDED(hr) && out && *out && dev == g_device) hookContext(*out);
+    return hr;
+}
+HRESULT STDMETHODCALLTYPE CreateDeferredContext1_hook(ID3D11Device1* dev, UINT flags, ID3D11DeviceContext1** out) {
+    const HRESULT hr = g_realCreateDeferredContext1(dev, flags, out);
+    if (SUCCEEDED(hr) && out && *out && reinterpret_cast<ID3D11Device*>(dev) == g_device) hookContext(*out);
+    return hr;
 }
 
 // ── the hand-over pipe: Frame Home asks for textures, we make them and share them ──────────────────
@@ -533,7 +616,6 @@ void handleRequest(HANDLE pipe, DWORD clientDefaultPid) {
         if (ok) {
             adapterLuid(reply.deviceLUID);
             reply.ok = 1;
-            arm();
             logf("Frame Home connected: %ux%u, generation %u", req.width, req.height, req.generation);
         } else {
             logf("could not share the textures with Frame Home (pid %lu)", pid);
@@ -599,11 +681,13 @@ void wrap(ID3D11Device* dev, ID3D11DeviceContext* ctx) {
         if (g_off) { logf("vrcompositor device wrapped, but Frame Home is off: Aurora as usual"); return; }
         scanAuroraShaders();
         hookSlot(dev, 15, reinterpret_cast<void*>(CreatePixelShader_hook), &g_realCreatePixelShader);
-        hookSlot(ctx, 9, reinterpret_cast<void*>(PSSetShader_hook), &g_realPSSetShader);
-        hookSlot(ctx, 12, reinterpret_cast<void*>(DrawIndexed_hook), &g_realDrawIndexed);
-        hookSlot(ctx, 13, reinterpret_cast<void*>(Draw_hook), &g_realDraw);
-        hookSlot(ctx, 20, reinterpret_cast<void*>(DrawIndexedInstanced_hook), &g_realDrawIndexedInstanced);
-        hookSlot(ctx, 21, reinterpret_cast<void*>(DrawInstanced_hook), &g_realDrawInstanced);
+        hookSlot(dev, 27, reinterpret_cast<void*>(CreateDeferredContext_hook), &g_realCreateDeferredContext);   // the environment's context
+        ID3D11Device1* dev1 = nullptr;                   // CreateDeferredContext1 (slot 44) only if the device is a Device1
+        if (SUCCEEDED(dev->QueryInterface(__uuidof(ID3D11Device1), reinterpret_cast<void**>(&dev1))) && dev1) {
+            hookSlot(dev, 44, reinterpret_cast<void*>(CreateDeferredContext1_hook), &g_realCreateDeferredContext1);
+            dev1->Release();
+        }
+        hookContext(ctx);                                // the immediate context (deferred ones are hooked as they're made)
         std::thread(serve).detach();
         std::thread(watchOff).detach();
         logf("vrcompositor device wrapped: Frame Home is the environment");

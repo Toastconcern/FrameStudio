@@ -78,7 +78,9 @@ jobs:
       matrix:
         include:
           - { arch: arm64, runner: macos-14 }
-          - { arch: x64, runner: macos-13 }
+          # Intel: macos-13 was retired (Dec 2025); macos-15-intel is GitHub's last Intel Mac runner (until Aug 2027).
+          # Not cross-built on an ARM Mac because Homebrew's MoltenVK, bundled into the app, is the runner's own arch.
+          - { arch: x64, runner: macos-15-intel }
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
     steps:

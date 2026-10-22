@@ -5506,23 +5506,64 @@ struct Studio {
     }
 
     // Blender-style axis indicator in the viewport's top-right corner.
-    void drawAxes(ImDrawList* dl, const float* view) {
-        const float r = 34 * scale;
-        const ImVec2 c(viewPos.x + viewSize.x - sidebarWidth() - r - 18 * scale, viewPos.y + r + 18 * scale);
-        struct Axis { float x, y, z; uint32_t color; const char* name; };
-        Axis axes[3];
+    // The navigation gizmo (top-right): the X/Y/Z axes as a little ball, like Blender's. Drag it to orbit the view;
+    // click an axis ball to snap to that view (front/back, left/right, top/bottom). Returns true while it has the
+    // mouse, so the viewport doesn't also orbit. Positive axes are solid and labelled; negative ones are hollow rings.
+    bool drawAxes(ImDrawList* dl, const float* view) {
+        const float r = 30 * scale, ballR = 9 * scale;
+        const ImVec2 c(viewPos.x + viewSize.x - sidebarWidth() - r - 20 * scale, viewPos.y + r + 20 * scale);
+        struct Ball { ImVec2 p; float depth; uint32_t color; const char* name; bool positive; int axis; };
+        Ball balls[6];
         const uint32_t colors[3] = {0xff3352, 0x8bdc00, 0x2890ff};
         const char* names[3] = {"X", "Y", "Z"};
-        for (int a = 0; a < 3; ++a) axes[a] = {view[a * 4], view[a * 4 + 1], view[a * 4 + 2], colors[a], names[a]};
-        std::sort(axes, axes + 3, [](const Axis& a, const Axis& b) { return a.z < b.z; });
-        dl->AddCircleFilled(c, r + 12 * scale, col(0x000000, 0.18f));
-        for (const Axis& a : axes) {
-            ImVec2 e(c.x + a.x * r, c.y - a.y * r);
-            dl->AddLine(c, e, col(a.color), 2.0f * scale);
-            dl->AddCircleFilled(e, 8 * scale, col(a.color));
-            ImVec2 ts = ImGui::CalcTextSize(a.name);
-            dl->AddText(ImVec2(e.x - ts.x * 0.5f, e.y - ts.y * 0.5f), col(0x111111), a.name);
+        for (int a = 0; a < 3; ++a) {
+            const float vx = view[a * 4], vy = view[a * 4 + 1], vz = view[a * 4 + 2];
+            balls[a * 2] = {ImVec2(c.x + vx * r, c.y - vy * r), vz, colors[a], names[a], true, a};
+            balls[a * 2 + 1] = {ImVec2(c.x - vx * r, c.y + vy * r), -vz, colors[a], names[a], false, a};
         }
+        // A button over the whole gizmo so it takes the mouse (and the viewport doesn't orbit under it).
+        const float hitR = r + ballR + 4 * scale;
+        ImGui::SetCursorScreenPos(ImVec2(c.x - hitR, c.y - hitR));
+        ImGui::InvisibleButton("##navGizmo", ImVec2(hitR * 2, hitR * 2));
+        const bool hot = ImGui::IsItemHovered(), active = ImGui::IsItemActive();
+        ImGuiIO& io = ImGui::GetIO();
+        int hover = -1;
+        ImVec2 hoverPos;
+        if (hot || active) {   // the ball nearest the pointer (so a click snaps to it)
+            float best = (ballR + 3 * scale) * (ballR + 3 * scale);
+            for (int i = 0; i < 6; ++i) { const float dx = io.MousePos.x - balls[i].p.x, dy = io.MousePos.y - balls[i].p.y; if (dx * dx + dy * dy < best) { best = dx * dx + dy * dy; hover = i; hoverPos = balls[i].p; } }
+        }
+        static bool dragged = false;
+        if (active && ImGui::IsMouseDragging(ImGuiMouseButton_Left, 4 * scale)) {   // drag: orbit, like the viewport
+            dragged = true;
+            cam.yaw -= io.MouseDelta.x * 0.006f;
+            cam.pitch = std::clamp(cam.pitch - io.MouseDelta.y * 0.006f, -1.55f, 1.55f);
+        }
+        if (ImGui::IsItemDeactivated()) {   // released: a click (not a drag) on a ball snaps to that view
+            if (!dragged && hover >= 0) {
+                const int a = balls[hover].axis;
+                const bool pos = balls[hover].positive;
+                if (a == 0) viewFrom(pos ? kPi * 0.5f : -kPi * 0.5f, 0);                        // X: right / left
+                else if (a == 1) viewFrom(0, pos ? kPi * 0.5f - 0.001f : -kPi * 0.5f + 0.001f); // Y: top / bottom
+                else viewFrom(pos ? 0 : kPi, 0);                                                 // Z: front / back
+            }
+            dragged = false;
+        }
+        std::sort(balls, balls + 6, [](const Ball& a, const Ball& b) { return a.depth < b.depth; });   // back to front
+        dl->AddCircleFilled(c, r + 12 * scale, col(0x000000, hot || active ? 0.30f : 0.18f));
+        for (const Ball& b : balls) {
+            if (b.positive) {
+                dl->AddLine(c, b.p, col(b.color), 2.0f * scale);
+                dl->AddCircleFilled(b.p, ballR, col(b.color));
+                const ImVec2 ts = ImGui::CalcTextSize(b.name);
+                dl->AddText(ImVec2(b.p.x - ts.x * 0.5f, b.p.y - ts.y * 0.5f), col(0x111111), b.name);
+            } else {
+                dl->AddCircleFilled(b.p, ballR, col(b.color, 0.28f));
+                dl->AddCircle(b.p, ballR, col(b.color), 16, 1.5f * scale);
+            }
+        }
+        if (hover >= 0) dl->AddCircle(hoverPos, ballR + 2 * scale, col(0xffffff), 20, 2 * scale);   // highlight the one under the pointer
+        return hot || active;
     }
 
     // The world layer drawn over the 3D view (x-ray: always visible): spawns cyan, seats green, hotspots yellow,
@@ -6027,7 +6068,7 @@ struct Studio {
             renderer.setSelection(show ? static_cast<int>(objects[selected].mesh) : -1);
         }
         if (scene) drawWorld(dl, viewProj);
-        if (scene) drawAxes(dl, view);
+        const bool navGizmo = scene && drawAxes(dl, view);   // the navigation gizmo took the mouse: don't also orbit the view
         if (scene && isolating) {   // say why everything else vanished, and how to get it back
             const char* msg = "Showing only the selection  \u00b7  I or Esc shows everything";
             const ImVec2 ts = ImGui::CalcTextSize(msg);
@@ -6038,7 +6079,7 @@ struct Studio {
 
         // Camera navigation
         const ImVec2 md = io.MouseDelta;
-        if (hovered && drag < 0) {
+        if (hovered && drag < 0 && !navGizmo) {
             if (ImGui::IsMouseClicked(ImGuiMouseButton_Middle)) drag = 2;
             else if (ImGui::IsMouseClicked(ImGuiMouseButton_Right)) drag = 1;
             else if (io.KeyAlt && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) drag = 0;
@@ -6113,7 +6154,7 @@ struct Studio {
         }
         if (itemDrag != kDragNone && dragMoved) ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeAll);
         // Dragging an item: pressed on it, then moved more than a few pixels (a click alone selects, below).
-        if (hovered && !io.KeyAlt && ImGui::IsMouseClicked(ImGuiMouseButton_Left) && !overGizmo && tool != Tool::DrawFloor && scene) {
+        if (hovered && !io.KeyAlt && ImGui::IsMouseClicked(ImGuiMouseButton_Left) && !overGizmo && !navGizmo && tool != Tool::DrawFloor && scene) {
             itemDrag = kDragNone;
             dragMoved = false;
             dragFrom = io.MousePos;

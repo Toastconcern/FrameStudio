@@ -21,6 +21,12 @@ if /i "%ARCH%"=="arm64" set "VCARCH=%HOSTARCH%_arm64"
 if "%VCARCH%"=="" ( echo ERROR: unknown architecture "%ARCH%": x64, x86 or arm64 & exit /b 1 )
 if "%VCARCH%"=="amd64_amd64" set "VCARCH=amd64"
 if "%VCARCH%"=="arm64_arm64" set "VCARCH=arm64"
+REM Built for another architecture than this PC's: tell CMake, or it reports this PC's own (AMD64) and astcenc/opus
+REM pick x86 SIMD code for an ARM64 build.
+set "CROSS="
+if /i "%ARCH%"=="x86" set "CROSS=-DCMAKE_SYSTEM_NAME=Windows -DCMAKE_SYSTEM_PROCESSOR=X86"
+if /i "%ARCH%"=="arm64" if /i not "%HOSTARCH%"=="arm64" set "CROSS=-DCMAKE_SYSTEM_NAME=Windows -DCMAKE_SYSTEM_PROCESSOR=ARM64"
+if /i "%ARCH%"=="x64" if /i "%HOSTARCH%"=="arm64" set "CROSS=-DCMAKE_SYSTEM_NAME=Windows -DCMAKE_SYSTEM_PROCESSOR=AMD64"
 
 set "VSWHERE=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe"
 for /f "usebackq tokens=*" %%i in (`"%VSWHERE%" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VSPATH=%%i"
@@ -29,6 +35,6 @@ call "%VSPATH%\VC\Auxiliary\Build\vcvarsall.bat" %VCARCH% >nul || ( echo ERROR: 
 where cmake >nul 2>nul || set "PATH=%VSPATH%\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin;%PATH%"
 where ninja >nul 2>nul || set "PATH=%VSPATH%\Common7\IDE\CommonExtensions\Microsoft\CMake\Ninja;%PATH%"
 
-cmake -S "%SRC%." -B "%BDIR%" -G Ninja -DCMAKE_BUILD_TYPE=Release || exit /b 1
+cmake -S "%SRC%." -B "%BDIR%" -G Ninja -DCMAKE_BUILD_TYPE=Release %CROSS% || exit /b 1
 cmake --build "%BDIR%" --target frame-studio || exit /b 1
 echo Built "%BDIR%\Frame Studio.exe" (%ARCH%)

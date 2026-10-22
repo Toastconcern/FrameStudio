@@ -22,7 +22,8 @@ jobs:
       matrix:
         include:
           - { arch: x64, runner: ubuntu-24.04, extra: "" }
-          - { arch: x86, runner: ubuntu-24.04, extra: "gcc-multilib g++-multilib" }
+          - { arch: x86, runner: ubuntu-24.04, i386: true,
+              extra: "gcc-multilib g++-multilib libx11-dev:i386 libxrandr-dev:i386 libxinerama-dev:i386 libxcursor-dev:i386 libxi-dev:i386" }
           - { arch: arm64, runner: ubuntu-24.04-arm, extra: "" }
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
@@ -30,6 +31,8 @@ jobs:
       - uses: actions/checkout@v4
       - name: Tools and X11 headers
         run: |
+          # x86 links against 32-bit X11, so apt needs the i386 packages too
+          if [ "${{ matrix.i386 }}" = "true" ]; then sudo dpkg --add-architecture i386; fi
           sudo apt-get update
           sudo apt-get install -y ninja-build cmake libx11-dev libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev libxkbcommon-dev ${{ matrix.extra }}
       - name: Build

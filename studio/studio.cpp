@@ -2333,17 +2333,17 @@ struct Studio {
         const uint32_t w = renderer.width(), h = renderer.height();
         if (rendered && w > 8 && h > 8 && renderer.readback(0, rgba) && rgba.size() >= static_cast<size_t>(w) * h * 4) {
             const uint32_t tw = 512, th = std::max<uint32_t>(1, h * tw / w);
-            std::vector<u8> small(static_cast<size_t>(tw) * th * 4);
+            std::vector<u8> scaled(static_cast<size_t>(tw) * th * 4);
             for (uint32_t y = 0; y < th; ++y)
                 for (uint32_t x = 0; x < tw; ++x) {
                     const u8* src = &rgba[(static_cast<size_t>(y * h / th) * w + x * w / tw) * 4];
-                    u8* dst = &small[(static_cast<size_t>(y) * tw + x) * 4];
+                    u8* dst = &scaled[(static_cast<size_t>(y) * tw + x) * 4];
                     dst[0] = src[0]; dst[1] = src[1]; dst[2] = src[2]; dst[3] = 255;
                 }
             stbi_write_png_to_func([](void* ctx, void* data, int size) {
                 auto* v = static_cast<std::vector<u8>*>(ctx);
                 v->insert(v->end(), static_cast<u8*>(data), static_cast<u8*>(data) + size);
-            }, &png, tw, th, 4, small.data(), tw * 4);
+            }, &png, tw, th, 4, scaled.data(), tw * 4);
         }
         cam = kept;
         return png;
@@ -2359,7 +2359,7 @@ struct Studio {
         unsigned char* px = bytes.empty() ? nullptr : stbi_load_from_memory(bytes.data(), static_cast<int>(bytes.size()), &w, &h, &c, 4);
         if (!px) return png;
         const int tw = std::min(512, w), th = std::max(1, h * tw / std::max(1, w));
-        std::vector<u8> small(static_cast<size_t>(tw) * th * 4);
+        std::vector<u8> scaled(static_cast<size_t>(tw) * th * 4);
         for (int y = 0; y < th; ++y)
             for (int x = 0; x < tw; ++x) {   // box filter over the source pixels each covers
                 const int x0 = x * w / tw, x1 = std::max(x0 + 1, (x + 1) * w / tw), y0 = y * h / th, y1 = std::max(y0 + 1, (y + 1) * h / th);
@@ -2367,13 +2367,13 @@ struct Studio {
                 for (int yy = y0; yy < y1; ++yy)
                     for (int xx = x0; xx < x1; ++xx, ++n)
                         for (int k = 0; k < 4; ++k) acc[k] += px[(static_cast<size_t>(yy) * w + xx) * 4 + k];
-                for (int k = 0; k < 4; ++k) small[(static_cast<size_t>(y) * tw + x) * 4 + k] = static_cast<u8>(k == 3 ? 255 : acc[k] / n);
+                for (int k = 0; k < 4; ++k) scaled[(static_cast<size_t>(y) * tw + x) * 4 + k] = static_cast<u8>(k == 3 ? 255 : acc[k] / n);
             }
         stbi_image_free(px);
         stbi_write_png_to_func([](void* ctx, void* data, int size) {
             auto* v = static_cast<std::vector<u8>*>(ctx);
             v->insert(v->end(), static_cast<u8*>(data), static_cast<u8*>(data) + size);
-        }, &png, tw, th, 4, small.data(), tw * 4);
+        }, &png, tw, th, 4, scaled.data(), tw * 4);
         return png;
     }
 
@@ -7568,7 +7568,7 @@ struct Studio {
         unsigned char* px = stbi_load_from_memory(png.data(), static_cast<int>(png.size()), &w, &h, &c, 4);
         if (!px) return;
         const int tw = std::min(160, w), th = std::max(1, h * tw / std::max(1, w));
-        std::vector<u8> small(static_cast<size_t>(tw) * th * 4);
+        std::vector<u8> scaled(static_cast<size_t>(tw) * th * 4);
         for (int y = 0; y < th; ++y)
             for (int x = 0; x < tw; ++x) {   // box filter over the source pixels each covers
                 const int x0 = x * w / tw, x1 = std::max(x0 + 1, (x + 1) * w / tw), y0 = y * h / th, y1 = std::max(y0 + 1, (y + 1) * h / th);
@@ -7576,10 +7576,10 @@ struct Studio {
                 for (int yy = y0; yy < y1; ++yy)
                     for (int xx = x0; xx < x1; ++xx, ++n)
                         for (int k = 0; k < 4; ++k) acc[k] += px[(static_cast<size_t>(yy) * w + xx) * 4 + k];
-                for (int k = 0; k < 4; ++k) small[(static_cast<size_t>(y) * tw + x) * 4 + k] = static_cast<u8>(k == 3 ? 255 : acc[k] / n);
+                for (int k = 0; k < 4; ++k) scaled[(static_cast<size_t>(y) * tw + x) * 4 + k] = static_cast<u8>(k == 3 ? 255 : acc[k] / n);
             }
         stbi_image_free(px);
-        m.thumbView = renderer.createPicture(small.data(), static_cast<uint32_t>(tw), static_cast<uint32_t>(th));
+        m.thumbView = renderer.createPicture(scaled.data(), static_cast<uint32_t>(tw), static_cast<uint32_t>(th));
         if (!m.thumbView) return;
         m.thumb = ImGui_ImplVulkan_AddTexture(viewSampler, m.thumbView, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
         m.thumbAspect = static_cast<float>(th) / static_cast<float>(tw);

@@ -56,8 +56,8 @@ jobs:
           cmake -S . -B build/pc-win64 -G Ninja -DCMAKE_BUILD_TYPE=Release -DFRAME_HOME_PC=ON -DCMAKE_TOOLCHAIN_FILE=cmake/llvm-mingw.cmake -DWINDOWS_ARCH=x86_64 -DLLVM_MINGW="$HOME/llvm-mingw"
           cmake --build build/pc-win64 --target frame-home frame-switcher d3d11.dll --parallel
           mkdir -p "build/stage/FrameHome-PC-windows-x64" dist
-          cp build/pc-win64/frame-home.exe build/pc-win64/frame-switcher.exe build/pc-win64/d3d11.dll frame/pc/install-frame-home-pc.ps1 \
-             "frame/pc/Install Frame Home on this PC.bat" "frame/pc/Remove Frame Home from this PC.bat" "build/stage/FrameHome-PC-windows-x64/"
+          cp build/pc-win64/frame-home.exe build/pc-win64/frame-switcher.exe build/pc-win64/d3d11.dll pc-streaming/install-frame-home-pc.ps1 \
+             "pc-streaming/Install Frame Home on this PC.bat" "pc-streaming/Remove Frame Home from this PC.bat" "build/stage/FrameHome-PC-windows-x64/"
           cp LICENSE build/stage/FrameHome-PC-windows-x64/LICENSE.txt
           (cd build/stage && zip -qr ../../dist/FrameHome-PC-windows-x64.zip FrameHome-PC-windows-x64)
       - uses: actions/upload-artifact@v4

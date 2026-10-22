@@ -72,8 +72,8 @@ stage_pc() {
     case "$target" in
         windows-x64) mkdir -p "$stage/pc"
                      cp "$home/frame-home.exe" "$home/frame-switcher.exe" "$home/d3d11.dll" "$stage/pc/"
-                     cp "$ROOT/frame/pc/install-frame-home-pc.ps1" "$ROOT/frame/pc/Install Frame Home on this PC.bat" \
-                        "$ROOT/frame/pc/Remove Frame Home from this PC.bat" "$stage/pc/" ;;
+                     cp "$ROOT/pc-streaming/install-frame-home-pc.ps1" "$ROOT/pc-streaming/Install Frame Home on this PC.bat" \
+                        "$ROOT/pc-streaming/Remove Frame Home from this PC.bat" "$stage/pc/" ;;
         linux-x64)   mkdir -p "$stage/pc/bin" "$stage/pc/layer"
                      cp "$home/frame-home" "$home/frame-switcher" "$stage/pc/bin/"
                      ${CXX:-g++} -O2 -shared -fPIC -std=c++17 -fvisibility=hidden -I"$ROOT/third_party/vulkan-headers/include" -I"$ROOT/src" \

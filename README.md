@@ -50,10 +50,11 @@ very largest homes may not fit.
   thermal governor that keeps the headset cool.
 - Safe: a compositor layer that steps aside if Frame Home stops, and a one-file off switch.
 
-**On a PC with SteamVR**
+**On a PC with SteamVR (experimental, separate)**
 
-- The same Frame Home as SteamVR's environment on Windows and Linux, switched from the Steam menu, showing what you
-  save in Studio ([guide](docs/pc-steamvr.md)).
+- A PC-side compositor layer that aims to make your homes SteamVR's environment on a desktop PC, kept apart in
+  [`pc-streaming/`](pc-streaming/README.md). It is for a tethered PC headset; it does **not** work for the Steam
+  Frame, which renders its home on the headset itself.
 
 **Frame Studio (on your computer)**
 
@@ -78,7 +79,7 @@ very largest homes may not fit.
 | [Performance](docs/performance.md) | Reaching 120 fps, checking it, fixing stutter |
 | [Frame Studio guide](docs/studio-guide.md) | The Studio window, tools and panels |
 | [Bundles](docs/bundles.md) | Several environments in one `.fbundle` |
-| [Frame Home on a PC](docs/pc-steamvr.md) | Your homes as SteamVR's environment on a Windows or Linux PC |
+| [Frame Home on a PC](pc-streaming/README.md) | Experimental PC-side layer (separate; not for the Steam Frame) |
 | [Building from source](docs/building.md) | Building on each system, CI, the headset side |
 | [Troubleshooting](docs/troubleshooting.md) | Symptoms and fixes, logs, the self-test |
 

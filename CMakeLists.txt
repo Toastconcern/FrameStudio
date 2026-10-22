@@ -142,9 +142,9 @@ if(NOT FRAME_HOME_PC)
 endif()
 
 # The Windows compositor layer: a proxy d3d11.dll that wraps vrcompositor's Direct3D 11 device and draws the home in
-# Aurora's place (layer/frame_home_layer_d3d11.cpp). The .def forwards every other d3d11 export to the real library.
+# Aurora's place (pc-streaming/frame_home_layer_d3d11.cpp). The .def forwards every other d3d11 export to the real library.
 if(WIN32 AND FRAME_HOME_PC)
-    add_library(frame-home-d3d11 MODULE layer/frame_home_layer_d3d11.cpp layer/d3d11_proxy.def)
+    add_library(frame-home-d3d11 MODULE pc-streaming/frame_home_layer_d3d11.cpp pc-streaming/d3d11_proxy.def)
     set_target_properties(frame-home-d3d11 PROPERTIES OUTPUT_NAME d3d11 PREFIX "")
     target_include_directories(frame-home-d3d11 PRIVATE src)
     target_link_libraries(frame-home-d3d11 PRIVATE dxguid uuid)

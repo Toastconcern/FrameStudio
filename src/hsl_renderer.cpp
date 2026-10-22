@@ -2110,7 +2110,7 @@ void HslRenderer::startWorkers() {
                 // Linear (UNORM) textures — normals, ORM, masks — may carry HDR-encoded ASTC blocks, which the LDR
                 // profile turns into magenta error texels (a corrupt ORM made the converted Cascadia's floor a
                 // mirror). Decode them with the HDR profile, unclamped, then clamp to 8 bits (HSR Studio decodes
-                // every UNORM ASTC texture through float too). sRGB colour textures keep the LDR path.
+                // every UNORM ASTC texture through float too). Colour (sRGB) textures start on the LDR path.
                 bool decoded = false;
                 if (!job.srgb) {
                     std::vector<uint16_t> half;
@@ -2125,6 +2125,25 @@ void HslRenderer::startWorkers() {
                     }
                 }
                 if (decoded || astc::decodeASTC(job.src->astc.data() + off, static_cast<u32>(lvl), w, h, job.src->bw, job.src->bh, rgba, false, 1)) {
+                    // A colour texture can be HDR-encoded too (the Focused vista's sky, water and glow): the LDR decode
+                    // then fills it with magenta error texels. Spot that (a lot of exact-magenta texels) and re-decode
+                    // through the HDR profile, sRGB-encoding the clamped linear colour so the sRGB view samples it
+                    // right; alpha is linear either way.
+                    if (job.srgb && !decoded && rgba.size() >= static_cast<size_t>(w) * h * 4) {
+                        size_t mag = 0;
+                        for (size_t q = 0; q + 3 < rgba.size(); q += 4)
+                            if (rgba[q] > 250 && rgba[q + 1] < 8 && rgba[q + 2] > 250) ++mag;
+                        std::vector<uint16_t> half;
+                        if (mag * 4 > static_cast<size_t>(w) * h &&      // a quarter or more of the texels are the error colour
+                            astc::decodeASTCHalf(job.src->astc.data() + off, static_cast<u32>(lvl), w, h, job.src->bw, job.src->bh, half) &&
+                            half.size() >= static_cast<size_t>(w) * h * 4) {
+                            auto toSrgb = [](float c) { c = std::clamp(c, 0.0f, 1.0f); return c <= 0.0031308f ? c * 12.92f : 1.055f * std::pow(c, 1.0f / 2.4f) - 0.055f; };
+                            for (size_t q = 0; q < rgba.size(); ++q) {
+                                const float v = fromHalf(half[q]);
+                                rgba[q] = static_cast<u8>(std::lround(((q & 3) == 3 ? std::clamp(v, 0.0f, 1.0f) : toSrgb(v)) * 255.0f));
+                            }
+                        }
+                    }
                     // A texture cooked without mips (a 6000^2 flipbook) arrives full size: brought within the cap here.
                     while (std::max(w, h) > maxDecodedSide() && rgba.size() >= static_cast<size_t>(w) * h * 4) halveRGBA(rgba, w, h);
                     // The image and its filled staging buffer are made here too: the frame only records the copy.

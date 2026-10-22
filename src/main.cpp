@@ -2064,6 +2064,15 @@ int runInstall(bool install) {
 
 int main(int argc, char** argv) {
     homeos::logCrashes();
+#ifdef _WIN32
+    // A GUI-subsystem build (no console window) has nowhere for the tool modes (--snapshot, --panorama, --bench) to
+    // print; send their messages to the log instead. runVr reopens it afresh for the environment itself.
+    if (!homeos::stderrIsTerminal()) {
+        std::error_code ec;
+        fs::create_directories(rootDir() / "logs", ec);
+        homeos::reopenStderr(rootDir() / "logs" / "frame-home.log", "a");
+    }
+#endif
 #ifdef FH_USE_VOLK
     if (volkInitialize() != VK_SUCCESS) { std::fprintf(stderr, "frame-home: no Vulkan on this system\n"); return 1; }
 #endif

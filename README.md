@@ -33,7 +33,6 @@ Artifacts).
 | Mac with Apple Silicon (M1 and later) | `FrameStudio-macos-arm64.zip` |
 | Mac with Intel | `FrameStudio-macos-x64.zip` |
 | Frame Home only, installed from any computer | `FrameHome-installer.zip` |
-| Frame Home for SteamVR on a Windows PC, without Studio | `FrameHome-PC-windows-x64.zip` (Studio's Windows x64 and Linux x64 downloads include it) |
 
 Studio needs a GPU with Vulkan 1.2: any recent NVIDIA, AMD or Intel driver on Windows and Linux. On a Mac, Vulkan
 runs on Metal through MoltenVK, which comes inside the app. The 32-bit builds have at most 4 GB to work in, so the
@@ -49,12 +48,6 @@ very largest homes may not fit.
 - Built for 120 fps: baked environments, eye-tracked foveation, auto resolution, per-world tuned settings, and a
   thermal governor that keeps the headset cool.
 - Safe: a compositor layer that steps aside if Frame Home stops, and a one-file off switch.
-
-**On a PC with SteamVR (experimental, separate)**
-
-- A PC-side compositor layer that aims to make your homes SteamVR's environment on a desktop PC, kept apart in
-  [`pc-streaming/`](pc-streaming/README.md). It is for a tethered PC headset; it does **not** work for the Steam
-  Frame, which renders its home on the headset itself.
 
 **Frame Studio (on your computer)**
 
@@ -81,7 +74,6 @@ very largest homes may not fit.
 | [Performance](docs/performance.md) | Reaching 120 fps, checking it, fixing stutter |
 | [Frame Studio guide](docs/studio-guide.md) | The Studio window, tools and panels |
 | [Bundles](docs/bundles.md) | Several environments in one `.fbundle` |
-| [Frame Home on a PC](pc-streaming/README.md) | Experimental PC-side layer (separate; not for the Steam Frame) |
 | [Building from source](docs/building.md) | Building on each system, CI, the headset side |
 | [Troubleshooting](docs/troubleshooting.md) | Symptoms and fixes, logs, the self-test |
 

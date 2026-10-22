@@ -38,36 +38,8 @@ jobs:
           name: FrameStudio-linux-${{ matrix.arch }}
           path: dist/FrameStudio-linux-${{ matrix.arch }}.tar.gz
 
-  # Frame Home for SteamVR on a Windows PC (frame-home.exe, frame-switcher.exe and the PC installer), cross-built with
-  # llvm-mingw as it's developed: the pc/ folder of the Windows x64 Studio, and a download of its own.
-  pc-home-windows:
-    name: Frame Home for Windows PCs
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v4
-      - name: llvm-mingw
-        run: |
-          sudo apt-get update && sudo apt-get install -y ninja-build cmake
-          url=$(curl -s https://api.github.com/repos/mstorsjo/llvm-mingw/releases/latest | grep -o 'https://[^"]*ucrt-ubuntu-[0-9.]*-x86_64\.tar\.xz' | head -1)
-          curl -sL "$url" | tar -xJ -C "$HOME" && mv "$HOME"/llvm-mingw-* "$HOME/llvm-mingw"
-      - name: Build
-        run: |
-          export PATH="$HOME/llvm-mingw/bin:$PATH"
-          cmake -S . -B build/pc-win64 -G Ninja -DCMAKE_BUILD_TYPE=Release -DFRAME_HOME_PC=ON -DCMAKE_TOOLCHAIN_FILE=cmake/llvm-mingw.cmake -DWINDOWS_ARCH=x86_64 -DLLVM_MINGW="$HOME/llvm-mingw"
-          cmake --build build/pc-win64 --target frame-home frame-switcher d3d11.dll --parallel
-          mkdir -p "build/stage/FrameHome-PC-windows-x64" dist
-          cp build/pc-win64/frame-home.exe build/pc-win64/frame-switcher.exe build/pc-win64/d3d11.dll pc-streaming/install-frame-home-pc.ps1 \
-             "pc-streaming/Install Frame Home on this PC.bat" "pc-streaming/Remove Frame Home from this PC.bat" "build/stage/FrameHome-PC-windows-x64/"
-          cp LICENSE build/stage/FrameHome-PC-windows-x64/LICENSE.txt
-          (cd build/stage && zip -qr ../../dist/FrameHome-PC-windows-x64.zip FrameHome-PC-windows-x64)
-      - uses: actions/upload-artifact@v4
-        with:
-          name: FrameHome-PC-windows-x64
-          path: dist/FrameHome-PC-windows-x64.zip
-
   windows:
     name: Windows ${{ matrix.arch }}
-    needs: [pc-home-windows]
     strategy:
       fail-fast: false
       matrix:
@@ -75,11 +47,6 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
-        if: matrix.arch == 'x64'
-        with:
-          name: FrameHome-PC-windows-x64
-          path: pc
       - name: Build (MSVC)
         shell: cmd
         run: studio\build_windows.bat ${{ matrix.arch }} "%GITHUB_WORKSPACE%\build\windows-${{ matrix.arch }}"
@@ -92,11 +59,6 @@ jobs:
           Copy-Item "build/windows-${{ matrix.arch }}/Frame Studio.exe" $stage
           Copy-Item -Recurse "build/windows-${{ matrix.arch }}/frame" "$stage/frame"
           Copy-Item LICENSE "$stage/LICENSE.txt"
-          if ("${{ matrix.arch }}" -eq "x64") {   # Frame Home for this PC's SteamVR, beside Studio
-            Expand-Archive "pc/FrameHome-PC-windows-x64.zip" -DestinationPath build/pc
-            Copy-Item -Recurse "build/pc/FrameHome-PC-windows-x64" "$stage/pc"
-            Remove-Item "$stage/pc/LICENSE.txt"
-          }
           New-Item -ItemType Directory -Force dist | Out-Null
           Compress-Archive -Path $stage -DestinationPath "dist/$name.zip" -Force
       - uses: actions/upload-artifact@v4
@@ -140,7 +102,7 @@ jobs:
     name: Publish
     # (also when a platform failed: "latest" gets every build that worked; a version release needs them all)
     if: ${{ !cancelled() && (startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/main') }}
-    needs: [linux, windows, macos, frame-home, pc-home-windows]
+    needs: [linux, windows, macos, frame-home]
     runs-on: ubuntu-24.04
     permissions:
       contents: write

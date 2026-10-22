@@ -141,16 +141,6 @@ if(NOT FRAME_HOME_PC)
     set_target_properties(frame-home PROPERTIES BUILD_RPATH "${OPENVR_LIB_DIR}" INSTALL_RPATH "${OPENVR_LIB_DIR}")
 endif()
 
-# The Windows compositor layer: a proxy d3d11.dll that wraps vrcompositor's Direct3D 11 device and draws the home in
-# Aurora's place (pc-streaming/frame_home_layer_d3d11.cpp). The .def forwards every other d3d11 export to the real library.
-if(WIN32 AND FRAME_HOME_PC)
-    add_library(frame-home-d3d11 MODULE pc-streaming/frame_home_layer_d3d11.cpp pc-streaming/d3d11_proxy.def)
-    set_target_properties(frame-home-d3d11 PROPERTIES OUTPUT_NAME d3d11 PREFIX "")
-    target_include_directories(frame-home-d3d11 PRIVATE src)
-    target_link_libraries(frame-home-d3d11 PRIVATE dxguid uuid)
-    target_link_options(frame-home-d3d11 PRIVATE -static -static-libgcc -static-libstdc++)
-endif()
-
 # fenv-tool: convert homes and models into .fenv environments.
 add_executable(fenv-tool src/fenv_tool.cpp)
 target_link_libraries(fenv-tool PRIVATE frame-scene)

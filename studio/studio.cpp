@@ -5354,17 +5354,15 @@ struct Studio {
     }
 
     // ── This PC: Frame Home as SteamVR's environment on the computer Studio runs on (the installer beside Studio,
-    // pc/: install-frame-home-pc.ps1 on Windows, install.sh on Linux). It shows My Environments, so what's saved here
-    // is in VR straight away; the Environments panel in the Steam menu switches them.
+    // pc/install.sh, Linux only). It shows My Environments, so what's saved here is in VR straight away; the
+    // Environments panel in the Steam menu switches them.
     std::thread pcJob;
     std::atomic<bool> pcBusy{false};
     std::string pcStatus;                    // (statusMutex)
     fs::path pcPayload() const { return exeDir() / L"pc"; }
     bool pcAvailable() const {
-#if defined(_WIN32)
-        return fs::exists(pcPayload() / L"install-frame-home-pc.ps1");
-#elif defined(__APPLE__)
-        return false;                        // (no SteamVR for macOS)
+#if defined(_WIN32) || defined(__APPLE__)
+        return false;                        // (Linux only: no SteamVR on macOS; no PC compositor layer on Windows)
 #else
         return fs::exists(pcPayload() / L"install.sh");
 #endif
@@ -5385,12 +5383,7 @@ struct Studio {
         pcBusy = true;
         { std::lock_guard<std::mutex> l(statusMutex); pcStatus = uninstall ? "Giving SteamVR its own environment back\u2026" : "Installing\u2026"; }
         pcJob = std::thread([this, uninstall] {
-#ifdef _WIN32
-            const std::string cmd = "powershell -NoProfile -ExecutionPolicy Bypass -File \"" + narrow((pcPayload() / L"install-frame-home-pc.ps1").wstring()) + "\"" +
-                                    (uninstall ? " -Uninstall" : "");
-#else
             const std::string cmd = "sh \"" + narrow((pcPayload() / L"install.sh").wstring()) + "\"" + (uninstall ? " uninstall" : "");
-#endif
             std::string out;
             const int rc = platform::run(cmd, pcPayload(), out);
             std::string msg = lastLine(out);   // the installer's verdict: its last "frame-install:" line

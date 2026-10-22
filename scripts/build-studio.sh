@@ -52,7 +52,7 @@ build() {
     "$CMAKE" --build "$dir" --target frame-studio --parallel
 }
 
-# Frame Home for SteamVR on the computer itself (Windows x64, Linux x64), built from the top-level project into
+# Frame Home for SteamVR on the computer itself (Linux x64), built from the top-level project into
 # $BUILD/<target>-home. $1 target, then extra cmake arguments.
 build_pc_home() {
     target=$1; shift
@@ -60,20 +60,15 @@ build_pc_home() {
     say "building Frame Home for $target's SteamVR"
     "$CMAKE" -S "$ROOT" -B "$dir" -DCMAKE_BUILD_TYPE=Release -DFRAME_HOME_PC=ON "$@" > "$dir.configure.log" 2>&1 || {
         tail -20 "$dir.configure.log"; say "$target: Frame Home configure failed (full log: $dir.configure.log)"; exit 1; }
-    "$CMAKE" --build "$dir" --target frame-home frame-switcher $([ "$target" = windows-x64 ] && echo d3d11.dll) --parallel
+    "$CMAKE" --build "$dir" --target frame-home frame-switcher --parallel
 }
 
-# pc/ beside Studio: Frame Home for this computer's SteamVR and its installer (Studio's Headset tab runs it). Both
-# platforms the Steam Frame's way now — the compositor layer draws the home in Aurora's place. Windows: the layer is
-# a proxy d3d11.dll (install-frame-home-pc.ps1 puts it beside SteamVR's compositor). Linux: the Vulkan layer, with
-# the headset's own install.sh.
+# pc/ beside Studio: Frame Home for this computer's SteamVR and its installer (Studio's Headset tab runs it), the Steam
+# Frame's way — the Vulkan compositor layer draws the home in Aurora's place, installed with the headset's own
+# install.sh (Linux only).
 stage_pc() {
     target=$1 stage=$2 home="$BUILD/$1-home"
     case "$target" in
-        windows-x64) mkdir -p "$stage/pc"
-                     cp "$home/frame-home.exe" "$home/frame-switcher.exe" "$home/d3d11.dll" "$stage/pc/"
-                     cp "$ROOT/pc-streaming/install-frame-home-pc.ps1" "$ROOT/pc-streaming/Install Frame Home on this PC.bat" \
-                        "$ROOT/pc-streaming/Remove Frame Home from this PC.bat" "$stage/pc/" ;;
         linux-x64)   mkdir -p "$stage/pc/bin" "$stage/pc/layer"
                      cp "$home/frame-home" "$home/frame-switcher" "$stage/pc/bin/"
                      ${CXX:-g++} -O2 -shared -fPIC -std=c++17 -fvisibility=hidden -I"$ROOT/third_party/vulkan-headers/include" -I"$ROOT/src" \
@@ -135,8 +130,7 @@ for t in $TARGETS; do
         linux-arm64) build "$t" -G Ninja && package "$t" ;;
         linux-x86) build "$t" -G Ninja -DCMAKE_C_FLAGS=-m32 -DCMAKE_CXX_FLAGS=-m32 -DCMAKE_SYSTEM_PROCESSOR=i686 \
                        -DCMAKE_LIBRARY_ARCHITECTURE=i386-linux-gnu && package "$t" ;;
-        windows-x64) build "$t" -G Ninja -DCMAKE_TOOLCHAIN_FILE="$ROOT/cmake/llvm-mingw.cmake" -DWINDOWS_ARCH=x86_64 &&
-                     build_pc_home "$t" -G Ninja -DCMAKE_TOOLCHAIN_FILE="$ROOT/cmake/llvm-mingw.cmake" -DWINDOWS_ARCH=x86_64 && package "$t" ;;
+        windows-x64) build "$t" -G Ninja -DCMAKE_TOOLCHAIN_FILE="$ROOT/cmake/llvm-mingw.cmake" -DWINDOWS_ARCH=x86_64 && package "$t" ;;
         windows-x86) build "$t" -G Ninja -DCMAKE_TOOLCHAIN_FILE="$ROOT/cmake/llvm-mingw.cmake" -DWINDOWS_ARCH=i686 && package "$t" ;;
         windows-arm64) build "$t" -G Ninja -DCMAKE_TOOLCHAIN_FILE="$ROOT/cmake/llvm-mingw.cmake" -DWINDOWS_ARCH=aarch64 && package "$t" ;;
         macos-arm64) build "$t" -G Ninja -DCMAKE_OSX_ARCHITECTURES=arm64 -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0 && package "$t" ;;

@@ -806,6 +806,12 @@ bool HslRenderer::init(uint32_t eyeWidth, uint32_t eyeHeight) {
     if (astcHdr_) dext.push_back(VK_EXT_TEXTURE_COMPRESSION_ASTC_HDR_EXTENSION_NAME);
     if (fdmOn_) dext.push_back(VK_EXT_FRAGMENT_DENSITY_MAP_EXTENSION_NAME);
     if (fdmOffset_) dext.push_back(VK_QCOM_FRAGMENT_DENSITY_MAP_OFFSET_EXTENSION_NAME);
+#ifdef _WIN32
+    // Windows system mode: import the compositor's Direct3D 11 textures to render the home into them.
+    if (importWin32)
+        for (const char* e : {"VK_KHR_external_memory", "VK_KHR_external_memory_win32"})
+            if (std::none_of(dext.begin(), dext.end(), [&](const char* d) { return !std::strcmp(d, e); })) dext.push_back(e);
+#endif
     // FH_PERF: the GPU's counters, for the bench (see perfCounterAverages).
     std::vector<uint32_t> perfIdx;
     VkPhysicalDevicePerformanceQueryFeaturesKHR perfFeat = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PERFORMANCE_QUERY_FEATURES_KHR};
@@ -866,6 +872,15 @@ bool HslRenderer::init(uint32_t eyeWidth, uint32_t eyeHeight) {
     dci.ppEnabledExtensionNames = dext.data();
     if (!VK_OK(vkCreateDevice(physical_, &dci, nullptr, &device_))) return false;
     vkGetDeviceQueue(device_, queueFamily_, 0, &queue_);
+#ifdef _WIN32
+    if (importWin32) {   // the adapter this device is on, so the compositor can check it's the one it draws with
+        VkPhysicalDeviceIDProperties idp = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES};
+        VkPhysicalDeviceProperties2 pp = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+        pp.pNext = &idp;
+        vkGetPhysicalDeviceProperties2(physical_, &pp);
+        if (idp.deviceLUIDValid) std::memcpy(deviceLUID_, idp.deviceLUID, 8);
+    }
+#endif
     if (!perfIdx.empty()) {
         VkQueryPoolPerformanceCreateInfoKHR pc = {VK_STRUCTURE_TYPE_QUERY_POOL_PERFORMANCE_CREATE_INFO_KHR};
         pc.queueFamilyIndex = queueFamily_;
@@ -4187,6 +4202,65 @@ bool HslRenderer::createExportImages(uint32_t n, std::vector<ExportImage>& out, 
     return true;
 }
 
+#ifdef _WIN32
+// Windows system mode: the compositor made kSlots shared Direct3D 11 textures (R8G8B8A8_UNORM_SRGB, `n` layers) at
+// this render size and duplicated their NT handles into us. Each becomes a VkImage we render the home into; render()
+// copies the eye frame into exportImages_[exportSlot] through the ordinary (non-direct) copy path. No cross-API lock:
+// a slot is published only once its frame is retired and the four rotate, as on Linux.
+bool HslRenderer::importWin32Images(uint32_t n, const uint64_t handles[], uint32_t w, uint32_t h) {
+    vkDeviceWaitIdle(device_);                          // an earlier generation may still be in flight
+    for (VkImage img : exportImages_) vkDestroyImage(device_, img, nullptr);
+    for (VkDeviceMemory m : importMem_) vkFreeMemory(device_, m, nullptr);
+    exportImages_.clear();
+    importMem_.clear();
+    exportInited_.clear();
+    exportSlot = -1;
+    exportDirect = false;                               // copied in (the imported textures aren't our render targets)
+    for (uint32_t i = 0; i < n; ++i) {
+        VkExternalMemoryImageCreateInfo ext = {VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO};
+        ext.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_BIT;
+        VkImageCreateInfo ci = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+        ci.pNext = &ext;
+        ci.imageType = VK_IMAGE_TYPE_2D;
+        ci.format = VK_FORMAT_R8G8B8A8_SRGB;            // == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB
+        ci.extent = {w, h, 1};
+        ci.mipLevels = 1;
+        ci.arrayLayers = viewCount;                     // 2 layers, one per eye
+        ci.samples = VK_SAMPLE_COUNT_1_BIT;
+        ci.tiling = VK_IMAGE_TILING_OPTIMAL;
+        ci.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+        ci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        ci.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        VkImage image = VK_NULL_HANDLE;
+        if (vkCreateImage(device_, &ci, nullptr, &image) != VK_SUCCESS) { LOG("system mode: import image %u failed", i); return false; }
+        VkMemoryRequirements req;
+        vkGetImageMemoryRequirements(device_, image, &req);
+        VkMemoryDedicatedAllocateInfo ded = {VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO};
+        ded.image = image;
+        VkImportMemoryWin32HandleInfoKHR imp = {VK_STRUCTURE_TYPE_IMPORT_MEMORY_WIN32_HANDLE_INFO_KHR};
+        imp.pNext = &ded;
+        imp.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_BIT;
+        imp.handle = reinterpret_cast<void*>(static_cast<uintptr_t>(handles[i]));
+        VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+        ai.pNext = &imp;
+        ai.allocationSize = req.size;
+        ai.memoryTypeIndex = memoryType(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        VkDeviceMemory mem = VK_NULL_HANDLE;
+        if (vkAllocateMemory(device_, &ai, nullptr, &mem) != VK_SUCCESS || vkBindImageMemory(device_, image, mem, 0) != VK_SUCCESS) {
+            LOG("system mode: import memory %u failed (adapter mismatch, or the compositor's textures went away)", i);
+            if (mem) vkFreeMemory(device_, mem, nullptr);
+            vkDestroyImage(device_, image, nullptr);
+            return false;
+        }
+        exportImages_.push_back(image);
+        importMem_.push_back(mem);
+    }
+    exportInited_.assign(n, false);
+    LOG("system mode: imported %u compositor textures (%ux%u, %u layers)", n, w, h, viewCount);
+    return true;
+}
+#endif
+
 uint32_t HslRenderer::exportUsage() const {
     return VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
            (exportDirect ? VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT : 0u);
@@ -4300,6 +4374,12 @@ void HslRenderer::shutdown() {
     vkDestroyFramebuffer(device_, framebuffer_, nullptr);
     vkDestroyRenderPass(device_, renderPass_, nullptr);
     if (exportPass_) vkDestroyRenderPass(device_, exportPass_, nullptr);
+#ifdef _WIN32
+    for (VkImage img : exportImages_) vkDestroyImage(device_, img, nullptr);   // imported compositor textures
+    for (VkDeviceMemory m : importMem_) vkFreeMemory(device_, m, nullptr);
+    exportImages_.clear();
+    importMem_.clear();
+#endif
     if (pipelineCache_) {
         size_t n = 0;
         if (!pipelineCachePath.empty() && vkGetPipelineCacheData(device_, pipelineCache_, &n, nullptr) == VK_SUCCESS && n) {

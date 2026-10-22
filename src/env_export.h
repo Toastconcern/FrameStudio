@@ -5,22 +5,176 @@
 #include "hsl_renderer.h"
 
 #ifdef _WIN32
-// A PC has no compositor layer: Frame Home is SteamVR's scene app there, so system mode never starts (init() fails).
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+
+#include <chrono>
+#include <cstdio>
+#include <cstring>
+
+// Windows system mode: Frame Home renders the home into the compositor's own Direct3D 11 textures (see env_share.h).
+// Frame Home owns the shared State (a file mapping) and hands the layer its handle; the layer owns the textures and
+// hands Frame Home theirs. createImages() does that hand-over over the layer's named pipe and imports the textures
+// into the renderer; after that it mirrors the Linux EnvExport.
 class EnvExport {
 public:
-    bool init() { return false; }
-    envshare::State* state() { return &state_; }
-    void release(HslRenderer&) {}
-    bool connected() const { return false; }
-    bool createImages(HslRenderer&) { return false; }
-    bool connect() { return false; }
-    void poll() {}
-    int beginFrame() { return 0; }
-    void publish(int, const float[2][16], const float[2][3]) {}
-    uint32_t refusedFlags() const { return 0; }
-    double sinceSampled() const { return 1e9; }
+    ~EnvExport() {
+        closeTextures();
+        if (pipe_ != INVALID_HANDLE_VALUE) ::CloseHandle(pipe_);
+        if (state_) ::UnmapViewOfFile(state_);
+        if (stateMap_) ::CloseHandle(stateMap_);
+    }
+
+    bool init() {
+        stateMap_ = ::CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, sizeof(envshare::State), nullptr);
+        if (!stateMap_) return false;
+        void* p = ::MapViewOfFile(stateMap_, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(envshare::State));
+        if (!p) return false;
+        state_ = new (p) envshare::State();
+        state_->show = 0;
+        return true;
+    }
+    envshare::State* state() { return state_; }
+
+    // (Re)negotiates the compositor's textures at the renderer's current size and imports them. Called at startup
+    // (where it waits a little for the layer to come up) and on every resize. True once the home can be drawn into
+    // the compositor's textures.
+    bool createImages(HslRenderer& r) {
+        r_ = &r;
+        const bool first = !everImported_;
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(first ? 3 : 0);
+        do {
+            if (negotiate(r)) return true;
+            if (first) ::Sleep(200);
+        } while (first && std::chrono::steady_clock::now() < deadline);
+        return false;
+    }
+    bool connected() const { return pipe_ != INVALID_HANDLE_VALUE && imported_; }
+
+    // Keeps the hand-over alive: reconnects and re-imports after the compositor restarts (as the Linux connect()
+    // re-sends its Hello). Cheap when already connected.
+    bool connect() {
+        if (connected()) return true;
+        if (!r_) return false;
+        return negotiate(*r_);
+    }
+
+    // Is the layer still there? (the pipe breaks when the compositor goes away)
+    void poll() {
+        if (pipe_ == INVALID_HANDLE_VALUE) return;
+        DWORD avail = 0;
+        if (!::PeekNamedPipe(pipe_, nullptr, 0, nullptr, &avail, nullptr)) {
+            const DWORD e = ::GetLastError();
+            if (e == ERROR_BROKEN_PIPE || e == ERROR_PIPE_NOT_CONNECTED || e == ERROR_INVALID_HANDLE) {
+                std::fprintf(stderr, "[frame-home] the compositor went away: reconnecting\n");
+                dropPipe();
+            }
+        }
+    }
+
+    int beginFrame() { const int k = static_cast<int>(next_); next_ = (next_ + 1) % envshare::kSlots; return k; }
+
+    void publish(int k, const float viewProj[2][16], const float eyePos[2][3]) {
+        envshare::Slot& s = state_->slot[k];
+        s.frame = ++frame_;
+        s.generation = generation_;
+        std::memcpy(s.viewProj, viewProj, sizeof s.viewProj);
+        for (int e = 0; e < 2; ++e) { for (int c = 0; c < 3; ++c) s.eyePos[e][c] = eyePos[e][c]; s.eyePos[e][3] = 1; }
+        state_->published.store(frame_);
+        state_->latest.store(static_cast<uint32_t>(k), std::memory_order_release);
+        state_->publishNs.store(envshare::nowNs());
+    }
+
+    uint32_t refusedFlags() const { return 0; }   // (Windows frames carry no Vulkan create flags for the layer to refuse)
+
+    double sinceSampled() const {
+        const uint64_t s = state_->sampledNs.load();
+        return s ? (envshare::nowNs() - s) / 1e9 : 1e9;
+    }
+
+    void release(HslRenderer&) { dropPipe(); }
+
 private:
-    envshare::State state_;
+    void closeTextures() { for (HANDLE& h : texture_) if (h) { ::CloseHandle(h); h = nullptr; } }
+    void dropPipe() {
+        if (pipe_ != INVALID_HANDLE_VALUE) { ::CloseHandle(pipe_); pipe_ = INVALID_HANDLE_VALUE; }
+        imported_ = false;
+    }
+
+    // Opens the pipe if need be, asks the layer for textures at this size, imports them. Throttled to once a second
+    // while it can't connect. On success the renderer holds the imported images and connected() is true.
+    bool negotiate(HslRenderer& r) {
+        const auto now = std::chrono::steady_clock::now();
+        if (pipe_ == INVALID_HANDLE_VALUE) {
+            if (now - lastTry_ < std::chrono::seconds(1)) return false;
+            lastTry_ = now;
+            pipe_ = ::CreateFileA(envshare::kPipeName, GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, 0, nullptr);
+            if (pipe_ == INVALID_HANDLE_VALUE) {
+                static bool said = false;
+                if (!said) { said = true; std::fprintf(stderr, "[frame-home] waiting for the compositor layer (no pipe yet, error %lu)\n", ::GetLastError()); }
+                return false;
+            }
+            DWORD mode = PIPE_READMODE_MESSAGE;
+            ::SetNamedPipeHandleState(pipe_, &mode, nullptr, nullptr);
+        }
+        // The State mapping, duplicated into the layer's (pipe server's) process so it can map it.
+        DWORD serverPid = 0;
+        HANDLE serverProc = nullptr, dupState = nullptr;
+        if (!::GetNamedPipeServerProcessId(pipe_, &serverPid) ||
+            !(serverProc = ::OpenProcess(PROCESS_DUP_HANDLE, FALSE, serverPid)) ||
+            !::DuplicateHandle(::GetCurrentProcess(), stateMap_, serverProc, &dupState, 0, FALSE, DUPLICATE_SAME_ACCESS)) {
+            if (serverProc) ::CloseHandle(serverProc);
+            dropPipe();
+            return false;
+        }
+        ::CloseHandle(serverProc);
+
+        envshare::WinRequest req;
+        req.width = r.width();
+        req.height = r.height();
+        req.format = 87;   // DXGI_FORMAT_R8G8B8A8_UNORM_SRGB
+        req.pid = ::GetCurrentProcessId();
+        req.generation = generation_ + 1;
+        req.state = reinterpret_cast<uint64_t>(dupState);
+        req.stateSize = static_cast<uint32_t>(sizeof(envshare::State));
+        DWORD wrote = 0;
+        envshare::WinReply reply = {};
+        DWORD got = 0;
+        if (!::WriteFile(pipe_, &req, sizeof req, &wrote, nullptr) || wrote != sizeof req ||
+            !::ReadFile(pipe_, &reply, sizeof reply, &got, nullptr) || got != sizeof reply ||
+            reply.magic != envshare::kMagic || !reply.ok || reply.generation != req.generation) {
+            std::fprintf(stderr, "[frame-home] the layer didn't hand over textures (wrote %lu read %lu ok %u gen %u/%u)\n",
+                         wrote, got, reply.ok, reply.generation, req.generation);
+            dropPipe();
+            return false;   // (the layer now owns dupState: it closes it, or drops it when the pipe breaks)
+        }
+        // The compositor's adapter: Frame Home must be on it, or the import silently reads another GPU's memory.
+        if (const uint8_t* luid = r.deviceLUID(); std::memcmp(luid, reply.deviceLUID, 8) != 0) {
+            static bool said = false;
+            if (!said) { said = true; std::fprintf(stderr, "[frame-home] the compositor draws on a different GPU than Frame Home: the home can't be shared with it\n"); }
+            dropPipe();
+            return false;
+        }
+        closeTextures();
+        for (uint32_t i = 0; i < envshare::kSlots; ++i) texture_[i] = reinterpret_cast<HANDLE>(static_cast<uintptr_t>(reply.texture[i]));
+        if (!r.importWin32Images(envshare::kSlots, reply.texture, req.width, req.height)) { dropPipe(); return false; }
+        generation_ = req.generation;
+        imported_ = everImported_ = true;
+        std::fprintf(stderr, "[frame-home] the compositor's textures are ours now: Frame Home is the environment (%ux%u per eye)\n", req.width, req.height);
+        return true;
+    }
+
+    envshare::State* state_ = nullptr;
+    HANDLE stateMap_ = nullptr;
+    HANDLE pipe_ = INVALID_HANDLE_VALUE;
+    HANDLE texture_[envshare::kSlots] = {};
+    HslRenderer* r_ = nullptr;
+    uint32_t next_ = 0, generation_ = 0;
+    uint64_t frame_ = 0;
+    bool imported_ = false, everImported_ = false;
+    std::chrono::steady_clock::time_point lastTry_;
 };
 #else
 #include <sys/mman.h>

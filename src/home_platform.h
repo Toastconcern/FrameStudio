@@ -142,6 +142,23 @@ inline int run(const std::vector<std::string>& args, int nice, bool wait) {
     CloseHandle(pi.hProcess);
     return static_cast<int>(code);
 }
+// Starts args[0] detached (its own process, no window) and returns its pid, or 0. appKey, when given, is set as
+// STEAMVR_APPKEY for the child so SteamVR takes it as that application (the environment renderer is its own identity).
+inline Pid spawn(const std::vector<std::string>& args, const char* appKey = nullptr) {
+    std::wstring cl = commandLine(args);
+    if (appKey) SetEnvironmentVariableA("STEAMVR_APPKEY", appKey);
+    STARTUPINFOW si = {};
+    si.cb = sizeof si;
+    PROCESS_INFORMATION pi = {};
+    const BOOL ok = CreateProcessW(nullptr, cl.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW | DETACHED_PROCESS, nullptr, nullptr, &si, &pi);
+    if (appKey) SetEnvironmentVariableA("STEAMVR_APPKEY", nullptr);
+    if (!ok) return 0;
+    const Pid pid = pi.dwProcessId;
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    return pid;
+}
+
 // This program again with the same arguments (settings that build the renderer differently, a lost GPU); this one
 // ends. SteamVR knows its home app by its file, so the new one is still the environment.
 [[noreturn]] inline void restartSelf() {

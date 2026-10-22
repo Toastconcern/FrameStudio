@@ -12,6 +12,9 @@
 #include "shader_bake.h"
 #include "spv_reflect.h"
 
+#ifdef _WIN32
+#define VK_USE_PLATFORM_WIN32_KHR       // the Win32 external-memory structs (system mode imports D3D11 textures)
+#endif
 #ifdef FH_USE_VOLK
 #include <volk.h>                       // Windows: Vulkan entry points loaded at runtime (no SDK needed)
 #else
@@ -154,6 +157,15 @@ public:
     uint32_t exportUsage() const;                       // the export images' usage flags (the layer imports them alike)
     uint32_t exportCreateFlags() const;                 // ...and their VkImageCreateFlags (likewise)
     void destroyExportImages(std::vector<ExportImage>& images);
+#ifdef _WIN32
+    // Windows system mode: the compositor (Direct3D 11) owns the shared textures and hands Frame Home their NT
+    // handles (env_share.h). Frame Home imports each as a VkImage, and render() copies the eye frame into
+    // exportImages_[exportSlot] exactly as the Linux copy path does. Set importWin32 before init() so the device is
+    // created with VK_KHR_external_memory_win32.
+    bool importWin32 = false;
+    bool importWin32Images(uint32_t n, const uint64_t handles[], uint32_t width, uint32_t height);
+    const uint8_t* deviceLUID() const { return deviceLUID_; }   // the adapter this device is on (valid after init)
+#endif
     int exportSlot = -1;
     void waitFrame();
     // Frames counted on the GPU (a timeline semaphore, when the device has them): render() signals frameSerial() once
@@ -384,6 +396,10 @@ private:
     void densityTexels(float cx, float cy, std::vector<float>& dens) const;   // two per texel: across, down
     void packDensity(const std::vector<float>& dens, uint8_t* dst) const;   // in the map's format
     std::vector<bool> exportInited_;
+#ifdef _WIN32
+    std::vector<VkDeviceMemory> importMem_;      // importWin32Images: the imported memories, freed on shutdown
+    uint8_t deviceLUID_[8] = {};
+#endif
     VkDescriptorPool descPool_ = VK_NULL_HANDLE;
     // Selection overlay (selection_spirv.h): edges as a line list + faces, solid colour from a 1x1 texture.
     struct Selection {

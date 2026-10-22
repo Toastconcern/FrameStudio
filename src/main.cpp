@@ -962,6 +962,26 @@ int runVr(const std::vector<std::string>& apks, bool system = false) {
         fs::create_directories(rootDir() / "logs", ec);
         if (homeos::reopenStderr(rootDir() / "logs" / "frame-home.log", std::getenv("FH_RESTARTED") ? "a" : "w")) setvbuf(stderr, nullptr, _IOLBF, 0);
     }
+#ifdef _WIN32
+    // The environment renderer runs one at a time (a restarted panel, or a stray second launch, mustn't make a
+    // second renderer fighting over the compositor's textures). A named mutex guards it; a pid file lets the panel
+    // find the running one. Both go when this process ends.
+    struct SystemGuard {
+        HANDLE mutex = nullptr;
+        bool held = false;
+        fs::path pidFile;
+        ~SystemGuard() { if (held) { std::error_code ec; fs::remove(pidFile, ec); } if (mutex) CloseHandle(mutex); }
+    } systemGuard;
+    if (system) {
+        systemGuard.mutex = CreateMutexW(nullptr, TRUE, L"Local\\FrameHomeSystemEnv");
+        if (systemGuard.mutex && GetLastError() == ERROR_ALREADY_EXISTS) { LOG("another frame-home --system is running: this one steps aside"); return 0; }
+        systemGuard.held = true;
+        std::error_code ec;
+        fs::create_directories(rootDir() / "layer", ec);
+        systemGuard.pidFile = rootDir() / "layer" / "system.pid";
+        if (FILE* f = homeos::openFile(systemGuard.pidFile, "w")) { std::fprintf(f, "%lu\n", static_cast<unsigned long>(GetCurrentProcessId())); std::fclose(f); }
+    }
+#endif
     vr::EVRInitError ierr = vr::VRInitError_None;
     vr::VR_Init(&ierr, system ? vr::VRApplication_Overlay : vr::VRApplication_Scene);
     if (ierr != vr::VRInitError_None) { LOG("VR_Init: %s", vr::VR_GetVRInitErrorAsEnglishDescription(ierr)); return 1; }
@@ -996,9 +1016,14 @@ int runVr(const std::vector<std::string>& apks, bool system = false) {
         std::string dext(dn, '\0');
         if (dn) vr::VRCompositor()->GetVulkanDeviceExtensionsRequired(pd, &dext[0], dn);
         r.deviceExtensions = split(dext.c_str());
-        if (system)   // the frames go to the compositor's device as external memory
+        if (system) {   // the frames go to the compositor's device as external memory
+#ifdef _WIN32
+            r.importWin32 = true;   // the renderer adds VK_KHR_external_memory_win32 (the compositor owns the textures)
+#else
             for (const char* e : {"VK_KHR_external_memory", "VK_KHR_external_memory_fd"})
                 if (std::find(r.deviceExtensions.begin(), r.deviceExtensions.end(), e) == r.deviceExtensions.end()) r.deviceExtensions.push_back(e);
+#endif
+        }
         vkDestroyInstance(probe, nullptr);
     }
     r.pipelineCachePath = (rootDir() / "pipelines.bin").string();

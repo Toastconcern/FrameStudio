@@ -60,17 +60,18 @@ build_pc_home() {
     say "building Frame Home for $target's SteamVR"
     "$CMAKE" -S "$ROOT" -B "$dir" -DCMAKE_BUILD_TYPE=Release -DFRAME_HOME_PC=ON "$@" > "$dir.configure.log" 2>&1 || {
         tail -20 "$dir.configure.log"; say "$target: Frame Home configure failed (full log: $dir.configure.log)"; exit 1; }
-    "$CMAKE" --build "$dir" --target frame-home frame-switcher --parallel
+    "$CMAKE" --build "$dir" --target frame-home frame-switcher $([ "$target" = windows-x64 ] && echo d3d11.dll) --parallel
 }
 
-# pc/ beside Studio: Frame Home for this computer's SteamVR and its installer (Studio's Headset tab runs it).
-# Windows: SteamVR's home app (install-frame-home-pc.ps1). Linux: the Steam Frame's way, the compositor layer, with
+# pc/ beside Studio: Frame Home for this computer's SteamVR and its installer (Studio's Headset tab runs it). Both
+# platforms the Steam Frame's way now — the compositor layer draws the home in Aurora's place. Windows: the layer is
+# a proxy d3d11.dll (install-frame-home-pc.ps1 puts it beside SteamVR's compositor). Linux: the Vulkan layer, with
 # the headset's own install.sh.
 stage_pc() {
     target=$1 stage=$2 home="$BUILD/$1-home"
     case "$target" in
         windows-x64) mkdir -p "$stage/pc"
-                     cp "$home/frame-home.exe" "$home/frame-switcher.exe" "$stage/pc/"
+                     cp "$home/frame-home.exe" "$home/frame-switcher.exe" "$home/d3d11.dll" "$stage/pc/"
                      cp "$ROOT/frame/pc/install-frame-home-pc.ps1" "$ROOT/frame/pc/Install Frame Home on this PC.bat" \
                         "$ROOT/frame/pc/Remove Frame Home from this PC.bat" "$stage/pc/" ;;
         linux-x64)   mkdir -p "$stage/pc/bin" "$stage/pc/layer"

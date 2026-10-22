@@ -1551,11 +1551,9 @@ int runPanel() {
     //    game is open. Here the panel makes sure that's on, and that the moments before Frame Home draws (SteamVR
     //    starting, a game quitting) show the home too: SteamVR's background is a 360-degree picture of it
     //    (keepBackground), with the classic environment instead of Aurora.
-#ifdef _WIN32
-    const bool systemEnv = false;
-#else
+    // The compositor layer is installed (the Frame always; a PC once Frame Home is installed there): its folder
+    // (rootDir()/layer) is the marker. The layer draws the home in Aurora's place and frame-home --system renders it.
     const bool systemEnv = fs::exists(rootDir() / "layer");
-#endif
     // (Frame Home uninstalled from a PC: its manifest is gone, and SteamVR's settings are left as the uninstall put them)
     const bool homeInstalled = systemEnv || fs::exists(rootDir() / "frame-home.vrmanifest");
     if (!systemEnv && homeInstalled) {
@@ -1578,9 +1576,12 @@ int runPanel() {
     }
     if (systemEnv) {   // its own SteamVR identity (hidden: no list, no dock), so its controller bindings are its own
         const fs::path m = rootDir() / "frame-environment.vrmanifest";
+        const std::string lin = (rootDir() / "bin" / "frame-home").string();
+        std::string win = (rootDir() / "bin" / "frame-home.exe").string();
+        for (size_t i = 0; (i = win.find('\\', i)) != std::string::npos; i += 2) win.replace(i, 1, "\\\\");   // JSON-escape the backslashes
         std::ofstream(m) << "{\n  \"source\": \"builtin\",\n  \"applications\": [ {\n    \"app_key\": \"framehome.environment\",\n"
-                            "    \"launch_type\": \"binary\",\n    \"binary_path_linux\": \"" << (rootDir() / "bin" / "frame-home").string() << "\",\n"
-                            "    \"binary_path_linux_arm\": \"" << (rootDir() / "bin" / "frame-home").string() << "\",\n    \"arguments\": \"--system\",\n"
+                            "    \"launch_type\": \"binary\",\n    \"binary_path_linux\": \"" << lin << "\",\n"
+                            "    \"binary_path_linux_arm\": \"" << lin << "\",\n    \"binary_path_windows\": \"" << win << "\",\n    \"arguments\": \"--system\",\n"
                             "    \"is_dashboard_overlay\": true,\n    \"is_hidden\": true,\n"
                             "    \"strings\": { \"en_us\": { \"name\": \"Frame Home\", \"description\": \"The environment\" } }\n  } ]\n}\n";
         const vr::EVRApplicationError ae = vr::VRApplications()->AddApplicationManifest(fs::absolute(m).u8string().c_str(), false);
@@ -1632,7 +1633,20 @@ int runPanel() {
         }
         if (pid > 0) { systemPid = pid; LOG("started frame-home --system (pid %d)", static_cast<int>(pid)); }
 #else
-        (void)now;
+        // Windows: the panel starts frame-home --system itself and keeps it alive. A pid file (written by the
+        // renderer, one at a time behind a named mutex) lets a restarted panel find the one already running.
+        std::error_code ec;
+        if (systemPid > 0 && homeos::alive(systemPid)) return;
+        if (fs::exists(rootDir() / "layer" / "off", ec)) return;
+        {
+            std::ifstream in(rootDir() / "layer" / "system.pid");
+            long p = 0;
+            if (in >> p && p > 0 && homeos::alive(static_cast<homeos::Pid>(p))) { systemPid = static_cast<homeos::Pid>(p); adopted = true; return; }
+        }
+        if (now - lastSpawn < std::chrono::seconds(5)) return;   // a crash loop doesn't spin
+        lastSpawn = now;
+        systemPid = homeos::spawn({(rootDir() / "bin" / "frame-home.exe").string(), "--system"}, "framehome.environment");
+        if (systemPid > 0) LOG("started frame-home --system (pid %lu)", static_cast<unsigned long>(systemPid));
 #endif
     };
     // The panel's pixels go to SteamVR in Vulkan images of our own (overlay_texture.h): SetOverlayRaw recreated the

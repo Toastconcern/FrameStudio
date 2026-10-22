@@ -46,17 +46,14 @@ namespace {
 
 // ── process / files ──────────────────────────────────────────────────────────────────────────────
 
-bool isCompositor() {
-    static int v = -1;
-    if (v < 0) {
-        wchar_t path[MAX_PATH] = {};
-        GetModuleFileNameW(nullptr, path, MAX_PATH);
-        const wchar_t* base = wcsrchr(path, L'\\');
-        base = base ? base + 1 : path;
-        v = _wcsicmp(base, L"vrcompositor.exe") == 0;
-    }
-    return v == 1;
+bool processIs(const wchar_t* exe) {
+    wchar_t path[MAX_PATH] = {};
+    GetModuleFileNameW(nullptr, path, MAX_PATH);
+    const wchar_t* base = wcsrchr(path, L'\\');
+    return _wcsicmp(base ? base + 1 : path, exe) == 0;
 }
+bool isCompositor() { static const int v = processIs(L"vrcompositor.exe"); return v; }
+bool isVrServer() { static const int v = processIs(L"vrserver.exe"); return v; }
 
 // %LOCALAPPDATA%\Frame Home (home_platform.h's root() on Windows), where the logs live.
 fs::path dir() {
@@ -79,6 +76,24 @@ void logf(const char* fmt, ...) {
     fs::create_directories(dir() / "logs", ec);
     FILE* f = nullptr;
     if (_wfopen_s(&f, (dir() / "logs" / "frame-layer.log").wstring().c_str(), L"a") || !f) return;
+    SYSTEMTIME t;
+    GetLocalTime(&t);
+    std::fprintf(f, "%02d:%02d:%02d ", t.wHour, t.wMinute, t.wSecond);
+    va_list ap;
+    va_start(ap, fmt);
+    std::vfprintf(f, fmt, ap);
+    va_end(ap);
+    std::fputc('\n', f);
+    std::fclose(f);
+}
+
+bool g_diagnostic = false;   // this process (vrserver) only watches what the streaming driver draws; it replaces nothing
+void probef(const char* fmt, ...) {
+    std::lock_guard<std::mutex> l(g_logMutex);
+    std::error_code ec;
+    fs::create_directories(dir() / "logs", ec);
+    FILE* f = nullptr;
+    if (_wfopen_s(&f, (dir() / "logs" / "frame-d3d-probe.log").wstring().c_str(), L"a") || !f) return;
     SYSTEMTIME t;
     GetLocalTime(&t);
     std::fprintf(f, "%02d:%02d:%02d ", t.wHour, t.wMinute, t.wSecond);
@@ -145,6 +160,8 @@ std::mutex g_shaderMutex, g_texMutex;
 std::atomic<bool> g_off{false};
 std::atomic<bool> g_connected{false};
 std::atomic<uint64_t> g_replaced{0}, g_skipped{0};     // draws swapped for the home / left undrawn (a diagnostic)
+std::atomic<uint64_t> g_drawsHere{0}, g_drawsOther{0}; // every draw on a hooked context (any shader), for diagnosis
+std::atomic<int> g_deviceCount{0}, g_deferredCount{0}; // distinct devices / deferred contexts the compositor made
 
 envshare::State* g_state = nullptr;                    // Frame Home's shared State (it owns it; we map its handle)
 HANDLE g_stateMap = nullptr;
@@ -333,6 +350,7 @@ using PFN_DrawInstanced = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT, U
 using PFN_DrawIndexedInstanced = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT, UINT, UINT, INT, UINT);
 
 PFN_CreatePixelShader g_realCreatePixelShader = nullptr;
+PFN_CreatePixelShader g_serverRealCreatePixelShader = nullptr;   // vrserver probe (diagnostic)
 PFN_CreateDeferredContext g_realCreateDeferredContext = nullptr;
 PFN_CreateDeferredContext1 g_realCreateDeferredContext1 = nullptr;
 
@@ -365,6 +383,27 @@ HRESULT STDMETHODCALLTYPE CreatePixelShader_hook(ID3D11Device* dev, const void* 
         std::lock_guard<std::mutex> l(g_shaderMutex);
         if (auto it = g_shaderKinds.find(h); it != g_shaderKinds.end()) g_psKind[*out] = it->second;
         if (auto it = g_shaderName.find(h); it != g_shaderName.end()) g_psName[*out] = it->second;
+        static std::unordered_set<void*> devices;    // how many distinct devices the compositor makes shaders on
+        if (devices.insert(dev).second) { g_deviceCount.store(static_cast<int>(devices.size())); logf("pixel shader created on device %p (%s)%s", (void*)dev, dev == g_device ? "ours" : "another", g_device ? "" : " [before wrap]"); }
+    }
+    return hr;
+}
+
+// vrserver probe: log whether the streaming driver creates the environment's own pixel shaders here.
+HRESULT STDMETHODCALLTYPE CreatePixelShaderProbe_hook(ID3D11Device* dev, const void* code, SIZE_T len, ID3D11ClassLinkage* link, ID3D11PixelShader** out) {
+    const HRESULT hr = g_serverRealCreatePixelShader(dev, code, len, link, out);
+    if (SUCCEEDED(hr) && code && len) {
+        static std::atomic<int> total{0};
+        total.fetch_add(1);
+        const uint64_t h = fnv(code, len);
+        auto it = g_shaderName.find(h);
+        if (it != g_shaderName.end()) {
+            static std::unordered_set<std::string> seen;
+            static std::mutex m;
+            std::lock_guard<std::mutex> l(m);
+            if (seen.insert(it->second).second) probef("vrserver creates %s%s", it->second.c_str(), g_shaderKinds.count(h) ? "  <-- AN ENVIRONMENT SHADER (home could be drawn here)" : "");
+        }
+        if (total.load() == 1 || total.load() == 300) probef("vrserver has created %d pixel shaders", total.load());
     }
     return hr;
 }
@@ -431,6 +470,7 @@ struct HomeBind {
 // The texture lock is held across a replaced draw so the pipe thread can't free the texture under it.
 template <typename Draw>
 void replaceDraw(ID3D11DeviceContext* ctx, CtxHooks* h, Draw&& draw) {
+    (ctx == g_context ? g_drawsHere : g_drawsOther).fetch_add(1, std::memory_order_relaxed);   // every draw we see
     noteDraw(ctx);                                   // diagnostic: what the compositor draws, and on which context
     ID3D11PixelShader* bound = nullptr;
     const Kind k = classify(ctx, bound);
@@ -515,12 +555,12 @@ void hookContext(ID3D11DeviceContext* ctx) {
 
 HRESULT STDMETHODCALLTYPE CreateDeferredContext_hook(ID3D11Device* dev, UINT flags, ID3D11DeviceContext** out) {
     const HRESULT hr = g_realCreateDeferredContext(dev, flags, out);
-    if (SUCCEEDED(hr) && out && *out && dev == g_device) hookContext(*out);
+    if (SUCCEEDED(hr) && out && *out) { g_deferredCount.fetch_add(1); logf("CreateDeferredContext: device %p (%s)", (void*)dev, dev == g_device ? "ours" : "another"); if (dev == g_device) hookContext(*out); }
     return hr;
 }
 HRESULT STDMETHODCALLTYPE CreateDeferredContext1_hook(ID3D11Device1* dev, UINT flags, ID3D11DeviceContext1** out) {
     const HRESULT hr = g_realCreateDeferredContext1(dev, flags, out);
-    if (SUCCEEDED(hr) && out && *out && reinterpret_cast<ID3D11Device*>(dev) == g_device) hookContext(*out);
+    if (SUCCEEDED(hr) && out && *out) { g_deferredCount.fetch_add(1); logf("CreateDeferredContext1: device %p (%s)", (void*)dev, reinterpret_cast<ID3D11Device*>(dev) == g_device ? "ours" : "another"); if (reinterpret_cast<ID3D11Device*>(dev) == g_device) hookContext(*out); }
     return hr;
 }
 
@@ -662,10 +702,12 @@ void watchOff() {
         // A heartbeat (every 5 s) of what the layer is doing, for testing without a headset to look through.
         if (++sec % 5 == 0) {
             const uint64_t r = g_replaced.exchange(0), s = g_skipped.exchange(0);
+            const uint64_t dh = g_drawsHere.exchange(0), dohter = g_drawsOther.exchange(0);
             size_t here, other;
             { std::lock_guard<std::mutex> l(g_shaderMutex); here = g_seenHere.size(); other = g_seenOther.size(); }
-            logf("heartbeat: home over %llu aurora draws, %llu undrawn (5 s); distinct shaders drawn here=%zu other=%zu; connected=%d",
-                 (unsigned long long)r, (unsigned long long)s, here, other, g_connected.load() ? 1 : 0);
+            logf("heartbeat: replaced %llu, skipped %llu; draws seen here=%llu other=%llu (5 s); named shaders here=%zu other=%zu; devices=%d deferred=%d hookedCtx=%d; connected=%d",
+                 (unsigned long long)r, (unsigned long long)s, (unsigned long long)dh, (unsigned long long)dohter, here, other,
+                 g_deviceCount.load(), g_deferredCount.load(), g_ctxHookCount.load(), g_connected.load() ? 1 : 0);
         }
     }
 }
@@ -722,6 +764,18 @@ extern "C" HRESULT WINAPI D3D11CreateDevice(   // exported by layer/d3d11_proxy.
         ID3D11DeviceContext* immediate = nullptr;
         (*device)->GetImmediateContext(&immediate);      // +1 ref, kept by wrap()
         if (immediate) wrap(*device, immediate);
+    }
+    // Probe: the Steam Frame streams, and its home may be rendered by the vrlink driver in vrserver, not the
+    // compositor. In vrserver, hook CreatePixelShader to see whether the environment's own shaders are made there
+    // (if so, that's where to draw the home for a streamed headset). Diagnostic only — nothing is replaced here.
+    if (SUCCEEDED(hr) && isVrServer() && device && *device) {
+        static std::once_flag once;
+        std::call_once(once, [&] {
+            g_diagnostic = true;
+            scanAuroraShaders();
+            hookSlot(*device, 15, reinterpret_cast<void*>(CreatePixelShaderProbe_hook), &g_serverRealCreatePixelShader);
+            probef("vrserver: watching for the environment's shaders (%zu aurora shaders known)", g_shaderKinds.size());
+        });
     }
     return hr;
 }

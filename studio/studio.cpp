@@ -1853,33 +1853,36 @@ struct Studio {
         ImGui::SetCursorScreenPos(a);
         const bool clicked = ImGui::InvisibleButton(id, ImVec2(w, h));
         const bool hov = ImGui::IsItemHovered(), held = ImGui::IsItemActive();
-        dl->AddRectFilled(a, b, col(held ? 0x33363c : hov ? 0x34373d : 0x2a2c30), 8 * scale);
-        dl->AddRect(a, b, col(hov ? kBlue : kLine, hov ? 0.85f : 0.6f), 8 * scale, 0, 1.0f);
-        // The tile: green for a Frame environment, blue for a Meta home, violet for models, grey when a file is gone.
+        const float round = 9 * scale;
+        dl->AddRectFilled(a, b, col(held ? kWidgetActive : hov ? kWidgetHover : kPanel), round);
+        dl->AddRect(a, b, col(hov ? kBlue : kLine, hov ? 0.9f : 1.0f), round, 0, (hov ? 1.5f : 1.0f) * scale);
+        // The tile: a solid chip with the kind's initial \u2014 green for a Frame environment, blue for a Meta home, violet
+        // for models, grey when a file is gone. Fixed hues so the chip reads on any theme (light and dark alike).
         const bool missing = info.kind.find("missing") != std::string::npos;
         const bool env = info.kind.rfind("Frame environment", 0) == 0, models = info.kind.rfind("Models", 0) == 0;
-        const uint32_t tint = missing ? 0x6b6f76 : env ? 0x3f9a5c : models ? 0x8a63d2 : 0x3f7bd6;
+        const uint32_t tint = env ? 0x3f9a5c : models ? 0x8a63d2 : 0x3f7bd6;
         const char* letter = env ? "E" : models ? "M" : "H";
         const float t = h - 16 * scale;
-        const ImVec2 t0(a.x + 8 * scale, a.y + 8 * scale), t1(t0.x + t, t0.y + t);
-        dl->AddRectFilled(t0, t1, col(tint, 0.22f), 6 * scale);
+        const ImVec2 t0(a.x + 10 * scale, a.y + 8 * scale), t1(t0.x + t, t0.y + t);
+        dl->AddRectFilled(t0, t1, missing ? col(kDim, 0.22f) : col(tint, 0.95f), 7 * scale);
         ImFont* bf = fontOr(g_fontBold);
         const ImVec2 ls = bf->CalcTextSizeA(bf->FontSize, FLT_MAX, 0, letter);
-        dl->AddText(bf, bf->FontSize, ImVec2((t0.x + t1.x - ls.x) * 0.5f, (t0.y + t1.y - ls.y) * 0.5f), col(tint == 0x6b6f76 ? kDim : 0xffffff, 0.9f), letter);
-        const float tx = t1.x + 12 * scale, lh = ImGui::GetTextLineHeight();
+        dl->AddText(bf, bf->FontSize, ImVec2((t0.x + t1.x - ls.x) * 0.5f, (t0.y + t1.y - ls.y) * 0.5f), missing ? col(kText, 0.45f) : col(0xffffff, 0.95f), letter);
+        const float tx = t1.x + 14 * scale, lh = ImGui::GetTextLineHeight();
         const float ty = a.y + (h - 2 * lh - 2 * scale) * 0.5f;
         dl->PushClipRect(a, ImVec2(b.x - 28 * scale, b.y), true);
         dl->AddText(ImVec2(tx, ty), col(missing ? kDim : kText), info.title.c_str());
         dl->AddText(ImVec2(tx, ty + lh + 2 * scale), col(kDim), info.kind.c_str());
         dl->PopClipRect();
-        if (hov) dl->AddText(ImVec2(b.x - 22 * scale, a.y + (h - lh) * 0.5f), col(kDim), "\u203a");
+        if (hov) dl->AddText(ImVec2(b.x - 22 * scale, a.y + (h - lh) * 0.5f), col(kBlue), "\u203a");
         return clicked;
     }
 
     void startScreen() {
-        // A quieter backdrop than the 3D view's grey, so the cards read as the screen's content.
+        // A quieter backdrop than the 3D view's grey, so the cards read as the screen's content (themed: the base
+        // background, with the cards a step lighter on top of it).
         ImDrawList* dl = ImGui::GetWindowDrawList();
-        dl->AddRectFilled(viewPos, ImVec2(viewPos.x + viewSize.x, viewPos.y + viewSize.y), col(0x25272b));
+        dl->AddRectFilled(viewPos, ImVec2(viewPos.x + viewSize.x, viewPos.y + viewSize.y), col(kBar));
         const float w = std::min(viewSize.x - 80 * scale, 720 * scale), x0 = viewPos.x + (viewSize.x - w) * 0.5f;
         float y = viewPos.y + std::max(36 * scale, viewSize.y * 0.10f);
         ImFont* tf = fontOr(g_fontTitle);
@@ -1918,7 +1921,7 @@ struct Studio {
             static auto listed = std::chrono::steady_clock::time_point();
             if (std::chrono::steady_clock::now() - listed > std::chrono::seconds(2)) { mine = libraryEnvs(); listed = std::chrono::steady_clock::now(); }
             if (mine.empty()) {
-                dl->AddText(ImVec2(x0, y), col(0x6b6f76), "Nothing yet. Open a home, make it yours, and Save (Ctrl+S): it's kept here.");
+                dl->AddText(ImVec2(x0, y), col(kDim), "Nothing yet. Open a home, make it yours, and Save (Ctrl+S): it's kept here.");
                 y += ImGui::GetTextLineHeight() + 22 * scale;
             }
             for (size_t r = 0; r < mine.size() && r < 6; ++r) {
@@ -1936,7 +1939,7 @@ struct Studio {
         listTitle("RECENT");
         y += ImGui::GetTextLineHeight() + 10 * scale;
         if (recent.empty()) {
-            dl->AddText(ImVec2(x0, y), col(0x6b6f76), "Nothing yet. Homes and environments you open show up here.");
+            dl->AddText(ImVec2(x0, y), col(kDim), "Nothing yet. Homes and environments you open show up here.");
             return;
         }
         for (size_t r = 0; r < recent.size(); ++r) {

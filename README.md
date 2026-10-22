@@ -66,6 +66,8 @@ very largest homes may not fit.
 - Packs several environments into one `.fbundle` to share or install together ([bundles](docs/bundles.md)).
 - Debug views (wireframe, meshes, GPU cost, overdraw), a home report, and the headset's settings and debug page
   from your desk.
+- A navigation gizmo in the viewport corner: drag it to orbit, click an axis to snap to that view.
+- Themes, from dark to light, drawn from the MetaDB palette (**Window > Theme**).
 
 ## Guides
 

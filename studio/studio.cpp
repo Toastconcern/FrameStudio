@@ -4907,10 +4907,12 @@ struct Studio {
             const ImVec2 p = ImGui::GetCursorScreenPos();
             if (ImGui::InvisibleButton("##tab", ImVec2(side, side))) inspectorTab = t.tab;
             const bool on = inspectorTab == t.tab, hot = ImGui::IsItemHovered();
-            if (on) dl->AddRectFilled(ImVec2(p.x - 3 * scale, p.y), ImVec2(p.x + side + (colW - side) * 0.5f + 1, p.y + side), col(kPanel), 5 * scale,
-                                      ImDrawFlags_RoundCornersLeft);
-            else if (hot) dl->AddRectFilled(p, ImVec2(p.x + side, p.y + side), col(kWidget), 5 * scale);
-            drawToolIcon(dl, t.icon, ImVec2(p.x + side * 0.5f, p.y + side * 0.5f), side * 0.6f, col(on ? 0xffffff : 0xb0b0b0));
+            if (on) {
+                dl->AddRectFilled(ImVec2(p.x - 3 * scale, p.y), ImVec2(p.x + side + (colW - side) * 0.5f + 1, p.y + side), col(kPanel), 5 * scale,
+                                  ImDrawFlags_RoundCornersLeft);
+                dl->AddRectFilled(ImVec2(p.x - 3 * scale, p.y + 3 * scale), ImVec2(p.x - 3 * scale + 2.5f * scale, p.y + side - 3 * scale), col(kBlue), 1);   // accent: which tab is open
+            } else if (hot) dl->AddRectFilled(p, ImVec2(p.x + side, p.y + side), col(kWidget), 5 * scale);
+            drawToolIcon(dl, t.icon, ImVec2(p.x + side * 0.5f, p.y + side * 0.5f), side * 0.6f, col(on ? kText : hot ? kText : kDim));
             if (hot) ImGui::SetTooltip("%s", t.tip);
             ImGui::PopID();
             ImGui::SetCursorPosX((colW - side) * 0.5f);
@@ -6777,7 +6779,12 @@ struct Studio {
             if (ImGui::MenuItem("The Home's Meshes", nullptr, showMeshes)) { showMeshes = !showMeshes; refreshVisibility(); }
             ImGui::EndPopup();
         }
-        ImGui::SameLine(0, 8 * scale);
+        {   // a divider: the overlay toggle is one thing, the shading modes another
+            ImGui::SameLine(0, 7 * scale);
+            const ImVec2 p = ImGui::GetCursorScreenPos();
+            ImGui::GetWindowDrawList()->AddLine(ImVec2(p.x, p.y + 4 * scale), ImVec2(p.x, p.y + fh - 4 * scale), col(kLine));
+            ImGui::SameLine(0, 7 * scale);
+        }
         // Blender's shading spheres: wire, solid, material
         auto sphere = [&](ImDrawList* d, ImVec2 c, float r, int kind) {
             if (kind == 0) {

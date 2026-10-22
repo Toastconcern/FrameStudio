@@ -46,6 +46,9 @@ Layout** puts everything back; **Ctrl+Space** fills the window with the 3D Viewp
 (a big view with Properties on the World tab) and **Headset** (Properties on the Headset tab). Studio remembers
 your layout between runs.
 
+**Themes.** **Window > Theme** recolours the whole interface, from dark to light, using the palette from the MetaDB
+site. The choice is saved and comes back next time.
+
 ## Opening a home
 
 - **File > Open...** (Ctrl+O), or drop a file on the window. It opens:
@@ -61,7 +64,8 @@ your layout between runs.
 
 | Do this | With |
 |---|---|
-| Orbit | middle-drag, or Alt + left-drag |
+| Orbit | middle-drag, Alt + left-drag, or drag the axes gizmo in the top-right corner |
+| Snap to a view (top, front, side...) | click an axis ball on the gizmo (or the Numpad: 1/3/7 front/side/top, Ctrl for the opposite) |
 | Pan | Shift + middle-drag |
 | Zoom | mouse wheel, or Ctrl + middle-drag |
 | Fly | hold the right mouse button + W A S D, Q / E down / up (wheel: speed, Shift: 4x) |

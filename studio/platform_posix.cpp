@@ -183,6 +183,17 @@ int run(const std::string& commandLine, const fs::path& workingDir, std::string&
 }
 
 std::string sshTool(const char* name) { return std::string(name) + " "; }
+std::string systemTool(const char* name) { return std::string(name) + " "; }
+
+bool launch(const fs::path& program) {
+#ifdef __APPLE__
+    const std::string cmd = "open -n " + shellQuote(program.string()) + " >/dev/null 2>&1";
+#else   // (its own output away from run's pipe, or run would wait for it to end)
+    const std::string cmd = "cd " + shellQuote(program.parent_path().string()) + " && nohup " + shellQuote(program.string()) + " >/dev/null 2>&1 &";
+#endif
+    std::string out;
+    return run(cmd, {}, out) == 0;
+}
 
 void openPath(const std::string& pathOrUrl) {
 #ifdef __APPLE__

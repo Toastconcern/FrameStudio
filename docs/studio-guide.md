@@ -180,6 +180,16 @@ The **Headset** tab (or the **Headset** menu):
   (show only the selection) and **Show Everything**.
 - **Edit > Menu Search...** (F3): find any command by typing part of its name.
 
+## Updates
+
+Studio checks GitHub for a newer **Latest build** a few seconds after it starts and every 6 hours after that. When
+there is one, an orange **Update Available** button shows in the top bar. Click it, then **Download and Install**:
+Studio downloads the build for your computer and puts it in place of the copy you're running. **Restart Now** opens
+the new one (it asks about unsaved changes first). **Help > Check for Updates...** checks right away.
+
+If Studio's folder can't be written to (Program Files, for example), nothing is changed and the window offers the
+download page instead. A copy you built yourself doesn't update itself.
+
 ## Keyboard shortcuts
 
 | Key | Does | Key | Does |

@@ -11,6 +11,11 @@ if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release)
 endif()
 
+# The build's identity for updates (studio/updater.h): the commit CI built ($FRAME_BUILD); empty for a local build,
+# which never updates itself.
+set(FRAME_BUILD "$ENV{FRAME_BUILD}")
+add_compile_definitions(FRAME_BUILD="${FRAME_BUILD}")
+
 set(ROOT "${CMAKE_CURRENT_SOURCE_DIR}/..")
 set(TP "${ROOT}/third_party")
 

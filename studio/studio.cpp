@@ -27,6 +27,7 @@
 #include "world_runtime.h"
 #include "frame_pacer.h"
 #include "platform.h"
+#include "updater.h"
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #define STBI_WRITE_NO_STDIO
 #include "stb_image_write.h"
@@ -665,6 +666,10 @@ struct Studio {
     int undoGroup = 0, nextUndoGroup = 1;   // pushUndo tags steps with undoGroup while a batch is open
     std::vector<std::vector<std::string>> recent;   // File > Open Recent: each entry footprint [+ vista]
     bool showControls = false;              // Help > Controls
+    updater::Updater updates;               // Frame Studio's own updates (studio/updater.h)
+    bool showUpdate = false;                // the update window (Help > Check for Updates, or the top bar's button)
+    bool restartAfterClose = false;         // "Restart": start the updated copy once this one has closed
+    std::chrono::steady_clock::time_point nextUpdateCheck = std::chrono::steady_clock::now() + std::chrono::seconds(5);
     bool testing = false;                   // --selftest: leave the recent list and edits alone
     struct TestEye { ImVec2 at; std::vector<size_t> members; };
     std::vector<TestEye> testEyes;          // --selftest: the explorer's eye buttons this frame (folders and rows)
@@ -6403,6 +6408,8 @@ struct Studio {
         if (ImGui::BeginMenu("Help")) {
             if (ImGui::MenuItem("Controls", "F1", showControls)) showControls = !showControls;
             if (ImGui::MenuItem("Menu Search", "F3")) openSearch();
+            ImGui::Separator();
+            if (ImGui::MenuItem("Check for Updates…")) { showUpdate = true; updates.check(); }
             ImGui::EndMenu();
         }
         // The workspace tabs: the active one raised like Blender's
@@ -6422,6 +6429,17 @@ struct Studio {
             if (on || hot) dl->AddRectFilled(a, b, col(on ? kPanel : kHeader), 4 * scale);
             dl->AddText(ImVec2(a.x + (bw - ts.x) * 0.5f, a.y + (bh - ts.y) * 0.5f), col(on ? 0xffffff : kDim), kWorkspaceName[w]);
             ImGui::SameLine(0, 2 * scale);
+        }
+        const updater::State us = updates.state();
+        if (us == updater::State::Available || us == updater::State::Installing || us == updater::State::Ready) {
+            ImGui::Dummy(ImVec2(10 * scale, 0));
+            ImGui::SameLine(0, 0);
+            ImGui::PushStyleColor(ImGuiCol_Button, hex(kOrange));
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, hex(kOrange));
+            ImGui::PushStyleColor(ImGuiCol_Text, hex(0xffffff));
+            const char* label = us == updater::State::Ready ? "Restart to Update###upd" : us == updater::State::Installing ? "Updating…###upd" : "Update Available###upd";
+            if (ImGui::SmallButton(label)) showUpdate = true;
+            ImGui::PopStyleColor(3);
         }
         if (scene) {   // the open home's name, at the right end as Blender shows its scene
             const std::string name = shownName() + (dirty ? " *" : "");
@@ -7354,6 +7372,7 @@ struct Studio {
         addPopup();
         searchPopup();
         controlsWindow();
+        updateWindow();
         settingsWindow();
         reportWindow();
         headsetDebugWindow();
@@ -7972,6 +7991,49 @@ struct Studio {
             }
             ImGui::EndTable();
         }
+        ImGui::End();
+    }
+
+    // Updates: checked a few seconds after start and every 6 hours (Help > Check for Updates any time); the top bar
+    // shows a button when there is one. Installing happens only when asked, here.
+    void updateWindow() {
+        const auto now = std::chrono::steady_clock::now();
+        if (!testing && !g_selfTestRun && updater::Updater::canUpdate() && now >= nextUpdateCheck) {
+            nextUpdateCheck = now + std::chrono::hours(6);
+            updates.check();
+        }
+        if (!showUpdate) return;
+        ImGui::SetNextWindowSize(ImVec2(380 * scale, 0), ImGuiCond_Appearing);
+        ImGui::SetNextWindowPos(ImVec2(ImGui::GetIO().DisplaySize.x * 0.5f, ImGui::GetIO().DisplaySize.y * 0.4f), ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+        if (!ImGui::Begin("Frame Studio Updates", &showUpdate, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoDocking)) { ImGui::End(); return; }
+        ImGui::PushTextWrapPos(360 * scale);
+        if (!updater::Updater::canUpdate()) {
+            ImGui::TextUnformatted("This copy of Frame Studio was built on this computer, not downloaded from GitHub, so it doesn't update itself.");
+            if (ImGui::Button("Open the Downloads Page")) platform::openPath(updater::kPageUrl);
+            ImGui::PopTextWrapPos();
+            ImGui::End();
+            return;
+        }
+        const updater::State s = updates.state();
+        ImGui::TextUnformatted(updates.text().c_str());
+        ImGui::TextDisabled("This build: %.7s", updater::kBuild);
+        ImGui::Spacing();
+        if (s == updater::State::Available) {
+            if (ImGui::Button("Download and Install")) updates.install();
+            ImGui::SameLine();
+            if (ImGui::Button("Later")) showUpdate = false;
+        } else if (s == updater::State::Ready) {
+            if (ImGui::Button("Restart Now")) { restartAfterClose = true; if (window.requestClose) window.requestClose(); }
+            ImGui::SameLine();
+            if (ImGui::Button("Later")) showUpdate = false;
+        } else if (s == updater::State::Failed) {
+            if (ImGui::Button("Try Again")) updates.check();
+            ImGui::SameLine();
+            if (ImGui::Button("Open the Downloads Page")) platform::openPath(updater::kPageUrl);
+        } else if (s == updater::State::Current) {
+            if (ImGui::Button("Check Again")) updates.check();
+        }
+        ImGui::PopTextWrapPos();
         ImGui::End();
     }
 };
@@ -9416,6 +9478,7 @@ int runStudio(StudioWindow& window, const std::vector<std::string>& args) {
     const float scale = window.uiScale();
     platform::setDialogOwner(window.nativeHandle());
     g_selfTestRun = !args.empty() && args[0] == "--selftest";   // (before anything saves)
+    updater::cleanUp();                                          // what the last update set aside
     auto app = std::make_unique<Studio>();
     g_app = app.get();
     app->window = window.hooks();
@@ -9598,6 +9661,8 @@ int runStudio(StudioWindow& window, const std::vector<std::string>& args) {
     vkDeviceWaitIdle(r.device());
     window.stopHangWatchdog();
     if (app->saver.joinable()) app->saver.join();
+    if (app->restartAfterClose && !platform::launch(updater::updatedProgram()))   // Help > updates: Restart Now
+        platform::message("Frame Studio", "The updated Frame Studio didn't start. Open it again from its folder.", platform::Icon::Warning);
     if (app->loadState == 1 || app->loadAbandoned) {   // a home still being read: nothing to lose, and waiting for it is what stalls
         std::fflush(stderr);
         std::_Exit(0);

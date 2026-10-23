@@ -115,8 +115,27 @@ std::string sshTool(const char* name) {
     return std::string(name) + " ";
 }
 
+std::string systemTool(const char* name) {
+    wchar_t sys[MAX_PATH] = {};
+    GetSystemDirectoryW(sys, MAX_PATH);
+    const fs::path p = fs::path(sys) / (widen(name) + L".exe");
+    std::error_code ec;
+    return fs::exists(p, ec) ? "\"" + narrow(p.wstring()) + "\" " : std::string(name) + " ";
+}
+
 void openPath(const std::string& pathOrUrl) {
     ShellExecuteW(nullptr, L"open", widen(pathOrUrl).c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+}
+
+bool launch(const fs::path& program) {
+    std::wstring cmd = L"\"" + program.wstring() + L"\"";
+    const std::wstring dir = program.parent_path().wstring();
+    STARTUPINFOW si = {sizeof si};
+    PROCESS_INFORMATION pi = {};
+    if (!CreateProcessW(program.c_str(), cmd.data(), nullptr, nullptr, FALSE, 0, nullptr, dir.c_str(), &si, &pi)) return false;
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+    return true;
 }
 
 void setDialogOwner(void* nativeWindow) { g_owner = static_cast<HWND>(nativeWindow); }

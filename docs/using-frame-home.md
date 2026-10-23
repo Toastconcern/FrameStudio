@@ -47,7 +47,17 @@ Over SSH (`ssh frame`) you can do the same with the panel's program:
 ~/frame-home/bin/frame-switcher --list          # the environments; the current one is marked with *
 ~/frame-home/bin/frame-switcher --set 3         # switch, by number from --list or by file name
 ~/frame-home/bin/frame-switcher --delete NAME   # delete one, like the panel's delete button
+~/frame-home/bin/frame-switcher --check-update  # is there a newer Frame Home on GitHub?
+~/frame-home/bin/frame-switcher --update        # download and install it now
 ```
+
+### Updates
+
+The panel checks GitHub for a newer Frame Home a minute after it starts and every 6 hours after that. When there is
+one, **Update Frame Home** shows at the top of the panel, beside **Restart Frame Home**. Click it: the headset
+downloads the new version and installs it, and Frame Home and the panel restart a few seconds later with
+"Frame Home is updated". Your environments and settings stay as they are. If it can't finish, the panel says why;
+`~/frame-home/logs/update.log` has the details.
 
 ## Adding environments
 

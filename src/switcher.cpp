@@ -12,6 +12,8 @@
 //   frame-switcher --thumbs        render missing thumbnails (frame-home --snapshot, from the spawn)
 //   frame-switcher --delete NAME   delete an environment (like the panel's delete button; NAME as for --set)
 //   frame-switcher --unpack-bundles   unpack the bundles (.fbundle) in envs now (the panel does it by itself)
+//   frame-switcher --check-update  is there a newer Frame Home on GitHub? (exit 10: yes)
+//   frame-switcher --update        download it and install it now (the panel's Update Frame Home)
 //   frame-switcher --test-delete DIR   self-check of deleting, in a fake root made in DIR (must not exist yet)
 #include "fenv.h"
 #include "fenv_bundle.h"
@@ -26,6 +28,9 @@
 #include "stb_truetype.h"
 
 #include <csignal>
+#ifndef _WIN32
+#include <sys/wait.h>
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -37,6 +42,7 @@
 #include <filesystem>
 #include <fstream>
 #include <map>
+#include <mutex>
 #include <set>
 #include <sstream>
 #include <string>
@@ -701,6 +707,146 @@ DebugInfo readDebugInfo() {
     return d;
 }
 
+// ── Updates (the Steam Frame only) ──
+// Frame Home updates from GitHub. The release "latest" carries latest.json, whose "home" is a hash of the headset
+// programs (frame-home, frame-switcher, fenv-tool and the compositor layer, worked out by CI from frame/payload). When
+// it isn't the hash of what's installed here, the header offers Update Frame Home: that downloads
+// FrameHome-installer.zip and runs its install.sh, which puts the new programs in place and restarts Frame Home and
+// this panel. Checked a minute after the panel starts, then every 6 hours (30 minutes after a failed check).
+#if defined(__linux__) && defined(__aarch64__)
+constexpr bool kSelfUpdate = true;
+#else
+constexpr bool kSelfUpdate = false;   // a PC gets Frame Home from Frame Studio
+#endif
+constexpr const char* kReleaseUrl = "https://github.com/Toastconcern/FrameStudio/releases/download/latest/";
+// Where latest.json and the installer are (FH_UPDATE_URL: another place, ending in "/", for testing an update).
+std::string releaseUrl() {
+    const char* u = std::getenv("FH_UPDATE_URL");
+    return u && *u ? std::string(u) : std::string(kReleaseUrl);
+}
+
+struct Updates {
+    enum class State { Idle, Available, Updating, Failed };
+    std::mutex m;
+    State state = State::Idle;
+    std::string error;                  // Failed: why (shown once as a toast)
+    std::atomic<bool> busy{false};      // a check or the update running
+    std::chrono::steady_clock::time_point next = std::chrono::steady_clock::now() + std::chrono::minutes(1);
+
+    State get() { std::lock_guard<std::mutex> l(m); return state; }
+    void set(State s, const std::string& e = {}) { std::lock_guard<std::mutex> l(m); state = s; error = e; }
+    void checkAgainIn(std::chrono::minutes d) { std::lock_guard<std::mutex> l(m); next = std::chrono::steady_clock::now() + d; }
+    bool due() { std::lock_guard<std::mutex> l(m); return std::chrono::steady_clock::now() >= next; }
+
+    // A shell line's output and exit code.
+    static std::string sh(const std::string& cmd, int& rc) {
+        std::string out;
+        rc = -1;
+#ifndef _WIN32
+        if (FILE* p = popen(cmd.c_str(), "r")) {
+            char buf[4096];
+            for (size_t n; (n = std::fread(buf, 1, sizeof buf, p)) > 0;) out.append(buf, n);
+            const int st = pclose(p);
+            rc = WIFEXITED(st) ? WEXITSTATUS(st) : -1;
+        }
+#endif
+        return out;
+    }
+    static std::string quoted(const fs::path& p) { return "'" + p.string() + "'"; }
+
+    // What's installed, hashed as CI hashes frame/payload.
+    static std::string installedHash() {
+        int rc = 0;
+        std::string h = sh("cd " + quoted(rootDir()) + " && sha256sum bin/frame-home bin/frame-switcher bin/fenv-tool "
+                           "layer/libframe_home_layer.so layer/env_ps.spv | cut -c1-64 | sha256sum | cut -c1-64", rc);
+        while (!h.empty() && (h.back() == '\n' || h.back() == '\r')) h.pop_back();
+        return rc == 0 && h.size() == 64 ? h : std::string();
+    }
+
+    // What GitHub has against what's installed. `why` is set when it couldn't be told.
+    struct Check {
+        std::string latest, mine, why;
+        bool hasInstaller = false;
+        bool newer() const { return why.empty() && latest != mine && hasInstaller; }
+    };
+    static Check checkNow() {
+        Check c;
+        int rc = 0;
+        const std::string json = sh("curl -fsSL --max-time 30 '" + releaseUrl() + "latest.json'", rc);
+        try {
+            const tinyjson::Value v = tinyjson::parse(json);
+            if (v.isObject() && v.has("home")) c.latest = v["home"].asString();
+            if (v.isObject() && v.has("files"))
+                for (size_t i = 0; i < v["files"].size(); ++i) c.hasInstaller |= v["files"][i].asString() == "FrameHome-installer.zip";
+        } catch (...) {}
+        c.mine = installedHash();
+        if (rc != 0) c.why = "GitHub not reached";
+        else if (c.latest.empty()) c.why = "no latest.json in the release";
+        else if (c.mine.empty()) c.why = "the installed files weren't found";
+        return c;
+    }
+
+    // Downloads the installer and runs its install.sh. That stops this panel (SteamVR starts the new one), so it
+    // returns only when something failed (the reason) or SteamVR isn't running (""; updated for its next start).
+    static std::string installNow() {
+        const fs::path dir = rootDir() / ".update";
+        const fs::path log = rootDir() / "logs" / "update.log";
+        std::error_code ec;
+        fs::remove_all(dir, ec);
+        fs::create_directories(dir, ec);
+        fs::create_directories(log.parent_path(), ec);
+        { std::ofstream(dir / "started") << "1\n"; }   // the new panel says it's updated
+        LOG("updating Frame Home from %s", releaseUrl().c_str());
+        int rc = 0;
+        sh("curl -fsSL --retry 2 --max-time 1800 -o " + quoted(dir / "FrameHome-installer.zip") + " '" + releaseUrl() +
+           "FrameHome-installer.zip' > " + quoted(log) + " 2>&1", rc);
+        if (rc != 0) return "The update didn't download. Check the headset's Wi-Fi and try again.";
+        sh("unzip -q -o " + quoted(dir / "FrameHome-installer.zip") + " -d " + quoted(dir) + " >> " + quoted(log) + " 2>&1", rc);
+        const fs::path script = dir / "FrameHome-installer" / "payload" / "install.sh";
+        if (rc != 0 || !fs::exists(script, ec)) return "The update couldn't be unpacked.";
+        // Its own session: install.sh stops this panel, and must carry on without it.
+        sh("setsid sh " + quoted(script) + " >> " + quoted(log) + " 2>&1", rc);
+        if (rc == 0) { fs::remove(dir / "started", ec); return {}; }
+        std::string tail = sh("tail -n 1 " + quoted(log), rc);
+        tail = tail.substr(0, tail.find('\n'));
+        return "The update failed: " + (tail.empty() ? std::string("see logs/update.log") : tail);
+    }
+
+    // Called from the panel's loop: starts a check in the background when one is due.
+    void tick() {
+        if (!kSelfUpdate || busy || !due()) return;
+        const State s = get();
+        if (s == State::Available || s == State::Updating) return;
+        busy = true;
+        std::thread([this] {
+            const Check c = checkNow();
+            if (!c.why.empty()) {
+                LOG("update check: %s", c.why.c_str());
+                checkAgainIn(std::chrono::minutes(30));
+            } else {
+                LOG("update check: installed %.12s, latest %.12s%s", c.mine.c_str(), c.latest.c_str(), c.hasInstaller ? "" : " (no installer in it)");
+                if (c.newer()) set(State::Available);
+                checkAgainIn(std::chrono::hours(6));
+            }
+            busy = false;
+        }).detach();
+    }
+
+    // The header's Update Frame Home.
+    void install() {
+        if (!kSelfUpdate || busy || get() != State::Available) return;
+        busy = true;
+        set(State::Updating);
+        std::thread([this] {
+            const std::string err = installNow();
+            if (err.empty()) { set(State::Idle); checkAgainIn(std::chrono::hours(6)); }
+            else set(State::Failed, err);
+            busy = false;
+        }).detach();
+    }
+};
+Updates g_updates;
+
 struct Panel {
     Canvas cv;
     Font title, head, body, label, small, tiny, glyphFont;
@@ -719,7 +865,7 @@ struct Panel {
     enum class Home { Running, Stopped, TurnedOff, Restarting };
     Home home = Home::Running;
     bool restartAsked = false;          // the button was clicked: the loop restarts or starts it
-    static constexpr int kHomeId = 9100;
+    static constexpr int kHomeId = 9100, kUpdateId = 9102;
 
     // Layout
     static constexpr int kCols = 3, kPad = 40, kTop = 112, kGap = 24, kThumbH = 216, kInfoH = 84, kCardH = kThumbH + kInfoH;
@@ -1267,6 +1413,19 @@ struct Panel {
         cv.rect(bx0, by0, x1, by1, kR, fill);
         label.drawMid(cv, bx0 + 20, cy, button, !enabled ? kFaint : primary ? kOnAccent : kText);
         if (enabled) addHot(bx0, by0, x1, by1, kHomeId, false);
+        const Updates::State us = g_updates.get();
+        if (us == Updates::State::Available || us == Updates::State::Updating) {   // in place of the state's text
+            const bool can = us == Updates::State::Available, uh = can && hotHover == kUpdateId;
+            const char* ub = can ? "Update Frame Home" : "Updating…";
+            const float ux1 = bx0 - 16, ux0 = ux1 - label.width(ub) - 40;
+            cv.rect(ux0, by0, ux1, by1, kR, !can ? kSurface : uh ? 0x34363b : kSurfaceHi);
+            label.drawMid(cv, ux0 + 20, cy, ub, can ? kText : kFaint);
+            if (can) {
+                cv.rect(ux1 - 14, by0 + 10, ux1 - 8, by0 + 16, 3, kAccent);   // a dot: something new
+                addHot(ux0, by0, ux1, by1, kUpdateId, false);
+            }
+            return;
+        }
         if (*text) small.drawMid(cv, bx0 - 20 - small.width(text), cy, text, kFaint);
     }
     void scrollbar() {
@@ -1369,6 +1528,11 @@ struct Panel {
         }
         if (id == kHomeId) {
             if (home != Home::Restarting) restartAsked = true;
+            return;
+        }
+        if (id == kUpdateId) {
+            g_updates.install();
+            say("Updating Frame Home: it restarts in a moment", false, 6);
             return;
         }
         if (id >= 9000 && id < 9003) {
@@ -1792,6 +1956,11 @@ int runPanel() {
         for (const Env& e : scanEnvs()) missing |= e.thumb.rgba.empty();
         if (missing) homeos::run({homeos::selfPath().string(), "--thumbs"}, 19, false);
     }
+    Updates::State shownUpdate = Updates::State::Idle;
+    {   // started by an update (install.sh restarted the panel): say so
+        std::error_code ec;
+        if (fs::remove(rootDir() / ".update" / "started", ec)) { panel.now = Panel::clockNow(); panel.say("Frame Home is updated", false, 5); }
+    }
     double lastSmooth = -10;
     int scrollLogs = 0;
     bool dirty = true, wasVisible = false;
@@ -1803,6 +1972,16 @@ int runPanel() {
             if (!panel.restartAsked) keepSystem(t);
             dirty |= homeTick(t);
             keepBackground();
+            g_updates.tick();
+            const Updates::State us = g_updates.get();
+            if (us == Updates::State::Failed) {   // said once; the button stays for another try
+                std::string err;
+                { std::lock_guard<std::mutex> l(g_updates.m); err = g_updates.error; }
+                LOG("update: %s", err.c_str());
+                panel.say(err, true, 8);
+                g_updates.set(Updates::State::Available);
+            }
+            if (us != shownUpdate) { shownUpdate = us; dirty = true; }
         }
         panel.now = Panel::clockNow();
         vr::VREvent_t ev;
@@ -2073,10 +2252,24 @@ int main(int argc, char** argv) {
     if (a == "--thumbs") return runThumbs();
     if (a == "--uninstall") return runUninstall();
     if (a == "--unpack-bundles") { unpackBundles(); return 0; }
+    if (a == "--check-update") {   // what the panel's update check finds. Exit 0: up to date, 10: an update, 1: unknown
+        const Updates::Check c = Updates::checkNow();
+        if (!c.why.empty()) { std::printf("couldn't check: %s\n", c.why.c_str()); return 1; }
+        std::printf("installed %s\nlatest    %s\n%s\n", c.mine.c_str(), c.latest.c_str(),
+                    c.newer() ? "an update is available" : c.latest == c.mine ? "up to date" : "different, but the release has no installer");
+        return c.newer() ? 10 : 0;
+    }
+    if (a == "--update") {         // what the panel's Update Frame Home does (whether or not the check found one)
+        const std::string err = Updates::installNow();
+        if (!err.empty()) { std::fprintf(stderr, "%s\n", err.c_str()); return 1; }
+        std::printf("updated (SteamVR isn't running: it takes over when SteamVR starts)\n");
+        return 0;
+    }
     if (a == "--test-delete" && argc > 2) return runTestDelete(argv[2]);
     if (a == "--render" && argc > 2) {   // the panel as it looks now, to a PPM (no SteamVR needed)
         // frame-switcher --render out.ppm [hover] [page] [scroll px] [switching card]
-        //   (FH_RENDER_CONFIRM=n: card n asks "Delete?"; FH_RENDER_TOAST=text: a toast)
+        //   (FH_RENDER_CONFIRM=n: card n asks "Delete?"; FH_RENDER_TOAST=text: a toast; FH_RENDER_UPDATE=1|2: an update
+        //   available | being installed)
         Panel panel;
         panel.loadFonts();
         panel.envs = scanEnvs();
@@ -2089,6 +2282,7 @@ int main(int argc, char** argv) {
         panel.info = readDebugInfo();
         panel.stats = statsLine();
         panel.hoverT.assign(panel.envs.size(), 0.0f);
+        if (const char* u = std::getenv("FH_RENDER_UPDATE"); u && *u) g_updates.set(*u == '2' ? Updates::State::Updating : Updates::State::Available);
         // page 0: hover is a card number, or a raw id (>= 10000: e.g. 30000 + n is card n's delete button)
         const int hoverId = panel.page == 0 && hover >= 0 ? (hover >= Panel::kCardId ? hover : Panel::kCardId + hover) : -1;
         if (const int c = Panel::cardOf(hoverId); c >= 0 && c < static_cast<int>(panel.envs.size())) { panel.hotHover = hoverId; panel.hoverT[c] = 1; }

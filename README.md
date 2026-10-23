@@ -20,7 +20,8 @@ headset runs, and lets you edit, save and send them to the headset.
 
 Every push builds everything. The newest build of `main` is always on the Releases page as **Latest build**; tagged
 versions (`v1.0`, ...) get their own release. Builds of other branches are under Actions (open a run, then
-Artifacts).
+Artifacts). Once installed, Frame Studio and Frame Home both update themselves from **Latest build**: Studio from its
+top bar, Frame Home from the Environments panel on the headset.
 
 | Computer | Frame Studio |
 |---|---|

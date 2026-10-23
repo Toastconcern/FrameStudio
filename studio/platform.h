@@ -29,8 +29,13 @@ std::tm localTime(std::time_t t);        // (thread-safe localtime)
 int run(const std::string& commandLine, const fs::path& workingDir, std::string& out);
 // ssh / scp, ready to prefix arguments: quoted when it's a path, with a trailing space.
 std::string sshTool(const char* name);
+// The system's own curl / tar (Windows 10 and later ship both in System32; Git's tar there can't open a .zip), ready
+// to prefix arguments like sshTool.
+std::string systemTool(const char* name);
 // Opens a folder in the file browser, or a file / URL in its usual program.
 void openPath(const std::string& pathOrUrl);
+// Starts a program (or, on macOS, a .app) on its own: not waited for, it outlives Frame Studio. False: not started.
+bool launch(const fs::path& program);
 
 // ── Dialogs ── (modal; they block until answered)
 // The window dialogs belong to (Windows: its HWND), so they come up over it. Null: none.

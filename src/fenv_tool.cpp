@@ -435,6 +435,8 @@ int tune(const std::string& home, const std::string& benchArg, int seconds, doub
 }  // namespace
 
 int main(int argc, char** argv) {
+    // The newest baked scene this build opens: Frame Studio asks before sending (an older headset can't open a newer one).
+    if (argc == 2 && !std::strcmp(argv[1], "version")) { std::printf("scene %u\n", kSceneBakeVersion); return 0; }
     if (argc >= 3 && !std::strcmp(argv[1], "info")) return info(argv[2]);
     if (argc >= 4 && !std::strcmp(argv[1], "bundle")) {
         std::string name;
@@ -529,6 +531,7 @@ int main(int argc, char** argv) {
                  "  fenv-tool upgrade file.fenv...   re-bake with this build (keeps world, edits, sound, picture)\n"
                  "  fenv-tool report [--json] <home.apk | home.fenv | footprint.apk+vista.apk>...   what it costs and what's wrong with it\n"
                  "  fenv-tool settings <home.fenv | home.apk> [JSON | --clear]   a world's own settings, shown or set\n"
-                 "  fenv-tool tune [--seconds 30] [--late 0.01] [--cool 80] [--dry-run] <home.fenv | home.apk>   its best settings on this headset, stored in it\n");
+                 "  fenv-tool tune [--seconds 30] [--late 0.01] [--cool 80] [--dry-run] <home.fenv | home.apk>   its best settings on this headset, stored in it\n"
+                 "  fenv-tool version   the newest baked scene this build opens\n");
     return 2;
 }

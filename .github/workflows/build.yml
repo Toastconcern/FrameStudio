@@ -104,6 +104,8 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
+      - name: Headset programs match the source
+        run: sh scripts/frame-payload.sh check
       - name: Package
         run: sh scripts/build-studio.sh frame-home
       - uses: actions/upload-artifact@v4
@@ -134,6 +136,10 @@ jobs:
       - uses: actions/checkout@v4
         with:
           path: src
+      # Every download carries frame/payload: none is published beside headset programs older than the source
+      # (Studio would save environments the headset can't open).
+      - name: Headset programs match the source
+        run: sh src/scripts/frame-payload.sh check
       # What Frame Studio (studio/updater.h) and the headset's Environments panel check for updates: this commit,
       # Frame Home's identity (a hash of the headset programs, the same one the panel works out for what's installed)
       # and the files in this release.

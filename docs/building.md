@@ -173,8 +173,17 @@ headset, copy the results into it:
 
 `frame/payload/install.sh` is the installer itself; it lives in the repository and needs no build.
 
-Commit the new payload together with the code that changed. Otherwise Studio's **Install on Steam Frame** would
-install an older Frame Home than the code says.
+Then record which source they were built from, and commit the new payload together with the code that changed:
+
+```sh
+sh scripts/frame-payload.sh stamp
+```
+
+`frame/payload/SOURCE` holds a hash of everything the headset side is built from (`src/`, `third_party/`, `layer/`,
+`CMakeLists.txt`). `sh scripts/frame-payload.sh check` tells you whether the payload is still current. The release
+build runs it too and publishes nothing while the payload is older than the source: a Studio beside an older Frame
+Home saves environments the headset can't open. Studio also asks the headset (`fenv-tool version`) before
+**Send to Frame** and says when its Frame Home needs updating.
 
 ## Repository layout
 

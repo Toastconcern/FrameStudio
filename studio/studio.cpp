@@ -2234,6 +2234,7 @@ struct Studio {
             setTuneStatus("Copying it to the headset\u2026");
             int rc = run(ssh + L"\"mkdir -p /tmp/frame-tune && rm -f /tmp/frame-tune/log\"", L"", out);
             if (rc != 0) { setTuneStatus("Can't reach the headset (" + host8 + "): " + lastLine(out)); tuning = false; return; }
+            if (const std::string why = headsetCantOpen(host8); !why.empty()) { fs::remove(f, ec); setTuneStatus("Not measured. " + why); tuning = false; return; }
             out.clear();
             rc = run(scp + L"\"" + f.filename().wstring() + L"\" " + widen(host8) + L":/tmp/frame-tune/tune.fenv", f.parent_path().wstring(), out);
             fs::remove(f, ec);
@@ -2382,6 +2383,20 @@ struct Studio {
         return png;
     }
 
+    // Why the headset's Frame Home can't open what this Studio saves, or "" when it can: its fenv-tool names the newest
+    // baked scene it opens ("scene N"; a build from before that question prints its usage instead).
+    std::string headsetCantOpen(const std::string& host8) {
+        std::string out;
+        const int rc = run(sshTool(L"ssh") + L"-o BatchMode=yes -o ConnectTimeout=8 " + widen(host8) + L" \"frame-home/bin/fenv-tool version\"", L"", out);
+        if (rc == 127 || out.find("not found") != std::string::npos)
+            return "Frame Home isn't installed on the headset: Headset > Install on Steam Frame first.";
+        const size_t at = out.find("scene ");
+        const long reads = at == std::string::npos ? 0 : std::strtol(out.c_str() + at + 6, nullptr, 10);
+        if (reads >= static_cast<long>(kSceneBakeVersion)) return {};
+        return "The headset's Frame Home is older than this Frame Studio and can't open what it saves: "
+               "Headset > Install on Steam Frame updates it.";
+    }
+
     // A footprint with its vista goes to the Frame as one home in one file: the pair baked into a .fenv with the
     // edits, world layer and background sound (what Save Environment writes). The pair's separate copies an earlier
     // Send left there go, so the headset lists it once.
@@ -2411,6 +2426,7 @@ struct Studio {
             setStatus("Connecting to the Frame\u2026");
             int rc = run(ssh + host + L" \"mkdir -p " + dir + L"\"", L"", out);
             if (rc != 0) { setStatus("Can't reach the Frame: " + lastLine(out)); sending = false; return; }
+            if (const std::string why = headsetCantOpen(host8); !why.empty()) { setStatus("Not sent. " + why); sending = false; return; }
             std::error_code ec2;
             char msg[200];
             std::snprintf(msg, sizeof msg, "Copying %s (%.0f MB)\u2026", name.c_str(), fs::file_size(f, ec2) / 1048576.0);

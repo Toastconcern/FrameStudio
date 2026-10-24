@@ -253,8 +253,13 @@ jobs:
           for package in dist/FrameStudio-linux-*; do
             [ -d "$package" ] || continue
             name=${package##*/}
+            # (artifacts don't keep file modes: the program itself has to be executable again)
+            chmod +x "$package/Frame Studio"
             if [ -d "$package/frame/bin" ]; then
               chmod +x "$package/frame/install.sh" "$package/frame/bin/"*
+            fi
+            if [ -d "$package/pc/bin" ]; then
+              chmod +x "$package/pc/install.sh" "$package/pc/bin/"*
             fi
             tar -czf "dist/$name.tar.gz" -C dist "$name"
             rm -rf "$package"
@@ -271,8 +276,8 @@ jobs:
             (cd dist && zip -qr "$name.zip" "$name")
             rm -rf "$package"
           done
-          chmod +x dist/FrameHome-installer/install-frame-home.sh \\
-            dist/FrameHome-installer/payload/install.sh \\
+          chmod +x dist/FrameHome-installer/install-frame-home.sh \
+            dist/FrameHome-installer/payload/install.sh \
             dist/FrameHome-installer/payload/bin/*
           (cd dist && zip -qr FrameHome-installer.zip FrameHome-installer)
           rm -rf dist/FrameHome-installer

@@ -75,7 +75,11 @@ const char* kLibName = "openvr_api.dll";
 using Lib = void*;
 Lib open(const fs::path& p) { return dlopen(p.c_str(), RTLD_NOW | RTLD_LOCAL); }
 void* symbol(Lib l, const char* name) { return dlsym(l, name); }
+#if defined(__aarch64__)
+const char* kLibInRuntime = "bin/linuxarm64/libopenvr_api.so";
+#else
 const char* kLibInRuntime = "bin/linux64/libopenvr_api.so";
+#endif
 const char* kLibName = "libopenvr_api.so";
 #endif
 

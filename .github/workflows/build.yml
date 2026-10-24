@@ -1,13 +1,17 @@
-# Builds Frame Studio for every computer it runs on, and the Frame Home installer, on every push (any branch or tag),
-# every pull request, and by hand (Actions > build > Run workflow). Each build is a downloadable artifact of the run.
-# A push to main also replaces the "latest" pre-release with them (one place to download the newest of everything);
-# a tag "v*" publishes them as that version's release.
+# Builds Frame Studio for every computer it runs on, plus a same-commit Frame Home payload, on branch pushes,
+# pull requests, and by hand (Actions > build > Run workflow). A push to main replaces the Studio "latest" pre-release
+# and includes the Frame Home installer. A tag "v*" publishes a versioned release containing both products.
 name: build
 
 on:
   push:
+    branches: ['**']
+    tags: ['v*']
   pull_request:
   workflow_dispatch:
+
+permissions:
+  contents: read
 
 # A newer push to the same branch replaces a run still going (its builds would be out of date anyway).
 concurrency:
@@ -17,10 +21,12 @@ concurrency:
 # Every Studio build knows the commit it's from (studio/updater.h compares it with the latest release's).
 env:
   FRAME_BUILD: ${{ github.sha }}
+  FRAME_HOME_PAYLOAD_DIR: ${{ github.workspace }}/build/frame-home/payload
 
 jobs:
   linux:
     name: Linux ${{ matrix.arch }}
+    needs: [frame-home]
     strategy:
       fail-fast: false
       matrix:
@@ -33,6 +39,11 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: FrameHome-payload
+          path: build/frame-home/payload
+          if-no-files-found: error
       - name: Tools and X11 headers
         run: |
           # x86 links against 32-bit X11, so apt needs the i386 packages too
@@ -48,6 +59,7 @@ jobs:
 
   windows:
     name: Windows ${{ matrix.arch }}
+    needs: [frame-home]
     strategy:
       fail-fast: false
       matrix:
@@ -56,6 +68,10 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: FrameHome-payload
+          path: build/frame-home/payload
       - name: Build (MSVC)
         shell: cmd
         run: studio\build_windows.bat ${{ matrix.arch }} "%GITHUB_WORKSPACE%\build\windows-${{ matrix.arch }}"
@@ -77,6 +93,7 @@ jobs:
 
   macos:
     name: macOS ${{ matrix.arch }}
+    needs: [frame-home]
     strategy:
       fail-fast: false
       matrix:
@@ -89,6 +106,10 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: FrameHome-payload
+          path: build/frame-home/payload
       - name: Tools and MoltenVK (Vulkan on Metal, bundled into the app)
         run: brew install ninja molten-vk
       - name: Build
@@ -99,19 +120,30 @@ jobs:
           path: dist/FrameStudio-macos-${{ matrix.arch }}.zip
 
   frame-home:
-    name: Frame Home installer
-    runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    name: Build Frame Home payload
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
-      - name: Headset programs match the source
-        run: sh scripts/frame-payload.sh check
-      - name: Package
-        run: sh scripts/build-studio.sh frame-home
+      - uses: actions/checkout@v4.2.2
+      - name: Build payload and installer
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build gcc-13 g++-13 glslc zip
+          sh scripts/build-frame-home.sh --ci
+      - uses: actions/upload-artifact@v4
+        with:
+          name: FrameHome-payload
+          path: build/frame-home/payload
       - uses: actions/upload-artifact@v4
         with:
           name: FrameHome-installer
-          path: dist/FrameHome-installer.zip
+          path: build/frame-home/FrameHome-installer.zip
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        with:
+          name: FrameHome-build-info
+          path: build/frame-home/build-info.txt
+          if-no-files-found: error
 
   release:
     name: Publish
@@ -125,30 +157,40 @@ jobs:
     timeout-minutes: 20
     permissions:
       contents: write
+      id-token: write
+      attestations: write
     env:
       GH_TOKEN: ${{ github.token }}
       REPO: ${{ github.repository }}
     steps:
       - uses: actions/download-artifact@v4
         with:
+          pattern: FrameStudio-*
           path: dist
           merge-multiple: true
-      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
         with:
-          path: src
-      # Every download carries frame/payload: none is published beside headset programs older than the source
-      # (Studio would save environments the headset can't open).
-      - name: Headset programs match the source
-        run: sh src/scripts/frame-payload.sh check
+          name: FrameHome-payload
+          path: ${{ runner.temp }}/frame-home-payload
+      - uses: actions/download-artifact@v4
+        with:
+          name: FrameHome-installer
+          path: dist
       # What Frame Studio (studio/updater.h) and the headset's Environments panel check for updates: this commit,
       # Frame Home's identity (a hash of the headset programs, the same one the panel works out for what's installed)
       # and the files in this release.
       - name: latest.json
         run: |
-          home=$(cd src/frame/payload && sha256sum bin/frame-home bin/frame-switcher bin/fenv-tool layer/libframe_home_layer.so layer/env_ps.spv | cut -c1-64 | sha256sum | cut -c1-64)
+          home=$(cd "$RUNNER_TEMP/frame-home-payload" && sha256sum bin/frame-home bin/frame-switcher bin/fenv-tool layer/libframe_home_layer.so layer/env_ps.spv | cut -c1-64 | sha256sum | cut -c1-64)
           files=$(ls dist | python3 -c 'import json, sys; print(json.dumps([l.strip() for l in sys.stdin if l.strip()]))')
           printf '{"build": "%s", "home": "%s", "date": "%s", "files": %s}\n' "$GITHUB_SHA" "$home" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$files" > dist/latest.json
           cat dist/latest.json
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: dist/FrameStudio-*
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: dist/FrameHome-installer.zip
       - name: Version release (tag v*)
         if: ${{ startsWith(github.ref, 'refs/tags/v') && !contains(needs.*.result, 'failure') }}
         run: gh release create "${{ github.ref_name }}" dist/* --repo "$REPO" --title "Frame Studio ${{ github.ref_name }}" --generate-notes

@@ -18,6 +18,15 @@ add_compile_definitions(FRAME_BUILD="${FRAME_BUILD}")
 
 set(ROOT "${CMAKE_CURRENT_SOURCE_DIR}/..")
 set(TP "${ROOT}/third_party")
+set(FRAME_HOME_PAYLOAD_DIR "$ENV{FRAME_HOME_PAYLOAD_DIR}" CACHE PATH "Built Frame Home payload to bundle with Studio")
+if(NOT FRAME_HOME_PAYLOAD_DIR)
+    set(FRAME_HOME_PAYLOAD_DIR "${ROOT}/frame/payload")
+endif()
+foreach(FRAME_HOME_FILE install.sh bin/frame-home bin/frame-switcher bin/fenv-tool layer/libframe_home_layer.so layer/env_ps.spv)
+    if(NOT EXISTS "${FRAME_HOME_PAYLOAD_DIR}/${FRAME_HOME_FILE}")
+        message(FATAL_ERROR "Frame Home payload is incomplete; build or download it and set FRAME_HOME_PAYLOAD_DIR (${FRAME_HOME_FILE} missing)")
+    endif()
+endforeach()
 
 if(WIN32)
     add_compile_definitions(NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS VK_USE_PLATFORM_WIN32_KHR)
@@ -158,7 +167,7 @@ if(APPLE)
 endif()
 # Frame Home's headset side (arm64 binaries + install.sh) ships beside the exe, in frame\: Frame > Install on Steam Frame.
 add_custom_command(TARGET frame-studio POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E copy_directory "${ROOT}/frame/payload" "$<TARGET_FILE_DIR:frame-studio>/frame")
+    COMMAND ${CMAKE_COMMAND} -E copy_directory "${FRAME_HOME_PAYLOAD_DIR}" "$<TARGET_FILE_DIR:frame-studio>/frame")
 if(MINGW)   # MinGW builds (x64, x86 and ARM64): wWinMain entry point, no runtime DLLs to ship
     target_link_options(frame-studio PRIVATE -municode -static)
 endif()

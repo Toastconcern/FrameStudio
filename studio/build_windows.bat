@@ -35,6 +35,8 @@ call "%VSPATH%\VC\Auxiliary\Build\vcvarsall.bat" %VCARCH% >nul || ( echo ERROR: 
 where cmake >nul 2>nul || set "PATH=%VSPATH%\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin;%PATH%"
 where ninja >nul 2>nul || set "PATH=%VSPATH%\Common7\IDE\CommonExtensions\Microsoft\CMake\Ninja;%PATH%"
 
-cmake -S "%SRC%." -B "%BDIR%" -G Ninja -DCMAKE_BUILD_TYPE=Release %CROSS% || exit /b 1
+set "PAYLOAD_ARG="
+if defined FRAME_HOME_PAYLOAD_DIR set PAYLOAD_ARG="-DFRAME_HOME_PAYLOAD_DIR=%FRAME_HOME_PAYLOAD_DIR%"
+cmake -S "%SRC%." -B "%BDIR%" -G Ninja -DCMAKE_BUILD_TYPE=Release %CROSS% %PAYLOAD_ARG% || exit /b 1
 cmake --build "%BDIR%" --target frame-studio || exit /b 1
 echo Built "%BDIR%\Frame Studio.exe" (%ARCH%)

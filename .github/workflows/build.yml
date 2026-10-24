@@ -43,7 +43,6 @@ jobs:
         with:
           name: FrameHome-payload
           path: build/frame-home/payload
-          if-no-files-found: error
       - name: Tools and X11 headers
         run: |
           # x86 links against 32-bit X11, so apt needs the i386 packages too
@@ -124,12 +123,14 @@ jobs:
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4.2.2
-      - name: Build payload and installer
+      - uses: actions/checkout@v4
+      - name: Install Frame Home build dependencies
         run: |
+          set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y cmake ninja-build gcc-13 g++-13 glslc zip
-          sh scripts/build-frame-home.sh --ci
+      - name: Build payload and installer
+        run: sh scripts/build-frame-home.sh --ci
       - uses: actions/upload-artifact@v4
         with:
           name: FrameHome-payload
@@ -144,7 +145,6 @@ jobs:
           name: FrameHome-build-info
           path: build/frame-home/build-info.txt
           if-no-files-found: error
-
   release:
     name: Publish
     # "latest" gets every build that finished (a failed or still-slow platform just isn't in it); a version release

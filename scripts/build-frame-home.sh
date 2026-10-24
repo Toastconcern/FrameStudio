@@ -92,14 +92,13 @@ allowed_files = {
     "FrameHome-installer/README-frame-home.txt",
 }
 with zipfile.ZipFile(sys.argv[1]) as archive:
-    names = {name.rstrip("/") for name in archive.namelist()}
-    missing = required - names
-    unexpected = {
-        name for name in names
-        if name != "FrameHome-installer"
-        and name not in allowed_files
-        and not name.startswith("FrameHome-installer/payload/")
+    names = {
+        info.filename.rstrip("/")
+        for info in archive.infolist()
+        if not info.is_dir()
     }
+    missing = required - names
+    unexpected = names - required - allowed_files
     if missing or unexpected:
         raise SystemExit(f"Invalid Frame Home installer: missing={sorted(missing)}, unexpected={sorted(unexpected)}")
 PY

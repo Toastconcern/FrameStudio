@@ -24,12 +24,14 @@ CMake and Ninja.
    studio\build_windows.bat x64
    ```
 
-   Download the `FrameHome-payload` artifact from an Actions run, extract it, and set `FRAME_HOME_PAYLOAD_DIR` to
-   its payload directory before running the batch file, or [build it manually](#frame-home-payload).
+   To bundle Frame Home with it, download the `FrameHome-payload` artifact from an Actions run, extract it, and set
+   `FRAME_HOME_PAYLOAD_DIR` to its payload directory before running the batch file, or
+   [build it manually](#frame-home-payload). Without one, Studio still builds (CMake warns), but its
+   **Install on Steam Frame** can't install Frame Home. Release builds (CI) require it.
 
    Use `x86` for 32-bit Windows or `arm64` for Windows on ARM instead of `x64`.
 3. The program is `%LOCALAPPDATA%\FrameStudio\build-x64\Frame Studio.exe` (the folder ends in your architecture).
-   The headset files are copied beside it, in `frame\`.
+   The headset files, when bundled, are copied beside it, in `frame\`.
 
 To build into another folder, give it as the second argument: `studio\build_windows.bat x64 C:\builds\studio`.
 

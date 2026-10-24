@@ -32,8 +32,6 @@ jobs:
       matrix:
         include:
           - { arch: x64, runner: ubuntu-24.04, extra: "" }
-          - { arch: x86, runner: ubuntu-24.04, i386: true,
-              extra: "gcc-multilib g++-multilib libx11-dev:i386 libxrandr-dev:i386 libxinerama-dev:i386 libxcursor-dev:i386 libxi-dev:i386" }
           - { arch: arm64, runner: ubuntu-24.04-arm, extra: "" }
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
@@ -65,8 +63,6 @@ jobs:
           path: build/frame-home/payload
       - name: Tools and X11 headers
         run: |
-          # x86 links against 32-bit X11, so apt needs the i386 packages too
-          if [ "${{ matrix.i386 }}" = "true" ]; then sudo dpkg --add-architecture i386; fi
           sudo mkdir -p "$APT_CACHE_DIR/archives/partial"
           sudo chown _apt:root "$APT_CACHE_DIR/archives/partial"
           sudo apt-get update
@@ -88,7 +84,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        arch: [x64, x86, arm64]
+        arch: [x64, arm64]
     runs-on: windows-latest
     timeout-minutes: 45
     steps:
@@ -125,9 +121,6 @@ jobs:
       matrix:
         include:
           - { arch: arm64, runner: macos-14 }
-          # Intel: macos-13 was retired (Dec 2025); macos-15-intel is GitHub's last Intel Mac runner (until Aug 2027).
-          # Not cross-built on an ARM Mac because Homebrew's MoltenVK, bundled into the app, is the runner's own arch.
-          - { arch: x64, runner: macos-15-intel }
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
     env:

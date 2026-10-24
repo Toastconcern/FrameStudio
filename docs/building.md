@@ -118,7 +118,7 @@ rolling `latest` release and one shared `v*` tag namespace; each release contain
 
 | When | What happens |
 |---|---|
-| Every push and pull request | Studio builds for Linux, Windows and macOS; Frame Home is built on ARM64 and bundled into Studio packages. Successful outputs are kept as run artifacts. |
+| Every push and pull request | Studio builds for Linux (x64, arm64), Windows (x64, arm64) and macOS (Apple Silicon); Frame Home is built on ARM64 and bundled into Studio packages. Successful outputs are kept as run artifacts. 32-bit and Intel Mac builds are local only (`scripts/build-studio.sh`). |
 | A push to `main` | The **Latest build** pre-release is replaced with Studio builds and the standalone Frame Home installer. |
 | A tag starting with `v` (for example `v1.0`) | One version release is published with both Studio packages and the Frame Home installer. |
 | By hand | **Actions > build > Run workflow** |

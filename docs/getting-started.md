@@ -26,12 +26,13 @@ walk, add seats, sounds and a picture, save the result as a `.fenv` environment,
 | | Requirement |
 |---|---|
 | Graphics | A GPU with Vulkan 1.2. Any recent NVIDIA, AMD or Intel driver on Windows and Linux. |
-| Windows | Windows 10 or 11. 64-bit (x64), 32-bit (x86) or ARM64. |
-| Linux | 64-bit (x64), 32-bit (x86) or ARM64, with an X11 desktop or XWayland. |
-| macOS | macOS 11 or later on Apple Silicon. macOS 10.15 or later on Intel. Vulkan runs on Metal through MoltenVK, which is inside the app. |
+| Windows | Windows 10 or 11, 64-bit (x64) or ARM64. |
+| Linux | 64-bit (x64) or ARM64, with an X11 desktop or XWayland. |
+| macOS | macOS 11 or later on Apple Silicon. Vulkan runs on Metal through MoltenVK, which is inside the app. |
 | Headset | A Steam Frame with developer mode and SSH turned on, on the same network as your computer. See [headset-setup.md](headset-setup.md). |
 
-The 32-bit builds can use at most 4 GB of memory. The very largest homes may not fit.
+32-bit Windows and Linux and Intel Macs have no ready-made download. You can still build Studio for them yourself:
+see [building.md](building.md). A 32-bit build can use at most 4 GB of memory, so the very largest homes may not fit.
 
 You do not need Studio to use Frame Home. If you only want to install Frame Home and copy ready-made `.fenv` files,
 see [install-frame-home.md](install-frame-home.md).
@@ -48,13 +49,10 @@ see [install-frame-home.md](install-frame-home.md).
 | Computer | File |
 |---|---|
 | Windows, 64-bit PCs | `FrameStudio-windows-x64.zip` |
-| Windows, 32-bit | `FrameStudio-windows-x86.zip` |
 | Windows on ARM | `FrameStudio-windows-arm64.zip` |
 | Linux, 64-bit PCs | `FrameStudio-linux-x64.tar.gz` |
-| Linux, 32-bit | `FrameStudio-linux-x86.tar.gz` |
 | Linux on ARM | `FrameStudio-linux-arm64.tar.gz` |
 | Mac with Apple Silicon (M1 and later) | `FrameStudio-macos-arm64.zip` |
-| Mac with Intel | `FrameStudio-macos-x64.zip` |
 | Frame Home only (no Studio) | `FrameHome-installer.zip` |
 
 Builds of other branches are not on the Releases page. You find them under **Actions**: open the run, then scroll

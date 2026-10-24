@@ -25,18 +25,15 @@ top bar, and Frame Home updates from the Environments panel on the headset. Both
 | Computer | Frame Studio |
 |---|---|
 | Windows, 64-bit PCs | `FrameStudio-windows-x64.zip` |
-| Windows, 32-bit | `FrameStudio-windows-x86.zip` |
 | Windows on ARM (Snapdragon, Surface Pro X...) | `FrameStudio-windows-arm64.zip` |
 | Linux, 64-bit PCs | `FrameStudio-linux-x64.tar.gz` |
-| Linux, 32-bit | `FrameStudio-linux-x86.tar.gz` |
 | Linux on ARM (Raspberry Pi 5, ARM laptops, the Steam Frame's desktop) | `FrameStudio-linux-arm64.tar.gz` |
 | Mac with Apple Silicon (M1 and later) | `FrameStudio-macos-arm64.zip` |
-| Mac with Intel | `FrameStudio-macos-x64.zip` |
 | Frame Home only, installed from any computer | `FrameHome-installer.zip` |
 
 Studio needs a GPU with Vulkan 1.2: any recent NVIDIA, AMD or Intel driver on Windows and Linux. On a Mac, Vulkan
-runs on Metal through MoltenVK, which comes inside the app. The 32-bit builds have at most 4 GB to work in, so the
-very largest homes may not fit.
+runs on Metal through MoltenVK, which comes inside the app. 32-bit Windows and Linux and Intel Macs have no ready-made
+download; Studio can still be built for them from source ([docs/building.md](docs/building.md)).
 
 See [Installing Frame Home](docs/install-frame-home.md) for how to install the runtime on a Steam Frame.
 

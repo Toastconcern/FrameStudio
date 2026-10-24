@@ -3,12 +3,11 @@
 You only need this page if you want to change the code or build a version that isn't on the Releases page. Ready
 builds for every computer are on GitHub (see [getting-started.md](getting-started.md#download)).
 
-There are two parts:
+There are two build surfaces:
 
 - **Frame Studio** builds on Windows, Linux and macOS (and cross-builds for Windows from Linux).
-- **The headset side** (Frame Home, the Environments panel, `fenv-tool` and the compositor layer) builds on the
-  Steam Frame itself. A ready-built copy is in the repository, in `frame/payload/`, so you only rebuild it when you
-  change that code.
+- **Frame Home** (the renderer, Environments panel, `fenv-tool` and compositor layer) is built by GitHub Actions on
+   ARM64 Linux, and can also be built locally on the Steam Frame.
 
 Everything Studio needs is in `third_party/`. Vulkan is loaded when Studio starts, so you don't need the Vulkan SDK
 to build it. All builds use CMake 3.16 or later and Ninja.
@@ -25,9 +24,14 @@ CMake and Ninja.
    studio\build_windows.bat x64
    ```
 
+   To bundle Frame Home with it, download the `FrameHome-payload` artifact from an Actions run, extract it, and set
+   `FRAME_HOME_PAYLOAD_DIR` to its payload directory before running the batch file, or
+   [build it manually](#frame-home-payload). Without one, Studio still builds (CMake warns), but its
+   **Install on Steam Frame** can't install Frame Home. Release builds (CI) require it.
+
    Use `x86` for 32-bit Windows or `arm64` for Windows on ARM instead of `x64`.
 3. The program is `%LOCALAPPDATA%\FrameStudio\build-x64\Frame Studio.exe` (the folder ends in your architecture).
-   The headset files are copied beside it, in `frame\`.
+   The headset files, when bundled, are copied beside it, in `frame\`.
 
 To build into another folder, give it as the second argument: `studio\build_windows.bat x64 C:\builds\studio`.
 
@@ -41,6 +45,8 @@ scripts/build-studio.sh TARGET... [--build-dir DIR]
 ```
 
 Each target is built and packed into `dist/`. `scripts/build-studio.sh --help` lists them.
+The script uses `build/frame-home/payload` when present. Set `FRAME_HOME_PAYLOAD_DIR` to use a payload from another
+location.
 
 | Target | Build on | Output |
 |---|---|---|
@@ -48,12 +54,10 @@ Each target is built and packed into `dist/`. `scripts/build-studio.sh --help` l
 | `linux-x86` | 64-bit Linux with `gcc-multilib g++-multilib` | `dist/FrameStudio-linux-x86.tar.gz` |
 | `windows-x64`, `windows-x86`, `windows-arm64` | Linux with [llvm-mingw](https://github.com/mstorsjo/llvm-mingw) | `dist/FrameStudio-windows-<arch>.zip` |
 | `macos-arm64`, `macos-x64` | A Mac with Xcode's command line tools | `dist/FrameStudio-macos-<arch>.zip` |
-| `frame-home` | Anywhere | `dist/FrameHome-installer.zip` (the headset files and install scripts, no Studio) |
 | `all` | Anywhere | Every target this computer can build |
 
-`all` builds: on a Mac, both macOS targets and `frame-home`; on 64-bit x86 Linux, `linux-x64`, `linux-x86` and
-`frame-home`; on ARM Linux, `linux-arm64` and `frame-home`. On Linux it adds the three Windows targets when it finds
-llvm-mingw.
+`all` builds the targets supported by this computer. On Linux it adds the three Windows targets when it finds
+llvm-mingw. The standalone Frame Home installer is built separately by GitHub Actions.
 
 Build folders go in `build/<target>` unless you pass `--build-dir`.
 
@@ -108,18 +112,22 @@ The Apple Silicon build runs on macOS 11 and later, the Intel build on macOS 10.
 
 ## Continuous builds (GitHub Actions)
 
-The workflow is `.github/workflows/build.yml`.
+The `.github/workflows/build.yml` workflow builds both products and publishes their assets together. There is one
+rolling `latest` release and one shared `v*` tag namespace; each release contains the Studio packages and
+`FrameHome-installer.zip`.
 
 | When | What happens |
 |---|---|
-| Every push, to any branch or tag, and every pull request | All targets build: Linux x64, x86, arm64; Windows x64, x86, arm64 (MSVC); macOS arm64 and x64; the Frame Home installer. Each is kept as an artifact of the run. |
-| A push to `main` | The **Latest build** pre-release is replaced with the new builds. Builds that worked are published even if another platform failed. |
-| A tag starting with `v` (for example `v1.0`) | A release with that name is published, with all builds. It is only made when every build succeeded. |
+| Every push and pull request | Studio builds for Linux, Windows and macOS; Frame Home is built on ARM64 and bundled into Studio packages. Successful outputs are kept as run artifacts. |
+| A push to `main` | The **Latest build** pre-release is replaced with Studio builds and the standalone Frame Home installer. |
+| A tag starting with `v` (for example `v1.0`) | One version release is published with both Studio packages and the Frame Home installer. |
 | By hand | **Actions > build > Run workflow** |
 
 A newer push to the same branch cancels a run that is still going.
+Linux, macOS, and Frame Home jobs cache compiler outputs between runs; Windows/MSVC builds are not cached.
+Linux jobs also cache downloaded apt packages, and macOS caches Homebrew downloads; apt repository metadata is still refreshed each run.
 
-To publish a version:
+To publish versions:
 
 ```sh
 git tag v1.0
@@ -132,58 +140,45 @@ To download a build from any run:
 2. Click the run (each push is one).
 3. Scroll down to **Artifacts** and download the one you need. You must be signed in.
 
-## The headset side
+## Frame Home payload
 
-Frame Home (`frame-home`), the Environments panel (`frame-switcher`), `fenv-tool` and the compositor layer are built
-on the Steam Frame itself, against SteamVR's own OpenVR library (`/opt/steamvr/bin/linuxarm64`, set by
-`OPENVR_LIB_DIR`). You need a C++17 compiler, CMake, Ninja and the Vulkan headers on the headset.
+The release payload is built from source by GitHub Actions on ARM64 Linux, currently pinned to glibc 2.39 for compatibility with SteamOS stable/beta. The same artifact is used by Studio packages and the standalone installer.
 
-1. Copy the repository to the headset and log in: `ssh frame`.
-2. Build the programs with the top-level `CMakeLists.txt`:
-
-   ```sh
-   cd ~/frame-env
-   cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
-   cmake --build build
-   ```
-
-   This makes `build/frame-home`, `build/frame-switcher` and `build/fenv-tool`.
-3. Build the compositor layer (it is not part of CMake):
-
-   ```sh
-   mkdir -p build/layer
-   g++ -O2 -shared -fPIC -std=c++17 -fvisibility=hidden layer/frame_home_layer.cpp -o build/layer/libframe_home_layer.so -lpthread
-   ```
-
-4. Compile the layer's shader `layer/env_ps.frag` to SPIR-V, for example with glslc:
-
-   ```sh
-   glslc layer/env_ps.frag -o build/layer/env_ps.spv
-   ```
-
-### Refreshing frame/payload
-
-`frame/payload/` is the ready-built copy that every Studio build and the installer carry. After building on the
-headset, copy the results into it:
-
-| From (on the headset) | To (in the repository) |
-|---|---|
-| `build/frame-home`, `build/frame-switcher`, `build/fenv-tool` | `frame/payload/bin/` |
-| `build/layer/libframe_home_layer.so`, `build/layer/env_ps.spv` | `frame/payload/layer/` |
-
-`frame/payload/install.sh` is the installer itself; it lives in the repository and needs no build.
-
-Then record which source they were built from, and commit the new payload together with the code that changed:
+To build and test on the Steam Frame, run:
 
 ```sh
-sh scripts/frame-payload.sh stamp
+sh scripts/build-frame-home.sh
 ```
 
-`frame/payload/SOURCE` holds a hash of everything the headset side is built from (`src/`, `third_party/`, `layer/`,
-`CMakeLists.txt`). `sh scripts/frame-payload.sh check` tells you whether the payload is still current. The release
-build runs it too and publishes nothing while the payload is older than the source: a Studio beside an older Frame
-Home saves environments the headset can't open. Studio also asks the headset (`fenv-tool version`) before
-**Send to Frame** and says when its Frame Home needs updating.
+This uses the headset's native OpenVR library and Vulkan SDK, normally at `/opt/steamvr/bin/linuxarm64`, and requires
+CMake, Ninja, a C/C++ compiler, `glslc`, `zip`, and Python 3. Set `OPENVR_LIB_DIR` if SteamVR is installed elsewhere. The
+payload, installer ZIP, and build manifest are written under `build/frame-home/`; the build manifest is included in the
+payload artifact as `build/frame-home/payload/build-info.txt`. This mode accepts the headset's
+installed glibc version, including Preview's 2.43; those local outputs are for development and are not the release
+build for stable/beta.
+
+CI selects release mode explicitly with `sh scripts/build-frame-home.sh --ci` (or `FRAME_HOME_BUILD_MODE=ci`). It
+requires ARM64 Linux with glibc 2.39 and GCC 13, then checks the ELF architecture and GLIBC symbol ceiling before
+packaging. The build manifest records compiler/tool versions, dynamic dependencies, and
+GLIBC/GLIBCXX/CXXABI requirements in `build/frame-home/payload/build-info.txt`; CI keeps it with the payload artifact. Studio can
+bundle a locally built or downloaded payload by setting `FRAME_HOME_PAYLOAD_DIR` to that payload directory. The
+installer ZIP is checked against a Frame Home-only file allowlist before it is published.
+
+Studio checks the headset's `fenv-tool version` before **Send to Frame** and warns when the headset cannot open the
+scene format Studio would save.
+
+### Attestations
+
+Frame Home installer and Studio release archives carry GitHub build-provenance attestations. With GitHub CLI, verify
+an asset from the repository root:
+
+```sh
+gh attestation verify FrameHome-installer.zip --repo Toastconcern/FrameStudio
+gh attestation verify FrameStudio-linux-x64.tar.gz --repo Toastconcern/FrameStudio
+```
+
+The attestation identifies the repository, workflow, source ref and commit that produced the archive. It does not
+replace runtime signature verification by the installer or updater.
 
 ## Repository layout
 

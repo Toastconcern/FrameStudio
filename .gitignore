@@ -1,6 +1,10 @@
 # build output
 /build*/
 /dist/
+/frame/payload/bin/
+/frame/payload/layer/libframe_home_layer.so
+/frame/payload/layer/env_ps.spv
+/frame/payload/SOURCE
 studio/build*/
 tools/*/build*/
 # editor / OS clutter

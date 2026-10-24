@@ -18,10 +18,9 @@ headset runs, and lets you edit, save and send them to the headset.
 
 ## Downloads
 
-Every push builds everything. The newest build of `main` is always on the Releases page as **Latest build**; tagged
-versions (`v1.0`, ...) get their own release. Builds of other branches are under Actions (open a run, then
-Artifacts). Once installed, Frame Studio and Frame Home both update themselves from **Latest build**: Studio from its
-top bar, Frame Home from the Environments panel on the headset.
+Every push builds Frame Studio and its matching Frame Home payload. The **Latest build** release contains both Studio
+packages and `FrameHome-installer.zip`; each `v*` version release contains both products too. Studio updates from its
+top bar, and Frame Home updates from the Environments panel on the headset. Both use the same release channel.
 
 | Computer | Frame Studio |
 |---|---|
@@ -38,6 +37,8 @@ top bar, Frame Home from the Environments panel on the headset.
 Studio needs a GPU with Vulkan 1.2: any recent NVIDIA, AMD or Intel driver on Windows and Linux. On a Mac, Vulkan
 runs on Metal through MoltenVK, which comes inside the app. The 32-bit builds have at most 4 GB to work in, so the
 very largest homes may not fit.
+
+See [Installing Frame Home](docs/install-frame-home.md) for how to install the runtime on a Steam Frame.
 
 ## Highlights
 
@@ -75,7 +76,7 @@ very largest homes may not fit.
 | [Performance](docs/performance.md) | Reaching 120 fps, checking it, fixing stutter |
 | [Frame Studio guide](docs/studio-guide.md) | The Studio window, tools and panels |
 | [Bundles](docs/bundles.md) | Several environments in one `.fbundle` |
-| [Building from source](docs/building.md) | Building on each system, CI, the headset side |
+| [Building from source](docs/building.md) | Building on each system, CI, and Frame Home payload builds |
 | [Troubleshooting](docs/troubleshooting.md) | Symptoms and fixes, logs, the self-test |
 
 ## Building from source
@@ -87,8 +88,8 @@ Everything Studio needs is in `third_party/`; you need CMake 3.16+ and Ninja. In
 | Windows (Visual Studio 2022 with C++) | `studio\build_windows.bat x64` (or `x86`, `arm64`) |
 | Linux, macOS | `scripts/build-studio.sh <target>...` or `scripts/build-studio.sh all` |
 
-The headset side is built on the Steam Frame; a ready-built copy is in `frame/payload/`. Full details, prerequisites
-and the CI: [docs/building.md](docs/building.md).
+Frame Home binaries are built in GitHub Actions and are not checked into `frame/payload/`. Full details, prerequisites
+and CI: [docs/building.md](docs/building.md).
 
 ## Repository layout
 
@@ -97,7 +98,7 @@ and the CI: [docs/building.md](docs/building.md).
 | `studio/` | Frame Studio: `studio.cpp` (the editor), `platform*.{h,cpp}` (Windows, Linux, macOS), `frame_pacer.h` |
 | `src/` | Shared engine: renderer (`hsl_renderer`), scene loading and baking, `.fenv`, walkable area, Frame Home (`main.cpp`), the Environments panel (`switcher.cpp`), `fenv-tool` |
 | `layer/` | The Vulkan layer inside SteamVR's compositor that shows Frame Home in place of its environment |
-| `frame/` | The headset payload and the stand-alone installers |
+| `frame/` | Frame Home installer source and stand-alone installer scripts |
 | `scripts/`, `cmake/` | Build script and the llvm-mingw toolchain file |
 | `tools/`, `tests_loco/` | Test and measuring tools, movement tests |
 | `third_party/` | Vendored libraries (each with its own license) |

@@ -10,14 +10,13 @@
 #                                          (on Windows itself: studio\build_windows.bat x64|x86|arm64)
 #   macos-arm64  macos-x64                 on a Mac with Xcode's command line tools; MoltenVK is bundled into the
 #                                          app from $MOLTENVK (a libMoltenVK.dylib) or Homebrew's molten-vk
-#   frame-home                             the Steam Frame installer on its own (no Studio needed): the headset
-#                                          files from frame/payload and the install scripts
 #   all                                    every target this computer can build
-# Output: dist/FrameStudio-<target>.zip (.tar.gz on Linux) and dist/FrameHome-installer.zip.
+# Output: dist/FrameStudio-<target>.zip (.tar.gz on Linux).
 set -eu
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 DIST="$ROOT/dist"
 BUILD="$ROOT/build"
+FRAME_PAYLOAD_DIR=${FRAME_HOME_PAYLOAD_DIR:-}
 CMAKE=${CMAKE:-cmake}
 TARGETS=""
 while [ $# -gt 0 ]; do
@@ -28,15 +27,33 @@ while [ $# -gt 0 ]; do
     esac
 done
 [ -n "$TARGETS" ] || { sed -n '2,19p' "$0"; exit 1; }
+if [ -z "$FRAME_PAYLOAD_DIR" ]; then
+    for candidate in "$BUILD/frame-home/payload" "$ROOT/build/frame-home/payload"; do
+        if [ -d "$candidate" ]; then FRAME_PAYLOAD_DIR=$candidate; break; fi
+    done
+    [ -n "$FRAME_PAYLOAD_DIR" ] || FRAME_PAYLOAD_DIR="$ROOT/frame/payload"
+fi
 mkdir -p "$DIST" "$BUILD"
 say() { echo "build-studio: $*"; }
+say "using Frame Home payload: $FRAME_PAYLOAD_DIR"
+
+configure() {
+    source=$1; dir=$2; shift 2
+    if [ "${FRAME_USE_CCACHE:-0}" = 1 ]; then
+        command -v ccache >/dev/null 2>&1 || { say "FRAME_USE_CCACHE is set but ccache is unavailable"; exit 1; }
+        "$CMAKE" -S "$source" -B "$dir" -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache "$@"
+    else
+        "$CMAKE" -S "$source" -B "$dir" -DCMAKE_BUILD_TYPE=Release "$@"
+    fi
+}
 
 if [ "$TARGETS" = " all" ]; then
     case "$(uname -s)" in
-        Darwin) TARGETS="macos-arm64 macos-x64 frame-home" ;;
+        Darwin) TARGETS="macos-arm64 macos-x64" ;;
         *) case "$(uname -m)" in
-               aarch64|arm64) TARGETS="linux-arm64 frame-home" ;;
-               *) TARGETS="linux-x64 linux-x86 frame-home" ;;
+               aarch64|arm64) TARGETS="linux-arm64" ;;
+               *) TARGETS="linux-x64 linux-x86" ;;
            esac
            [ -x "${LLVM_MINGW:-$HOME/.local/opt/llvm-mingw}/bin/x86_64-w64-mingw32-clang" ] && TARGETS="$TARGETS windows-x64 windows-x86 windows-arm64" ;;
     esac
@@ -47,7 +64,7 @@ build() {
     target=$1; shift
     dir="$BUILD/$target"
     say "building $target"
-    "$CMAKE" -S "$ROOT/studio" -B "$dir" -DCMAKE_BUILD_TYPE=Release "$@" > "$dir.configure.log" 2>&1 || {
+    configure "$ROOT/studio" "$dir" "-DFRAME_HOME_PAYLOAD_DIR=$FRAME_PAYLOAD_DIR" "$@" > "$dir.configure.log" 2>&1 || {
         tail -20 "$dir.configure.log"; say "$target: configure failed (full log: $dir.configure.log)"; exit 1; }
     "$CMAKE" --build "$dir" --target frame-studio --parallel
 }
@@ -58,7 +75,7 @@ build_pc_home() {
     target=$1; shift
     dir="$BUILD/$target-home"
     say "building Frame Home for $target's SteamVR"
-    "$CMAKE" -S "$ROOT" -B "$dir" -DCMAKE_BUILD_TYPE=Release -DFRAME_HOME_PC=ON "$@" > "$dir.configure.log" 2>&1 || {
+    configure "$ROOT" "$dir" -DFRAME_HOME_PC=ON "$@" > "$dir.configure.log" 2>&1 || {
         tail -20 "$dir.configure.log"; say "$target: Frame Home configure failed (full log: $dir.configure.log)"; exit 1; }
     "$CMAKE" --build "$dir" --target frame-home frame-switcher --parallel
 }
@@ -73,8 +90,8 @@ stage_pc() {
                      cp "$home/frame-home" "$home/frame-switcher" "$stage/pc/bin/"
                      ${CXX:-g++} -O2 -shared -fPIC -std=c++17 -fvisibility=hidden -I"$ROOT/third_party/vulkan-headers/include" -I"$ROOT/src" \
                         "$ROOT/layer/frame_home_layer.cpp" -o "$stage/pc/layer/libframe_home_layer.so" -lpthread
-                     cp "$ROOT/frame/payload/layer/env_ps.spv" "$stage/pc/layer/"
-                     cp "$ROOT/frame/payload/install.sh" "$stage/pc/" && chmod +x "$stage/pc/install.sh" "$stage"/pc/bin/* ;;
+                     cp "$FRAME_PAYLOAD_DIR/layer/env_ps.spv" "$stage/pc/layer/"
+                     cp "$FRAME_PAYLOAD_DIR/install.sh" "$stage/pc/" && chmod +x "$stage/pc/install.sh" "$stage"/pc/bin/* ;;
     esac
 }
 
@@ -112,18 +129,6 @@ bundle_moltenvk() {
     fi
 }
 
-# dist/FrameHome-installer.zip: Frame Home for the Steam Frame, installed without Frame Studio
-package_frame_home() {
-    stage="$BUILD/stage/FrameHome-installer"
-    rm -rf "$stage" && mkdir -p "$stage"
-    cp -R "$ROOT/frame/payload" "$stage/payload"
-    cp "$ROOT/LICENSE" "$stage/LICENSE.txt"
-    cp "$ROOT/frame/install-frame-home.sh" "$ROOT/frame/install-frame-home.ps1" "$ROOT/frame/Install Frame Home.bat" "$ROOT/frame/README-frame-home.txt" "$stage/"
-    chmod +x "$stage/install-frame-home.sh" "$stage/payload/install.sh" "$stage"/payload/bin/* 2>/dev/null || true
-    (cd "$BUILD/stage" && rm -f "$DIST/FrameHome-installer.zip" && zip -qr "$DIST/FrameHome-installer.zip" FrameHome-installer)
-    say "frame-home -> dist/FrameHome-installer.zip"
-}
-
 for t in $TARGETS; do
     case "$t" in
         linux-x64) build "$t" -G Ninja && build_pc_home "$t" -G Ninja && package "$t" ;;
@@ -135,7 +140,6 @@ for t in $TARGETS; do
         windows-arm64) build "$t" -G Ninja -DCMAKE_TOOLCHAIN_FILE="$ROOT/cmake/llvm-mingw.cmake" -DWINDOWS_ARCH=aarch64 && package "$t" ;;
         macos-arm64) build "$t" -G Ninja -DCMAKE_OSX_ARCHITECTURES=arm64 -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0 && package "$t" ;;
         macos-x64) build "$t" -G Ninja -DCMAKE_OSX_ARCHITECTURES=x86_64 -DCMAKE_OSX_DEPLOYMENT_TARGET=10.15 && package "$t" ;;
-        frame-home) package_frame_home ;;
         *) say "unknown target: $t (see --help)"; exit 1 ;;
     esac
 done

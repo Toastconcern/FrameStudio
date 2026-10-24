@@ -1,13 +1,17 @@
-# Builds Frame Studio for every computer it runs on, and the Frame Home installer, on every push (any branch or tag),
-# every pull request, and by hand (Actions > build > Run workflow). Each build is a downloadable artifact of the run.
-# A push to main also replaces the "latest" pre-release with them (one place to download the newest of everything);
-# a tag "v*" publishes them as that version's release.
+# Builds Frame Studio for every computer it runs on, plus a same-commit Frame Home payload, on branch pushes,
+# pull requests, and by hand (Actions > build > Run workflow). A push to main replaces the Studio "latest" pre-release
+# and includes the Frame Home installer. A tag "v*" publishes a versioned release containing both products.
 name: build
 
 on:
   push:
+    branches: ['**']
+    tags: ['v*']
   pull_request:
   workflow_dispatch:
+
+permissions:
+  contents: read
 
 # A newer push to the same branch replaces a run still going (its builds would be out of date anyway).
 concurrency:
@@ -17,10 +21,12 @@ concurrency:
 # Every Studio build knows the commit it's from (studio/updater.h compares it with the latest release's).
 env:
   FRAME_BUILD: ${{ github.sha }}
+  FRAME_HOME_PAYLOAD_DIR: ${{ github.workspace }}/build/frame-home/payload
 
 jobs:
   linux:
     name: Linux ${{ matrix.arch }}
+    needs: [frame-home]
     strategy:
       fail-fast: false
       matrix:
@@ -31,23 +37,54 @@ jobs:
           - { arch: arm64, runner: ubuntu-24.04-arm, extra: "" }
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
+    env:
+      FRAME_USE_CCACHE: "1"
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      CCACHE_MAXSIZE: 500M
+      CCACHE_COMPILERCHECK: content
+      APT_CACHE_DIR: ${{ github.workspace }}/.apt-cache
     steps:
-      - uses: actions/checkout@v4
+      - name: Check out source
+        uses: actions/checkout@v4
+      - name: Restore compiler cache
+        uses: actions/cache@v5
+        with:
+          path: ${{ github.workspace }}/.ccache
+          key: ccache-studio-linux-${{ matrix.arch }}-${{ github.sha }}
+          restore-keys: ccache-studio-linux-${{ matrix.arch }}-
+      - name: Restore apt package cache
+        uses: actions/cache@v5
+        with:
+          path: .apt-cache/archives
+          key: apt-ubuntu-24.04-${{ matrix.arch }}-${{ hashFiles('.github/workflows/build.yml') }}
+          restore-keys: apt-ubuntu-24.04-${{ matrix.arch }}-
+      - name: Download Frame Home payload
+        uses: actions/download-artifact@v4
+        with:
+          name: FrameHome-payload
+          path: build/frame-home/payload
       - name: Tools and X11 headers
         run: |
           # x86 links against 32-bit X11, so apt needs the i386 packages too
           if [ "${{ matrix.i386 }}" = "true" ]; then sudo dpkg --add-architecture i386; fi
+          sudo mkdir -p "$APT_CACHE_DIR/archives/partial"
+          sudo chown _apt:root "$APT_CACHE_DIR/archives/partial"
           sudo apt-get update
-          sudo apt-get install -y ninja-build cmake libx11-dev libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev libxkbcommon-dev ${{ matrix.extra }}
+          sudo apt-get -o Dir::Cache::archives="$APT_CACHE_DIR/archives" install -y ccache ninja-build cmake libx11-dev libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev libxkbcommon-dev ${{ matrix.extra }}
+          sudo chown -R "$(id -u):$(id -g)" "$APT_CACHE_DIR/archives"
       - name: Build
         run: sh scripts/build-studio.sh linux-${{ matrix.arch }}
-      - uses: actions/upload-artifact@v4
+      - name: Show compiler cache statistics
+        run: ccache --show-stats
+      - name: Upload Linux build
+        uses: actions/upload-artifact@v4
         with:
           name: FrameStudio-linux-${{ matrix.arch }}
-          path: dist/FrameStudio-linux-${{ matrix.arch }}.tar.gz
+          path: build/stage/FrameStudio-linux-${{ matrix.arch }}
 
   windows:
     name: Windows ${{ matrix.arch }}
+    needs: [frame-home]
     strategy:
       fail-fast: false
       matrix:
@@ -55,7 +92,13 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
+      - name: Check out source
+        uses: actions/checkout@v4
+      - name: Download Frame Home payload
+        uses: actions/download-artifact@v4
+        with:
+          name: FrameHome-payload
+          path: build/frame-home/payload
       - name: Build (MSVC)
         shell: cmd
         run: studio\build_windows.bat ${{ matrix.arch }} "%GITHUB_WORKSPACE%\build\windows-${{ matrix.arch }}"
@@ -68,15 +111,15 @@ jobs:
           Copy-Item "build/windows-${{ matrix.arch }}/Frame Studio.exe" $stage
           Copy-Item -Recurse "build/windows-${{ matrix.arch }}/frame" "$stage/frame"
           Copy-Item LICENSE "$stage/LICENSE.txt"
-          New-Item -ItemType Directory -Force dist | Out-Null
-          Compress-Archive -Path $stage -DestinationPath "dist/$name.zip" -Force
-      - uses: actions/upload-artifact@v4
+      - name: Upload Windows build
+        uses: actions/upload-artifact@v4
         with:
           name: FrameStudio-windows-${{ matrix.arch }}
-          path: dist/FrameStudio-windows-${{ matrix.arch }}.zip
+          path: build/stage/FrameStudio-windows-${{ matrix.arch }}
 
   macos:
     name: macOS ${{ matrix.arch }}
+    needs: [frame-home]
     strategy:
       fail-fast: false
       matrix:
@@ -87,32 +130,90 @@ jobs:
           - { arch: x64, runner: macos-15-intel }
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
+    env:
+      FRAME_USE_CCACHE: "1"
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      CCACHE_MAXSIZE: 500M
+      CCACHE_COMPILERCHECK: content
     steps:
-      - uses: actions/checkout@v4
+      - name: Check out source
+        uses: actions/checkout@v4
+      - name: Restore compiler cache
+        uses: actions/cache@v5
+        with:
+          path: ${{ github.workspace }}/.ccache
+          key: ccache-studio-macos-${{ matrix.arch }}-${{ github.sha }}
+          restore-keys: ccache-studio-macos-${{ matrix.arch }}-
+      - name: Restore Homebrew package cache
+        uses: actions/cache@v5
+        with:
+          path: ~/Library/Caches/Homebrew/downloads
+          key: brew-macos-${{ matrix.arch }}-${{ hashFiles('.github/workflows/build.yml') }}
+          restore-keys: brew-macos-${{ matrix.arch }}-
+      - name: Download Frame Home payload
+        uses: actions/download-artifact@v4
+        with:
+          name: FrameHome-payload
+          path: build/frame-home/payload
       - name: Tools and MoltenVK (Vulkan on Metal, bundled into the app)
-        run: brew install ninja molten-vk
+        run: brew install ccache ninja molten-vk
       - name: Build
         run: sh scripts/build-studio.sh macos-${{ matrix.arch }}
-      - uses: actions/upload-artifact@v4
+      - name: Show compiler cache statistics
+        run: ccache --show-stats
+      - name: Upload macOS build
+        uses: actions/upload-artifact@v4
         with:
           name: FrameStudio-macos-${{ matrix.arch }}
-          path: dist/FrameStudio-macos-${{ matrix.arch }}.zip
+          path: build/stage/FrameStudio-macos-${{ matrix.arch }}
 
   frame-home:
-    name: Frame Home installer
-    runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    name: Build Frame Home payload
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 45
+    env:
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      CCACHE_MAXSIZE: 500M
+      CCACHE_COMPILERCHECK: content
+      APT_CACHE_DIR: ${{ github.workspace }}/.apt-cache
     steps:
-      - uses: actions/checkout@v4
-      - name: Headset programs match the source
-        run: sh scripts/frame-payload.sh check
-      - name: Package
-        run: sh scripts/build-studio.sh frame-home
-      - uses: actions/upload-artifact@v4
+      - name: Check out source
+        uses: actions/checkout@v4
+      - name: Restore compiler cache
+        uses: actions/cache@v5
+        with:
+          path: ${{ github.workspace }}/.ccache
+          key: ccache-frame-home-arm64-${{ github.sha }}
+          restore-keys: ccache-frame-home-arm64-
+      - name: Restore apt package cache
+        uses: actions/cache@v5
+        with:
+          path: .apt-cache/archives
+          key: apt-ubuntu-24.04-arm64-${{ hashFiles('.github/workflows/build.yml') }}
+          restore-keys: apt-ubuntu-24.04-arm64-
+      - name: Install Frame Home build dependencies
+        run: |
+          set -euo pipefail
+          sudo mkdir -p "$APT_CACHE_DIR/archives/partial"
+          sudo chown _apt:root "$APT_CACHE_DIR/archives/partial"
+          sudo apt-get update
+          sudo apt-get -o Dir::Cache::archives="$APT_CACHE_DIR/archives" install -y ccache cmake ninja-build gcc-13 g++-13 glslc zip libdeflate-dev
+          sudo chown -R "$(id -u):$(id -g)" "$APT_CACHE_DIR/archives"
+      - name: Build payload and installer
+        run: sh scripts/build-frame-home.sh --ci
+      - name: Show compiler cache statistics
+        run: ccache --show-stats
+      - name: Upload Frame Home payload
+        uses: actions/upload-artifact@v4
+        with:
+          name: FrameHome-payload
+          path: build/frame-home/payload
+      - name: Upload Frame Home installer
+        uses: actions/upload-artifact@v4
         with:
           name: FrameHome-installer
-          path: dist/FrameHome-installer.zip
-
+          path: build/frame-home/FrameHome-installer-stage/FrameHome-installer
+          if-no-files-found: error
   release:
     name: Publish
     # "latest" gets every build that finished (a failed or still-slow platform just isn't in it); a version release
@@ -125,30 +226,88 @@ jobs:
     timeout-minutes: 20
     permissions:
       contents: write
+      id-token: write
+      attestations: write
     env:
       GH_TOKEN: ${{ github.token }}
       REPO: ${{ github.repository }}
     steps:
-      - uses: actions/download-artifact@v4
+      - name: Download Studio build artifacts
+        uses: actions/download-artifact@v4
         with:
+          pattern: FrameStudio-*
           path: dist
-          merge-multiple: true
-      - uses: actions/checkout@v4
+          merge-multiple: false
+      - name: Download Frame Home payload
+        uses: actions/download-artifact@v4
         with:
-          path: src
-      # Every download carries frame/payload: none is published beside headset programs older than the source
-      # (Studio would save environments the headset can't open).
-      - name: Headset programs match the source
-        run: sh src/scripts/frame-payload.sh check
+          name: FrameHome-payload
+          path: ${{ runner.temp }}/frame-home-payload
+      - name: Download Frame Home installer
+        uses: actions/download-artifact@v4
+        with:
+          name: FrameHome-installer
+          path: dist/FrameHome-installer
+      - name: Rebuild release archives
+        run: |
+          for package in dist/FrameStudio-linux-*; do
+            [ -d "$package" ] || continue
+            name=${package##*/}
+            # (artifacts don't keep file modes: the program itself has to be executable again)
+            chmod +x "$package/Frame Studio"
+            if [ -d "$package/frame/bin" ]; then
+              chmod +x "$package/frame/install.sh" "$package/frame/bin/"*
+            fi
+            if [ -d "$package/pc/bin" ]; then
+              chmod +x "$package/pc/install.sh" "$package/pc/bin/"*
+            fi
+            tar -czf "dist/$name.tar.gz" -C dist "$name"
+            rm -rf "$package"
+          done
+          for package in dist/FrameStudio-windows-* dist/FrameStudio-macos-*; do
+            [ -d "$package" ] || continue
+            name=${package##*/}
+            if [ -d "$package/frame/bin" ]; then
+              chmod +x "$package/frame/install.sh" "$package/frame/bin/"*
+            fi
+            if [[ "$name" == FrameStudio-macos-* ]]; then
+              chmod +x "$package/Frame Studio.app/Contents/MacOS/Frame Studio"
+            fi
+            (cd dist && zip -qr "$name.zip" "$name")
+            rm -rf "$package"
+          done
+          chmod +x dist/FrameHome-installer/install-frame-home.sh \
+            dist/FrameHome-installer/payload/install.sh \
+            dist/FrameHome-installer/payload/bin/*
+          (cd dist && zip -qr FrameHome-installer.zip FrameHome-installer)
+          rm -rf dist/FrameHome-installer
+          python3 - <<'PY'
+          from pathlib import Path
+          from zipfile import ZipFile
+
+          for path in Path("dist").glob("*.zip"):
+              with ZipFile(path) as archive:
+                  nested = [name for name in archive.namelist() if name.lower().endswith(".zip")]
+                  if nested:
+                      raise SystemExit(f"{path} contains nested ZIP files: {nested}")
+          PY
       # What Frame Studio (studio/updater.h) and the headset's Environments panel check for updates: this commit,
       # Frame Home's identity (a hash of the headset programs, the same one the panel works out for what's installed)
       # and the files in this release.
       - name: latest.json
         run: |
-          home=$(cd src/frame/payload && sha256sum bin/frame-home bin/frame-switcher bin/fenv-tool layer/libframe_home_layer.so layer/env_ps.spv | cut -c1-64 | sha256sum | cut -c1-64)
+          home=$(cd "$RUNNER_TEMP/frame-home-payload" && sha256sum bin/frame-home bin/frame-switcher bin/fenv-tool layer/libframe_home_layer.so layer/env_ps.spv | cut -c1-64 | sha256sum | cut -c1-64)
           files=$(ls dist | python3 -c 'import json, sys; print(json.dumps([l.strip() for l in sys.stdin if l.strip()]))')
           printf '{"build": "%s", "home": "%s", "date": "%s", "files": %s}\n' "$GITHUB_SHA" "$home" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$files" > dist/latest.json
           cat dist/latest.json
+      - name: Attest Studio release archives
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: dist/FrameStudio-*
+      - name: Attest Frame Home installer
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: dist/FrameHome-installer.zip
       - name: Version release (tag v*)
         if: ${{ startsWith(github.ref, 'refs/tags/v') && !contains(needs.*.result, 'failure') }}
         run: gh release create "${{ github.ref_name }}" dist/* --repo "$REPO" --title "Frame Studio ${{ github.ref_name }}" --generate-notes

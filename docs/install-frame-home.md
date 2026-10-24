@@ -1,10 +1,10 @@
 # Installing Frame Home
 
-Frame Home is the part that runs on the Steam Frame. There are three ways to install it. All three do the same
+Frame Home is the part that runs on the Steam Frame. There are four ways to install it. All four do the same
 thing on the headset: they copy the files and run the same installer (`install.sh`).
 
-Before you start, the headset needs developer mode and SSH: see [headset-setup.md](headset-setup.md). The third way
-(on the headset itself) needs no SSH.
+Before you start, the headset needs developer mode and SSH for the computer-based methods: see
+[headset-setup.md](headset-setup.md). The two methods on the headset itself need no SSH.
 
 ## Way 1: from Frame Studio
 
@@ -23,10 +23,28 @@ Environments already on the headset with the same name and size are not copied a
 
 Studio connects without asking for passwords, so it needs an SSH key (see [headset-setup.md](headset-setup.md)).
 
-## Way 2: with FrameHome-installer.zip, from any computer
+## Way 2: Install script from GitHub on the Steam Frame
 
-Download `FrameHome-installer.zip` from the Releases page (see [getting-started.md](getting-started.md#download))
-and unpack it. Inside are:
+In Desktop Mode, open Konsole and run:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/Toastconcern/FrameStudio/main/frame/install-frame-home-online.sh | bash
+```
+
+This downloads the installer from the shared **Latest build** release. To install a versioned release instead, set
+`FRAME_HOME_TAG` to its tag, for example:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/Toastconcern/FrameStudio/main/frame/install-frame-home-online.sh | FRAME_HOME_TAG=v1.0 bash
+```
+
+The bootstrap requires `curl` and `unzip`, verifies the downloaded ZIP, and runs the same `payload/install.sh` used
+by the other install methods. Put `.fenv` files in `~/frame-home/envs`; the Environments panel lists them.
+
+## Way 3: with FrameHome-installer.zip, from any computer
+
+Download `FrameHome-installer.zip` from **Latest build** or a `v*` version release, then unpack it. Frame Home and
+Studio share the same releases and tags, but this ZIP contains only Frame Home files. Inside are:
 
 | File | For |
 |---|---|
@@ -78,7 +96,7 @@ sh install-frame-home.sh --host steamos@192.168.1.50 my-home.fenv another.fenv
 Copied environments get a headset-friendly name: lower case, spaces become dashes, and only letters, digits, `.`,
 `_` and `-` are kept. `My Home.fenv` becomes `my-home.fenv`.
 
-## Way 3: directly on the headset
+## Way 4: from a downloaded folder on the headset
 
 1. Switch the headset to Desktop Mode.
 2. Copy the unpacked `FrameHome-installer` folder to the headset (USB stick, network share, or a download in the

@@ -94,8 +94,9 @@ if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
     set_source_files_properties("${TP}/qhe/cook/hzanim_acl.cpp" PROPERTIES COMPILE_OPTIONS "-flax-vector-conversions")
 endif()
 target_link_libraries(frame-scene PUBLIC miniz lzma smolv ${ASTCENC_LIB} pthread)
-# libdeflate when the system has it (the Frame): APK scene.zips inflate several times faster than with miniz.
-find_library(LIBDEFLATE_LIB deflate)
+# libdeflate when the system has it (the Frame, CI): APK scene.zips inflate several times faster than with miniz. Its
+# static library first, so a release build doesn't need it installed on the headset.
+find_library(LIBDEFLATE_LIB NAMES libdeflate.a deflate)
 find_path(LIBDEFLATE_INC libdeflate.h)
 if(LIBDEFLATE_LIB AND LIBDEFLATE_INC)
     target_compile_definitions(frame-scene PUBLIC QHE_HAVE_LIBDEFLATE)

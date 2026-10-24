@@ -24,8 +24,8 @@ CMake and Ninja.
    studio\build_windows.bat x64
    ```
 
-   Studio packages the CI-built headset payload. Download the `FrameHome-payload` artifact from an Actions run and set
-   `FRAME_HOME_PAYLOAD_DIR` to its extracted directory before running the build script.
+   Download the `FrameHome-payload` artifact from an Actions run, extract it, and set `FRAME_HOME_PAYLOAD_DIR` to
+   its payload directory before running the batch file, or [build it manually](#frame-home-payload).
 
    Use `x86` for 32-bit Windows or `arm64` for Windows on ARM instead of `x64`.
 3. The program is `%LOCALAPPDATA%\FrameStudio\build-x64\Frame Studio.exe` (the folder ends in your architecture).
@@ -43,6 +43,8 @@ scripts/build-studio.sh TARGET... [--build-dir DIR]
 ```
 
 Each target is built and packed into `dist/`. `scripts/build-studio.sh --help` lists them.
+The script uses `build/frame-home/payload` when present. Set `FRAME_HOME_PAYLOAD_DIR` to use a payload from another
+location.
 
 | Target | Build on | Output |
 |---|---|---|

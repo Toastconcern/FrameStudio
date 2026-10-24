@@ -16,7 +16,7 @@ set -eu
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 DIST="$ROOT/dist"
 BUILD="$ROOT/build"
-FRAME_PAYLOAD_DIR=${FRAME_HOME_PAYLOAD_DIR:-"$ROOT/frame/payload"}
+FRAME_PAYLOAD_DIR=${FRAME_HOME_PAYLOAD_DIR:-}
 CMAKE=${CMAKE:-cmake}
 TARGETS=""
 while [ $# -gt 0 ]; do
@@ -27,8 +27,15 @@ while [ $# -gt 0 ]; do
     esac
 done
 [ -n "$TARGETS" ] || { sed -n '2,19p' "$0"; exit 1; }
+if [ -z "$FRAME_PAYLOAD_DIR" ]; then
+    for candidate in "$BUILD/frame-home/payload" "$ROOT/build/frame-home/payload"; do
+        if [ -d "$candidate" ]; then FRAME_PAYLOAD_DIR=$candidate; break; fi
+    done
+    [ -n "$FRAME_PAYLOAD_DIR" ] || FRAME_PAYLOAD_DIR="$ROOT/frame/payload"
+fi
 mkdir -p "$DIST" "$BUILD"
 say() { echo "build-studio: $*"; }
+say "using Frame Home payload: $FRAME_PAYLOAD_DIR"
 
 if [ "$TARGETS" = " all" ]; then
     case "$(uname -s)" in

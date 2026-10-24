@@ -66,6 +66,15 @@ for binary in "$PAYLOAD/bin/"* "$PAYLOAD/layer/libframe_home_layer.so"; do
         echo "$binary requires $highest, newer than the glibc 2.39 baseline" >&2
         exit 1
     fi
+    # Release builds load only what every SteamOS has (OpenVR and Vulkan are found at run time, libdeflate is linked in).
+    if [ "$MODE" = ci ]; then
+        extra=$(readelf -d "$binary" | sed -n 's/.*(NEEDED).*\[\(.*\)\]/\1/p' |
+            grep -vxE 'libc\.so\.6|libm\.so\.6|libdl\.so\.2|libpthread\.so\.0|libstdc\+\+\.so\.6|libgcc_s\.so\.1|ld-linux-aarch64\.so\.1' || true)
+        if [ -n "$extra" ]; then
+            echo "$binary needs libraries a headset may not have: $(echo $extra)" >&2
+            exit 1
+        fi
+    fi
 done
 
 {

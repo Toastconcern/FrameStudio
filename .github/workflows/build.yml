@@ -197,7 +197,7 @@ jobs:
           sudo mkdir -p "$APT_CACHE_DIR/archives/partial"
           sudo chown _apt:root "$APT_CACHE_DIR/archives/partial"
           sudo apt-get update
-          sudo apt-get -o Dir::Cache::archives="$APT_CACHE_DIR/archives" install -y ccache cmake ninja-build gcc-13 g++-13 glslc zip
+          sudo apt-get -o Dir::Cache::archives="$APT_CACHE_DIR/archives" install -y ccache cmake ninja-build gcc-13 g++-13 glslc zip libdeflate-dev
           sudo chown -R "$(id -u):$(id -g)" "$APT_CACHE_DIR/archives"
       - name: Build payload and installer
         run: sh scripts/build-frame-home.sh --ci

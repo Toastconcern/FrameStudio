@@ -708,8 +708,8 @@ DebugInfo readDebugInfo() {
 }
 
 // ── Updates (the Steam Frame only) ──
-// Frame Home updates from GitHub. The release "latest" carries latest.json, whose "home" is a hash of the headset
-// programs (frame-home, frame-switcher, fenv-tool and the compositor layer, worked out by CI from frame/payload). When
+// Frame Home updates from GitHub. The shared "latest" release carries latest.json, whose "home" is a hash of the
+// headset programs (frame-home, frame-switcher, fenv-tool and the compositor layer, worked out by CI). When
 // it isn't the hash of what's installed here, the header offers Update Frame Home: that downloads
 // FrameHome-installer.zip and runs its install.sh, which puts the new programs in place and restarts Frame Home and
 // this panel. Checked a minute after the panel starts, then every 6 hours (30 minutes after a failed check).

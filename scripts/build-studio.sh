@@ -37,6 +37,17 @@ mkdir -p "$DIST" "$BUILD"
 say() { echo "build-studio: $*"; }
 say "using Frame Home payload: $FRAME_PAYLOAD_DIR"
 
+configure() {
+    source=$1; dir=$2; shift 2
+    if [ "${FRAME_USE_CCACHE:-0}" = 1 ]; then
+        command -v ccache >/dev/null 2>&1 || { say "FRAME_USE_CCACHE is set but ccache is unavailable"; exit 1; }
+        "$CMAKE" -S "$source" -B "$dir" -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache "$@"
+    else
+        "$CMAKE" -S "$source" -B "$dir" -DCMAKE_BUILD_TYPE=Release "$@"
+    fi
+}
+
 if [ "$TARGETS" = " all" ]; then
     case "$(uname -s)" in
         Darwin) TARGETS="macos-arm64 macos-x64" ;;
@@ -53,8 +64,7 @@ build() {
     target=$1; shift
     dir="$BUILD/$target"
     say "building $target"
-    "$CMAKE" -S "$ROOT/studio" -B "$dir" -DCMAKE_BUILD_TYPE=Release \
-        "-DFRAME_HOME_PAYLOAD_DIR=$FRAME_PAYLOAD_DIR" "$@" > "$dir.configure.log" 2>&1 || {
+    configure "$ROOT/studio" "$dir" "-DFRAME_HOME_PAYLOAD_DIR=$FRAME_PAYLOAD_DIR" "$@" > "$dir.configure.log" 2>&1 || {
         tail -20 "$dir.configure.log"; say "$target: configure failed (full log: $dir.configure.log)"; exit 1; }
     "$CMAKE" --build "$dir" --target frame-studio --parallel
 }
@@ -65,7 +75,7 @@ build_pc_home() {
     target=$1; shift
     dir="$BUILD/$target-home"
     say "building Frame Home for $target's SteamVR"
-    "$CMAKE" -S "$ROOT" -B "$dir" -DCMAKE_BUILD_TYPE=Release -DFRAME_HOME_PC=ON "$@" > "$dir.configure.log" 2>&1 || {
+    configure "$ROOT" "$dir" -DFRAME_HOME_PC=ON "$@" > "$dir.configure.log" 2>&1 || {
         tail -20 "$dir.configure.log"; say "$target: Frame Home configure failed (full log: $dir.configure.log)"; exit 1; }
     "$CMAKE" --build "$dir" --target frame-home frame-switcher --parallel
 }

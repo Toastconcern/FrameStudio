@@ -31,6 +31,7 @@ for tool in cmake ninja "$CC" "$CXX" glslc readelf zip python3; do
     command -v "$tool" >/dev/null 2>&1 || { echo "Missing build tool: $tool" >&2; exit 1; }
 done
 if [ "$MODE" = ci ]; then
+    command -v ccache >/dev/null 2>&1 || { echo "Release builds require ccache" >&2; exit 1; }
     "$CXX" --version | grep -q '13\.' || { echo "Release builds require GCC 13" >&2; exit 1; }
 fi
 
@@ -38,14 +39,18 @@ if [ "$MODE" = local ]; then
     cmake -S "$ROOT" -B "$BUILD" -G Ninja -DCMAKE_BUILD_TYPE=Release -DFRAME_HOME_PC=OFF \
         "-DOPENVR_LIB_DIR=${OPENVR_LIB_DIR:-/opt/steamvr/bin/linuxarm64}"
 else
-    cmake -S "$ROOT" -B "$BUILD" -G Ninja -DCMAKE_BUILD_TYPE=Release -DFRAME_HOME_PC=ON
+    cmake -S "$ROOT" -B "$BUILD" -G Ninja -DCMAKE_BUILD_TYPE=Release -DFRAME_HOME_PC=ON \
+        -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
 fi
 cmake --build "$BUILD" --target frame-home frame-switcher fenv-tool --parallel
 
 rm -rf "$PAYLOAD" "$OUT/FrameHome-installer-stage" "$OUT/FrameHome-installer.zip"
 mkdir -p "$PAYLOAD/bin" "$PAYLOAD/layer"
 cp "$BUILD/frame-home" "$BUILD/frame-switcher" "$BUILD/fenv-tool" "$PAYLOAD/bin/"
-"$CXX" -O2 -shared -fPIC -std=c++17 -fvisibility=hidden \
+compile_layer() {
+    if [ "$MODE" = ci ]; then ccache "$CXX" "$@"; else "$CXX" "$@"; fi
+}
+compile_layer -O2 -shared -fPIC -std=c++17 -fvisibility=hidden \
     -I"$ROOT/third_party/vulkan-headers/include" -I"$ROOT/src" \
     "$ROOT/layer/frame_home_layer.cpp" -o "$PAYLOAD/layer/libframe_home_layer.so" -lpthread
 glslc "$ROOT/layer/env_ps.frag" -o "$PAYLOAD/layer/env_ps.spv"
@@ -63,6 +68,24 @@ for binary in "$PAYLOAD/bin/"* "$PAYLOAD/layer/libframe_home_layer.so"; do
     fi
 done
 
+{
+    printf 'mode=%s\n' "$MODE"
+    printf 'architecture=%s\n' "$(uname -m)"
+    printf 'libc=%s\n' "$(getconf GNU_LIBC_VERSION)"
+    printf 'c_compiler=%s\n' "$("$CC" --version | head -n 1)"
+    printf 'cxx_compiler=%s\n' "$("$CXX" --version | head -n 1)"
+    printf 'cmake=%s\n' "$(cmake --version | head -n 1)"
+    printf 'ninja=%s\n' "$(ninja --version)"
+    printf 'glslc=%s\n' "$(glslc --version | head -n 1)"
+} > "$OUT/build-info.txt"
+for binary in "$PAYLOAD/bin/"* "$PAYLOAD/layer/libframe_home_layer.so"; do
+    printf '\n[%s]\n' "${binary#"$PAYLOAD/"}" >> "$OUT/build-info.txt"
+    readelf -d "$binary" | grep -E 'NEEDED|RPATH|RUNPATH' >> "$OUT/build-info.txt" || true
+    readelf --version-info "$binary" | grep -oE '(GLIBC|GLIBCXX|CXXABI)_[0-9]+(\.[0-9]+)+' | sort -Vu | tr '\n' ' ' >> "$OUT/build-info.txt" || true
+    printf '\n' >> "$OUT/build-info.txt"
+done
+cp "$OUT/build-info.txt" "$PAYLOAD/build-info.txt"
+
 STAGE="$OUT/FrameHome-installer-stage/FrameHome-installer"
 mkdir -p "$STAGE"
 cp -R "$PAYLOAD" "$STAGE/payload"
@@ -71,13 +94,13 @@ cp "$ROOT/frame/install-frame-home.sh" "$ROOT/frame/install-frame-home.ps1" \
     "$ROOT/frame/Install Frame Home.bat" "$ROOT/frame/README-frame-home.txt" "$STAGE/"
 chmod +x "$STAGE/install-frame-home.sh"
 (cd "$OUT/FrameHome-installer-stage" && zip -qr "$OUT/FrameHome-installer.zip" FrameHome-installer)
-rm -rf "$OUT/FrameHome-installer-stage"
 python3 - "$OUT/FrameHome-installer.zip" <<'PY'
 import sys
 import zipfile
 
 required = {
     "FrameHome-installer/payload/install.sh",
+    "FrameHome-installer/payload/build-info.txt",
     "FrameHome-installer/payload/bin/frame-home",
     "FrameHome-installer/payload/bin/frame-switcher",
     "FrameHome-installer/payload/bin/fenv-tool",
@@ -102,20 +125,4 @@ with zipfile.ZipFile(sys.argv[1]) as archive:
     if missing or unexpected:
         raise SystemExit(f"Invalid Frame Home installer: missing={sorted(missing)}, unexpected={sorted(unexpected)}")
 PY
-{
-    printf 'mode=%s\n' "$MODE"
-    printf 'architecture=%s\n' "$(uname -m)"
-    printf 'libc=%s\n' "$(getconf GNU_LIBC_VERSION)"
-    printf 'c_compiler=%s\n' "$("$CC" --version | head -n 1)"
-    printf 'cxx_compiler=%s\n' "$("$CXX" --version | head -n 1)"
-    printf 'cmake=%s\n' "$(cmake --version | head -n 1)"
-    printf 'ninja=%s\n' "$(ninja --version)"
-    printf 'glslc=%s\n' "$(glslc --version | head -n 1)"
-} > "$OUT/build-info.txt"
-for binary in "$PAYLOAD/bin/"* "$PAYLOAD/layer/libframe_home_layer.so"; do
-    printf '\n[%s]\n' "${binary#"$PAYLOAD/"}" >> "$OUT/build-info.txt"
-    readelf -d "$binary" | grep -E 'NEEDED|RPATH|RUNPATH' >> "$OUT/build-info.txt" || true
-    readelf --version-info "$binary" | grep -oE '(GLIBC|GLIBCXX|CXXABI)_[0-9]+(\.[0-9]+)+' | sort -Vu | tr '\n' ' ' >> "$OUT/build-info.txt" || true
-    printf '\n' >> "$OUT/build-info.txt"
-done
-echo "Built $OUT/payload, $OUT/FrameHome-installer.zip, and $OUT/build-info.txt"
+echo "Built $OUT/payload (including build-info.txt), $OUT/FrameHome-installer.zip"

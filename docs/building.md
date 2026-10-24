@@ -122,6 +122,8 @@ rolling `latest` release and one shared `v*` tag namespace; each release contain
 | By hand | **Actions > build > Run workflow** |
 
 A newer push to the same branch cancels a run that is still going.
+Linux, macOS, and Frame Home jobs cache compiler outputs between runs; Windows/MSVC builds are not cached.
+Linux jobs also cache downloaded apt packages, and macOS caches Homebrew downloads; apt repository metadata is still refreshed each run.
 
 To publish versions:
 
@@ -148,14 +150,15 @@ sh scripts/build-frame-home.sh
 
 This uses the headset's native OpenVR library and Vulkan SDK, normally at `/opt/steamvr/bin/linuxarm64`, and requires
 CMake, Ninja, a C/C++ compiler, `glslc`, `zip`, and Python 3. Set `OPENVR_LIB_DIR` if SteamVR is installed elsewhere. The
-payload, installer ZIP, and build manifest are written under `build/frame-home/`. This mode accepts the headset's
+payload, installer ZIP, and build manifest are written under `build/frame-home/`; the build manifest is included in the
+payload artifact as `build/frame-home/payload/build-info.txt`. This mode accepts the headset's
 installed glibc version, including Preview's 2.43; those local outputs are for development and are not the release
 build for stable/beta.
 
 CI selects release mode explicitly with `sh scripts/build-frame-home.sh --ci` (or `FRAME_HOME_BUILD_MODE=ci`). It
 requires ARM64 Linux with glibc 2.39 and GCC 13, then checks the ELF architecture and GLIBC symbol ceiling before
 packaging. The build manifest records compiler/tool versions, dynamic dependencies, and
-GLIBC/GLIBCXX/CXXABI requirements in `build/frame-home/build-info.txt`; CI retains it as a run artifact. Studio can
+GLIBC/GLIBCXX/CXXABI requirements in `build/frame-home/payload/build-info.txt`; CI keeps it with the payload artifact. Studio can
 bundle a locally built or downloaded payload by setting `FRAME_HOME_PAYLOAD_DIR` to that payload directory. The
 installer ZIP is checked against a Frame Home-only file allowlist before it is published.
 

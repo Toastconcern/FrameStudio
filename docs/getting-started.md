@@ -43,7 +43,8 @@ see [install-frame-home.md](install-frame-home.md).
 2. Pick a release:
    - **Latest build** is rebuilt from the newest code every time the main branch changes. It is marked as a
      pre-release.
-   - A **version release** (for example `v1.0`) is a fixed version.
+   - A **numbered release** (for example `v0.1.51`) is a fixed version. One is published for every change to the main
+     branch; the newest is marked **Latest** on the Releases page.
 3. Download the file for your computer:
 
 | Computer | File |

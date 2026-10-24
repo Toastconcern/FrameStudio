@@ -225,6 +225,19 @@ jobs:
       GH_TOKEN: ${{ github.token }}
       REPO: ${{ github.repository }}
     steps:
+      # Every push to main is also a numbered release: VERSION (major.minor) and the number of commits on main.
+      - name: Check out history (for the version number)
+        if: github.ref == 'refs/heads/main'
+        uses: actions/checkout@v4
+        with:
+          path: src
+          fetch-depth: 0
+      - name: Version
+        if: github.ref == 'refs/heads/main'
+        run: |
+          version="v$(tr -d ' \r\n' < src/VERSION).$(git -C src rev-list --count HEAD)"
+          echo "VERSION_TAG=$version" >> "$GITHUB_ENV"
+          echo "$version"
       - name: Download Studio build artifacts
         uses: actions/download-artifact@v4
         with:
@@ -304,6 +317,16 @@ jobs:
       - name: Version release (tag v*)
         if: ${{ startsWith(github.ref, 'refs/tags/v') && !contains(needs.*.result, 'failure') }}
         run: gh release create "${{ github.ref_name }}" dist/* --repo "$REPO" --title "Frame Studio ${{ github.ref_name }}" --generate-notes
+      # The numbered release (push to main): GitHub's "Latest release", with the changes since the previous numbered
+      # one. Only when no build failed; a re-run of the same commit finds it there and leaves it.
+      - name: Numbered release (push to main)
+        if: ${{ github.ref == 'refs/heads/main' && !contains(needs.*.result, 'failure') }}
+        run: |
+          if gh release view "$VERSION_TAG" --repo "$REPO" > /dev/null 2>&1; then echo "$VERSION_TAG is already released"; exit 0; fi
+          previous=$(gh release list --repo "$REPO" --exclude-pre-releases --limit 1 --json tagName --jq '.[0].tagName // empty')
+          gh release create "$VERSION_TAG" dist/* --repo "$REPO" --target "${{ github.sha }}" --latest \
+            --title "Frame Studio $VERSION_TAG" --generate-notes ${previous:+--notes-start-tag "$previous"}
+      # The rolling "latest" pre-release: where installed Studios and headsets look for updates (latest.json).
       - name: Latest build (push to main)
         if: github.ref == 'refs/heads/main'
         run: |

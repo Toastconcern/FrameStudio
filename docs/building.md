@@ -119,7 +119,7 @@ rolling `latest` release and one shared `v*` tag namespace; each release contain
 | When | What happens |
 |---|---|
 | Every push and pull request | Studio builds for Linux (x64, arm64), Windows (x64, arm64) and macOS (Apple Silicon); Frame Home is built on ARM64 and bundled into Studio packages. Successful outputs are kept as run artifacts. 32-bit and Intel Mac builds are local only (`scripts/build-studio.sh`). |
-| A push to `main` | The **Latest build** pre-release is replaced with Studio builds and the standalone Frame Home installer. |
+| A push to `main` | A numbered release, `v<VERSION>.<commits on main>` (for example `v0.1.51`), is published with the Studio builds and the Frame Home installer, with release notes for the changes since the previous one; it becomes GitHub's **Latest release**. It is only made when no build failed. The **Latest build** pre-release is replaced too: installed copies of Studio and Frame Home update from it. |
 | A tag starting with `v` (for example `v1.0`) | One version release is published with both Studio packages and the Frame Home installer. |
 | By hand | **Actions > build > Run workflow** |
 
@@ -127,7 +127,10 @@ A newer push to the same branch cancels a run that is still going.
 Linux, macOS, and Frame Home jobs cache compiler outputs between runs; Windows/MSVC builds are not cached.
 Linux jobs also cache downloaded apt packages, and macOS caches Homebrew downloads; apt repository metadata is still refreshed each run.
 
-To publish versions:
+The first two parts of the number come from the `VERSION` file at the top of the repository (`0.1`). To start a new
+major or minor version, change it (for example to `1.0`); the last part keeps counting commits.
+
+To publish a release by hand with a name of your own:
 
 ```sh
 git tag v1.0

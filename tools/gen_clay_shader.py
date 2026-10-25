@@ -75,8 +75,9 @@ class Mod:
         return [0x07230203, 0x00010000, 0, self.next, 0] + self.w
 
 
-def build_vert(skinned=False):
-    """skinned: also in loc5 uvec4 boneIndices, loc6 vec4 boneWeights, set2 b3 uniform SkinningMatrices { mat4 joints[256]; }
+def build_vert(skinned=False, vcolor=False):
+    """vcolor: vColor = tint x the vertex colour (imported PLY / glTF meshes that carry colours; Clay homes don't).
+    skinned: also in loc5 uvec4 boneIndices, loc6 vec4 boneWeights, set2 b3 uniform SkinningMatrices { mat4 joints[256]; }
     position = sum(w_i * joints[j_i] * position) / sum(w_i), or the position itself when its weights are all 0
     (the CPU skinning's rule)."""
     m = Mod()
@@ -262,7 +263,12 @@ def build_vert(skinned=False):
     m.ins(OpCompositeConstruct, v2, tuv, tu, tv)
     m.ins(OpStore, o_uv, tuv)
     # libshell's model shader has no vertex colour: colour = BaseColorFactor (here the tint) x textures.
-    m.ins(OpStore, o_col, tint)
+    if vcolor:                                                         # imported models' own colours
+        m.ins(OpLoad, v4, col, v_col)
+        m.ins(OpFMul, v4, colt, tint, col)
+        m.ins(OpStore, o_col, colt)
+    else:
+        m.ins(OpStore, o_col, tint)
     m.ins(OpLoad, v3, nrm, v_nrm)
     m.ins(OpStore, o_nrm, nrm)
     m.ins(OpLoad, v2, uv1, v_uv1)
@@ -504,6 +510,7 @@ elif __name__ == "__main__":
             emit("kClayVertSpirv", build_vert()), "",
             emit("kClayFragSpirv", build_frag(False)), "",
             emit("kClayFragCutoutSpirv", build_frag(True)), "",
-            emit("kClaySkinnedVertSpirv", check(build_vert(True))), ""]
+            emit("kClaySkinnedVertSpirv", check(build_vert(True))), "",
+            emit("kClayVColorVertSpirv", check(build_vert(False, True))), ""]
     open(out, "w", newline="\n").write("\n".join(body))
     print("wrote", out)

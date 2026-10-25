@@ -6,6 +6,7 @@
 // settings change does); `fenv-tool tune` and Frame Studio's Calculate Best Settings work them out on the headset.
 #include "perf_settings.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <string>
@@ -71,11 +72,16 @@ struct WorldSettings {
     bool fromValue(const tinyjson::Value& d) {
         if (!d.isObject()) return false;
         *this = WorldSettings();
-        if (d.has("resolution")) resolution = static_cast<float>(d["resolution"].asFloat());
-        if (d.has("msaa")) msaa = static_cast<int>(d["msaa"].asFloat());
-        if (d.has("anisotropy")) anisotropy = static_cast<int>(d["anisotropy"].asFloat());
-        if (d.has("foveation")) foveation = static_cast<float>(d["foveation"].asFloat());
-        if (d.has("frameRate")) frameRate = static_cast<int>(d["frameRate"].asFloat());
+        // (a file's numbers: inf / NaN / 1e300 as an int is undefined, and NaN would be written back as invalid JSON)
+        const auto num = [&](const char* k, double unset) {
+            const double v = d[k].asFloat();
+            return std::isfinite(v) ? std::min(1e6, std::max(-1e6, v)) : unset;
+        };
+        if (d.has("resolution")) resolution = static_cast<float>(num("resolution", 0));
+        if (d.has("msaa")) msaa = static_cast<int>(num("msaa", 0));
+        if (d.has("anisotropy")) anisotropy = static_cast<int>(num("anisotropy", 0));
+        if (d.has("foveation")) foveation = static_cast<float>(num("foveation", 0));
+        if (d.has("frameRate")) frameRate = static_cast<int>(num("frameRate", -1));
         if (d.has("tuned")) tuned = d["tuned"].asString();
         clamp();
         return true;

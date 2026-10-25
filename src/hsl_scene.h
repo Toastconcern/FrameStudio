@@ -8,9 +8,11 @@
 #include "core/world.h"
 #include "walkgrid.h"
 #include "loaders/rendskel_parser.h"
+#include "splat_import.h"
 
 #include <functional>
 #include <map>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -35,6 +37,16 @@ struct HslAnimGroup {
     std::vector<int> meshes;            // HslScene::meshes indices
 };
 
+// A Gaussian splat capture (splat_import.h) placed in the home: drawn after the solid meshes, blended back to front.
+// Not walkable (the walkable area and the colliders never see it). A .fenv carries each as splats/<name>.spz.
+struct HslSplatObject {
+    std::string name;
+    std::shared_ptr<const std::vector<Splat>> splats;   // (shared: a copy of the scene, a save's, doesn't copy them)
+    float worldFromModel[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};   // column-major
+    bool hidden = false;                // not drawn (Frame Studio: hidden, deleted, or something else shown alone)
+    int source = -1;                    // apkPaths index of the file it was opened from (-1: a .fenv's)
+};
+
 // What one APK of the home is (the editor's info panel).
 struct HslSourceInfo {
     std::string package, version;       // from AndroidManifest.xml: com.meta.shell.env.footprint.haven2025, 206.0.0.0.70
@@ -46,6 +58,7 @@ struct HslScene {
     std::vector<std::string> apkPaths;  // footprint first, then the vista (if any)
     std::vector<MeshData> meshes;       // all APKs' meshes, in apkPaths order
     std::vector<int> meshSource;        // per mesh: index into apkPaths
+    std::vector<HslSplatObject> splats; // Gaussian splat objects (a splat file opened, or a .fenv's)
     std::vector<HslAnimGroup> anims;
     std::map<std::string, ShaderProgramSrc> programs;   // by asset path
     float ambientRGB[3] = {0.95f, 0.90f, 0.83f};        // radiance; replaced by the env's .lprb L00 when present
@@ -97,6 +110,12 @@ std::vector<WalkSource> drawnWalkSources(const HslScene& scene, const HomeWorld&
                                          const std::vector<char>* removed = nullptr, bool leaveLinked = true);
 // Is this mesh in the walkable-area bake: 0 no, 1 solid, 2 blocks but isn't floor (see-through).
 int walkMeshUse(const MeshData& md);
+
+// Splat objects as .fenv members (splats/<name>.spz, stored: .spz is gzip already) and their manifest entries; the
+// manifest then says it needs "splats" (none: nothing added).
+struct FenvManifest;
+struct FenvMember;
+void addSplatMembers(const std::vector<HslSplatObject>& objects, FenvManifest& m, std::vector<FenvMember>& members);
 
 // Finds the program a mesh's material references (exact asset path, else same ".surface" name).
 const ShaderProgramSrc* findProgram(const HslScene& scene, const std::string& shaderPath);

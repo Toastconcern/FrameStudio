@@ -1,24 +1,65 @@
 # build output
 /build*/
 /dist/
+/out/
 /frame/payload/bin/
 /frame/payload/layer/libframe_home_layer.so
 /frame/payload/layer/env_ps.spv
 /frame/payload/SOURCE
 studio/build*/
 tools/*/build*/
+CMakeUserPresets.json
+CMakeCache.txt
+CMakeFiles/
+compile_commands.json
+.cache/
+.ccache/
+.apt-cache/
+# compiler and linker leftovers outside a build folder
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.dll
+*.exe
+*.pdb
+*.ilk
+*.exp
+*.dSYM/
 # editor / OS clutter
 .vscode/
+.vs/
 .idea/
+.fleet/
 *.swp
+*.swo
+*~
 .DS_Store
 Thumbs.db
-# never commit homes, environments or keys
+desktop.ini
+# scripts' scratch
+__pycache__/
+*.pyc
+.venv/
+venv/
+node_modules/
+*.log
+*.tmp
+*.part
+*.orig
+*.rej
+# never commit homes, environments, bundles or keys
 *.apk
 *.fenv
+*.fbundle
 *.pem
+*.key
+*.p12
+*.pfx
 id_rsa*
 id_ed25519*
+.env
 *Zone.Identifier
 # astcenc's own test framework (not built here)
 third_party/astcenc/Source/GoogleTest/

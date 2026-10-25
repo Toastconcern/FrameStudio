@@ -13,11 +13,13 @@ endif()
 
 # The build's identity for updates (studio/updater.h): the commit CI built ($FRAME_BUILD); empty for a local build,
 # which never updates itself.
+# Defined on studio.cpp alone (below, with FRAME_VERSION): on every file it changed every one's command line each
+# commit, and the compiler cache missed on all of them.
 set(FRAME_BUILD "$ENV{FRAME_BUILD}")
-add_compile_definitions(FRAME_BUILD="${FRAME_BUILD}")
 
 set(ROOT "${CMAKE_CURRENT_SOURCE_DIR}/..")
 set(TP "${ROOT}/third_party")
+include("${ROOT}/cmake/frame_version.cmake")   # (FRAME_VERSION: on studio.cpp alone, so a new number rebuilds only it)
 set(FRAME_HOME_PAYLOAD_DIR "$ENV{FRAME_HOME_PAYLOAD_DIR}" CACHE PATH "Built Frame Home payload to bundle with Studio")
 if(NOT FRAME_HOME_PAYLOAD_DIR)
     set(FRAME_HOME_PAYLOAD_DIR "${ROOT}/frame/payload")
@@ -57,6 +59,14 @@ target_include_directories(volk PUBLIC "${TP}/volk" "${TP}/vulkan-headers/includ
 add_library(lzma STATIC "${TP}/lzma/LzmaEnc.c" "${TP}/lzma/LzmaDec.c" "${TP}/lzma/LzFind.c" "${TP}/lzma/LzFindOpt.c"
     "${TP}/lzma/LzFindMt.c" "${TP}/lzma/Threads.c" "${TP}/lzma/CpuArch.c")
 target_include_directories(lzma PUBLIC "${TP}/lzma")
+# zstd 1.5.6 (BSD), decompression only: version 4 .spz splat files (src/splat_import.cpp). Single-threaded, plain C
+# (no amd64 assembly), so it builds the same with every compiler.
+add_library(zstd STATIC "${TP}/zstd/common/debug.c" "${TP}/zstd/common/entropy_common.c"
+    "${TP}/zstd/common/error_private.c" "${TP}/zstd/common/fse_decompress.c" "${TP}/zstd/common/xxhash.c"
+    "${TP}/zstd/common/zstd_common.c" "${TP}/zstd/decompress/huf_decompress.c" "${TP}/zstd/decompress/zstd_ddict.c"
+    "${TP}/zstd/decompress/zstd_decompress.c" "${TP}/zstd/decompress/zstd_decompress_block.c")
+target_include_directories(zstd PUBLIC "${TP}/zstd")
+target_compile_definitions(zstd PRIVATE ZSTD_DISABLE_ASM)
 add_library(miniz STATIC "${TP}/miniz/miniz.c" "${TP}/miniz/miniz_tdef.c" "${TP}/miniz/miniz_tinfl.c" "${TP}/miniz/miniz_zip.c")
 target_include_directories(miniz PUBLIC "${TP}/miniz")
 # APKs are signed and intact; re-checksumming every extracted asset was ~20% of load time.
@@ -135,6 +145,7 @@ if(NOT WIN32)
     target_link_libraries(imgui PUBLIC glfw)
 endif()
 
+set_source_files_properties(studio.cpp PROPERTIES COMPILE_DEFINITIONS "FRAME_VERSION=\"${FRAME_VERSION}\";FRAME_BUILD=\"${FRAME_BUILD}\"")
 add_executable(frame-studio WIN32 MACOSX_BUNDLE
     studio.cpp
     ${STUDIO_PLATFORM}
@@ -143,8 +154,11 @@ add_executable(frame-studio WIN32 MACOSX_BUNDLE
     "${ROOT}/src/anim_bake.cpp"
     "${ROOT}/src/fenv_lzma.cpp"
     "${ROOT}/src/model_import.cpp"
+    "${ROOT}/src/splat_import.cpp"
+    "${ROOT}/src/spv_opt.cpp"
     "${TP}/ufbx/ufbx.c"
     "${ROOT}/src/hsl_renderer.cpp"
+    "${ROOT}/src/hsl_renderer_splat.cpp"
     "${TP}/qhe/cook/hzanim_acl.cpp"
     "${TP}/stb/stb_image_impl.c"
     "${TP}/stb/stb_vorbis_impl.c"
@@ -167,15 +181,39 @@ target_include_directories(frame-studio PRIVATE
     "${TP}/rtm/includes"
     "${TP}/astcenc/Source"
     "${TP}/tinyfiledialogs")
-target_link_libraries(frame-studio PRIVATE imgui volk miniz lzma smolv opusfile ${STUDIO_ASTCENC})
+target_link_libraries(frame-studio PRIVATE imgui volk miniz lzma zstd smolv opusfile ${STUDIO_ASTCENC})
+# The SPIRV-Tools optimizer for src/spv_opt.h (FH_SPV_OPT=1 at run time). Off: on the Frame it made no shader any
+# cheaper (Turnip's compiler already does what it does), and it is a large library to build everywhere.
+option(FRAME_SPV_OPT "Build in the SPIRV-Tools shader optimizer (third_party/spirv-tools)" OFF)
+if(FRAME_SPV_OPT)
+    add_subdirectory("${TP}/spirv-tools" spirv-tools EXCLUDE_FROM_ALL)
+    target_link_libraries(frame-studio PRIVATE spirv-tools-opt)
+    target_compile_definitions(frame-studio PRIVATE FH_HAVE_SPV_OPT)
+endif()
 if(WIN32)
     target_link_libraries(frame-studio PRIVATE dwmapi comdlg32 shell32)
 else()
     find_package(Threads REQUIRED)
     target_link_libraries(frame-studio PRIVATE glfw Threads::Threads ${CMAKE_DL_LIBS} m)
 endif()
+# The app icon (art/icon): a Windows resource, the macOS bundle's .icns, and on Linux a PNG beside the program
+# that the window sets as its icon.
+if(WIN32)
+    # The manifest (paths over 260 characters), merged into the program's: from the build folder, since mt.exe can't
+    # open it from a network path such as \\wsl.localhost (a source folder in WSL).
+    configure_file(studio.manifest "${CMAKE_CURRENT_BINARY_DIR}/studio.manifest" COPYONLY)
+    target_sources(frame-studio PRIVATE studio.rc "${CMAKE_CURRENT_BINARY_DIR}/studio.manifest")
+elseif(APPLE)
+    set(STUDIO_ICNS "${ROOT}/art/icon/frame-studio.icns")
+    target_sources(frame-studio PRIVATE "${STUDIO_ICNS}")
+    set_source_files_properties("${STUDIO_ICNS}" PROPERTIES MACOSX_PACKAGE_LOCATION Resources)
+else()
+    add_custom_command(TARGET frame-studio POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different "${ROOT}/art/icon/frame-studio-256.png" "$<TARGET_FILE_DIR:frame-studio>/frame-studio.png")
+endif()
 if(APPLE)
-    set_target_properties(frame-studio PROPERTIES MACOSX_BUNDLE_BUNDLE_NAME "Frame Studio" MACOSX_BUNDLE_GUI_IDENTIFIER "com.framestudio.app")
+    set_target_properties(frame-studio PROPERTIES MACOSX_BUNDLE_BUNDLE_NAME "Frame Studio" MACOSX_BUNDLE_GUI_IDENTIFIER "com.framestudio.app"
+        MACOSX_BUNDLE_ICON_FILE frame-studio.icns)
 endif()
 # Frame Home's headset side (arm64 binaries + install.sh) ships beside the exe, in frame\: Frame > Install on Steam Frame.
 if(FRAME_HOME_PAYLOAD_COMPLETE)

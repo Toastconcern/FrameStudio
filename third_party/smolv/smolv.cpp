@@ -362,6 +362,7 @@ enum SpvOp
 	SpvOpGroupNonUniformLogicalXor = 364,
 	SpvOpGroupNonUniformQuadBroadcast = 365,
 	SpvOpGroupNonUniformQuadSwap = 366,
+	SpvOpSmolvLast_ = 0xFFFF, // Frame Studio: any 16-bit opcode a malformed blob decodes to is a valid value of the enum
 };
 static const int kKnownOpsCount = SpvOpGroupNonUniformQuadSwap+1;
 
@@ -1214,14 +1215,24 @@ static bool smolv_CheckSpirVHeader(const uint32_t* words, size_t wordCount)
 	// in a "big endian" order. Need to byteswap all words then.
 	return smolv_CheckGenericHeader(words, wordCount, kSpirVHeaderMagic, 0xFFFFFFFF);
 }
+// Frame Studio: the header words are copied out (the SMOL-V data need not be 4-byte aligned).
+static uint32_t smolv_Load4(const uint8_t* p)
+{
+	uint32_t v;
+	memcpy(&v, p, 4);
+	return v;
+}
+
 static bool smolv_CheckSmolHeader(const uint8_t* bytes, size_t byteCount)
 {
-	if (!smolv_CheckGenericHeader((const uint32_t*)bytes, byteCount/4, kSmolHeaderMagic, 0x00FFFFFF))
+	if (!bytes || byteCount < 24) // header, and one more word past it to store decoded length
 		return false;
-	if (byteCount < 24) // one more word past header to store decoded length
+	uint32_t header[5];
+	memcpy(header, bytes, sizeof header);
+	if (!smolv_CheckGenericHeader(header, 5, kSmolHeaderMagic, 0x00FFFFFF))
 		return false;
 	// SMOL-V version
-	int smolVersion = ((const uint32_t*)bytes)[1] >> 24;
+	int smolVersion = header[1] >> 24;
 	if (smolVersion < 0 || smolVersion > kSmolCurrEncodingVersion)
 		return false;
 	return true;
@@ -1256,7 +1267,7 @@ static bool smolv_Read4(const uint8_t*& data, const uint8_t* dataEnd, uint32_t& 
 {
 	if (data + 4 > dataEnd)
 		return false;
-	outv = (data[0]) | (data[1] << 8) | (data[2] << 16) | (data[3] << 24);
+	outv = uint32_t(data[0]) | (uint32_t(data[1]) << 8) | (uint32_t(data[2]) << 16) | (uint32_t(data[3]) << 24); // Frame Studio: unsigned shifts
 	data += 4;
 	return true;
 }
@@ -1286,7 +1297,8 @@ static bool smolv_ReadVarint(const uint8_t*& data, const uint8_t* dataEnd, uint3
 	while (data < dataEnd)
 	{
 		uint8_t b = *data;
-		v |= (b & 127) << shift;
+		if (shift < 32) // Frame Studio: unsigned, and bytes past 32 bits (malformed input) add nothing
+			v |= uint32_t(b & 127) << shift;
 		shift += 7;
 		data++;
 		if (!(b & 128))
@@ -1608,8 +1620,7 @@ size_t smolv::GetDecodedBufferSize(const void* smolvData, size_t smolvSize)
 {
 	if (!smolv_CheckSmolHeader((const uint8_t*)smolvData, smolvSize))
 		return 0;
-	const uint32_t* words = (const uint32_t*)smolvData;
-	return words[5];
+	return smolv_Load4((const uint8_t*)smolvData + 20); // Frame Studio: unaligned-safe
 }
 
 

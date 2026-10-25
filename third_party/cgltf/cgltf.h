@@ -1533,7 +1533,9 @@ static cgltf_size cgltf_calc_index_bound(cgltf_buffer_view* buffer_view, cgltf_s
 	case cgltf_component_type_r_16u:
 		for (size_t i = 0; i < count; ++i)
 		{
-			cgltf_size v = ((unsigned short*)data)[i];
+			unsigned short u; /* Frame Studio: memcpy, the view's offset may not be 2-aligned (UB, a fault on some CPUs) */
+			memcpy(&u, data + i * sizeof(u), sizeof(u));
+			cgltf_size v = u;
 			bound = bound > v ? bound : v;
 		}
 		break;
@@ -1541,7 +1543,9 @@ static cgltf_size cgltf_calc_index_bound(cgltf_buffer_view* buffer_view, cgltf_s
 	case cgltf_component_type_r_32u:
 		for (size_t i = 0; i < count; ++i)
 		{
-			cgltf_size v = ((unsigned int*)data)[i];
+			unsigned int u;
+			memcpy(&u, data + i * sizeof(u), sizeof(u));
+			cgltf_size v = u;
 			bound = bound > v ? bound : v;
 		}
 		break;

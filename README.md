@@ -6,6 +6,9 @@ behind the Steam menu and while games load. **Frame Studio** is the desktop edit
 macOS. It opens Meta homes, `.fenv` environments and models (glTF, FBX, OBJ), shows them with the same renderer the
 headset runs, and lets you edit, save and send them to the headset.
 
+**Discord:** [join the Frame Studio server](https://discord.gg/yJDn59ErgK) for help, bug reports, feature requests,
+new releases and environments people have made. What changed in each version: [CHANGELOG.md](CHANGELOG.md).
+
 ## Quick start
 
 1. **Download** Frame Studio for your computer from the Releases page (**Latest build**, or a version release) and

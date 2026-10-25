@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!-- Merged into Frame Studio.exe's own manifest (studio/CMakeLists.txt). longPathAware: Windows lets the program use
+     paths over 260 characters (a home deep in a folder tree), where long paths are turned on (Windows 10 1607 and
+     later: the LongPathsEnabled setting). -->
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <application xmlns="urn:schemas-microsoft-com:asm.v3">
+    <windowsSettings xmlns:ws2="http://schemas.microsoft.com/SMI/2016/WindowsSettings">
+      <ws2:longPathAware>true</ws2:longPathAware>
+    </windowsSettings>
+  </application>
+</assembly>

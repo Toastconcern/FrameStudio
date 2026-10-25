@@ -19,9 +19,11 @@
 //   "title": "Rainy Haven", "image": "haven.apk.image-1a2b3c4d.jpg"   (the image beside this file, like the sound)
 #include <algorithm>
 #include <cctype>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <sstream>
 #include <string>
@@ -178,14 +180,25 @@ inline bool saveHomeEdits(const std::string& path, const HomeEdits& e) {
     if (!e.title.empty()) o << ",\n  \"title\": " << quote(e.title);
     if (!e.image.empty()) o << ",\n  \"image\": " << quote(e.image);
     o << "\n}\n";
-    std::ofstream f(path, std::ios::binary);
-    if (!f) return false;
-    f << o.str();
-    return static_cast<bool>(f);
+    // By its UTF-8 name (a narrow path is the ANSI code page on Windows: C:\Users\José\... wasn't found), written
+    // beside it and renamed over it once whole: a crash or a full disk midway never leaves a cut-off edits file.
+    namespace fs = std::filesystem;
+    const fs::path target = fs::u8path(path), part = fs::u8path(path + ".part");
+    {
+        std::ofstream f(part, std::ios::binary | std::ios::trunc);
+        if (!f) return false;
+        f << o.str();
+        f.close();
+        if (!f) { std::error_code ec; fs::remove(part, ec); return false; }
+    }
+    std::error_code ec;
+    fs::rename(part, target, ec);
+    if (ec) { fs::remove(part, ec); return false; }
+    return true;
 }
 
 inline bool loadHomeEdits(const std::string& path, HomeEdits& out) {
-    std::ifstream f(path, std::ios::binary);
+    std::ifstream f(std::filesystem::u8path(path), std::ios::binary);
     if (!f) return false;
     std::stringstream ss;
     ss << f.rdbuf();
@@ -213,7 +226,8 @@ inline bool loadHomeEdits(const std::string& path, HomeEdits& out) {
                     std::string k;
                     if (!r.str(k) || !r.eat(':')) return false;
                     double d;
-                    bool ok = k == "index" ? (r.num(d) && (x.index = static_cast<int>(d), true))
+                    // (an index past int's range, or NaN, is no mesh: -1, never an out-of-range cast)
+                    bool ok = k == "index" ? (r.num(d) && (x.index = d >= 0 && d < 2147483647.0 ? static_cast<int>(d) : -1, true))
                             : k == "name" ? r.str(x.name)
                             : k == "deleted" ? r.boolean(x.deleted)
                             : k == "pivot" ? r.floats(x.pivot, 16)
@@ -234,8 +248,9 @@ inline bool loadHomeEdits(const std::string& path, HomeEdits& out) {
                 double d = 0;
                 const bool ok = k == "file" ? r.str(out.sound.file)
                               : k == "name" ? r.str(out.sound.name)
-                              : k == "volume" ? (r.num(d) && (out.sound.volume = static_cast<float>(std::clamp(d, 0.0, 1.0)), true))
-                              : k == "homeVolume" ? (r.num(d) && (out.sound.homeVolume = static_cast<float>(std::clamp(d, 0.0, 1.0)), true))
+                              // (strtod reads "nan", which clamp lets through to the audio gain: a NaN keeps the default)
+                              : k == "volume" ? (r.num(d) && (std::isnan(d) || (out.sound.volume = static_cast<float>(std::clamp(d, 0.0, 1.0)), true)))
+                              : k == "homeVolume" ? (r.num(d) && (std::isnan(d) || (out.sound.homeVolume = static_cast<float>(std::clamp(d, 0.0, 1.0)), true)))
                               : r.skip();
                 if (!ok) return false;
             } while (r.eat(','));

@@ -63,10 +63,23 @@ if ! LD_LIBRARY_PATH="$P/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" "$P/bin/frame
     say "Frame Home can't run on this headset: ${missing:-unknown error} (nothing was changed)"; exit 1
 fi
 mkdir -p "$H/bin" "$H/envs" || exit 1
-# New binaries beside the old ones, then renamed over them: a running copy keeps its file until it restarts.
+# New binaries beside the old ones, then renamed over them: a running copy keeps its file until it restarts. All of
+# them copied before any is renamed, so a copy that fails (a full disk) leaves the old set whole, never a mix.
 for x in frame-home frame-switcher fenv-tool; do
     [ -f "$P/bin/$x" ] || continue
-    cp -f "$P/bin/$x" "$H/bin/$x.new" && chmod +x "$H/bin/$x.new" && mv -f "$H/bin/$x.new" "$H/bin/$x" || { say "couldn't install $x"; exit 1; }
+    cp -f "$P/bin/$x" "$H/bin/$x.new" && chmod +x "$H/bin/$x.new" || { rm -f "$H"/bin/*.new; say "couldn't install $x (nothing was changed)"; exit 1; }
+done
+# The compositor layer and its shader are copied in the same round: new programs never go in beside an old layer
+# because the layer's copy failed (Frame Home and the layer share the frames).
+if [ -f "$P/layer/libframe_home_layer.so" ]; then
+    mkdir -p "$H/layer" || { rm -f "$H"/bin/*.new; say "couldn't install the compositor layer (nothing was changed)"; exit 1; }
+    for f in libframe_home_layer.so env_ps.spv; do
+        cp -f "$P/layer/$f" "$H/layer/.$f.new" || { rm -f "$H"/bin/*.new "$H"/layer/.*.new; say "couldn't install the compositor layer (nothing was changed)"; exit 1; }
+    done
+fi
+for x in frame-home frame-switcher fenv-tool; do
+    [ -f "$H/bin/$x.new" ] || continue
+    mv -f "$H/bin/$x.new" "$H/bin/$x" || { say "couldn't install $x"; exit 1; }
 done
 # The compositor layer and its shader (renamed over the old ones: a running compositor keeps its copy).
 layerChanged=0
@@ -74,7 +87,8 @@ if [ -f "$P/layer/libframe_home_layer.so" ]; then
     mkdir -p "$H/layer" "$(dirname "$LAYERJSON")"
     cmp -s "$P/layer/libframe_home_layer.so" "$H/layer/libframe_home_layer.so" || layerChanged=1
     cmp -s "$P/layer/env_ps.spv" "$H/layer/env_ps.spv" || layerChanged=1
-    for f in libframe_home_layer.so env_ps.spv; do cp -f "$P/layer/$f" "$H/layer/.$f.new" && mv -f "$H/layer/.$f.new" "$H/layer/$f"; done
+    # (the library and its shader go together: both copied above, then both renamed)
+    for f in libframe_home_layer.so env_ps.spv; do mv -f "$H/layer/.$f.new" "$H/layer/$f" || { say "couldn't install the compositor layer"; exit 1; }; done
     rm -f "$H/layer/off" "$H/layer/starting" "$H/layer/crashes"
     [ -f "$LAYERJSON" ] || layerChanged=1
     cat > "$LAYERJSON" <<JSON
@@ -94,7 +108,15 @@ if [ -f "$P/layer/libframe_home_layer.so" ]; then
 JSON
 fi
 # Libraries the binaries need that the headset may not have (none today; kept for future builds).
-[ -d "$P/lib" ] && { mkdir -p "$H/lib"; cp -f "$P"/lib/* "$H/lib/"; }
+# (each copied beside and renamed over: writing into a library a running process has mapped would crash it)
+if [ -d "$P/lib" ]; then
+    mkdir -p "$H/lib"
+    for f in "$P"/lib/*; do
+        [ -f "$f" ] || continue
+        n=$(basename "$f")
+        cp -f "$f" "$H/lib/.$n.new" && mv -f "$H/lib/.$n.new" "$H/lib/$n" || { say "couldn't install $n"; exit 1; }
+    done
+fi
 # Environments that came with this install.
 for f in "$P"/envs/*.fenv; do [ -f "$f" ] && mv -f "$f" "$H/envs/"; done
 

@@ -242,9 +242,9 @@ inline bool fenvBundleWrite(const std::string& outPath, const std::vector<std::s
     mz_zip_writer_end(&zip);
     std::error_code ec;
     if (!ok) { fs::remove(fs::u8path(tmp), ec); return false; }
-    fs::rename(fs::u8path(tmp), fs::u8path(outPath), ec);
-    if (ec) { fs::remove(fs::u8path(outPath), ec); fs::rename(fs::u8path(tmp), fs::u8path(outPath), ec); }
-    if (ec) { fs::remove(fs::u8path(tmp), ec); error = "couldn't replace " + outPath + ": " + ec.message(); return false; }
+    // (the old bundle set aside, not deleted, until the new one is in its place: removing it first and then failing
+    // the rename lost both)
+    if (!fenv_detail::replaceWith(fs::u8path(tmp), fs::u8path(outPath), ec)) { error = "couldn't replace " + outPath + ": " + ec.message(); return false; }
     return true;
 }
 

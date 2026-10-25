@@ -284,7 +284,7 @@ bool bakeScene(const HslScene& scene, std::vector<u8>& out, std::string& error, 
     for (size_t i = 0; i < s.meshes.size(); ++i) writeMesh(mw, *meshes[i], tex, half, vis && vis->changed[i] ? &vis->indices[i] : nullptr);
 
     Writer w{out};
-    w.u(kMagic); w.u(kSceneBakeVersion);
+    w.u(kMagic); w.u(sceneBakeVersionFor(s));
     w.u(static_cast<u32>(s.apkPaths.size()));
     for (size_t i = 0; i < s.apkPaths.size(); ++i) {
         w.str(s.apkPaths[i]);
@@ -465,6 +465,9 @@ bool unbakeScene(const u8* data, size_t size, HslScene& s, std::string& error) {
         u32 chain = 1;                           // a mip count past the image's own chain: the levels it can have
         while ((std::max(ts->w, ts->h) >> chain) != 0) ++chain;
         ts->mips = std::min(std::max(ts->mips, 1u), chain);
+        // ...and only the levels its bytes hold (a damaged file): the GPU image is made with that many levels, and a
+        // level with nothing uploaded into it would be sampled as whatever the memory held.
+        while (ts->mips > 1 && static_cast<u64>(astcMipBytesForCount(ts->w, ts->h, ts->bw, ts->bh, ts->mips)) * ts->faces > ts->astc.size()) --ts->mips;
         t = ts;
     }
     std::vector<std::shared_ptr<const std::vector<u16>>> half(r.count(4));

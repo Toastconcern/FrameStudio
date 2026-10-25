@@ -236,8 +236,13 @@ private:
     std::shared_ptr<const WalkGrid> grid_;
     bool hasFloor_ = false;
 
-    static int64_t key(int cx, int cz) { return (static_cast<int64_t>(cx) << 32) ^ static_cast<uint32_t>(cz); }
-    static int cell(float v) { return static_cast<int>(std::floor(v)); }
+    static int64_t key(int cx, int cz) { return static_cast<int64_t>(static_cast<uint64_t>(static_cast<uint32_t>(cx)) << 32 | static_cast<uint32_t>(cz)); }
+    // (clamped, NaN as 0: a damaged file's 1e30 or NaN vertex must not overflow the int, or a cell loop ending at
+    // INT_MAX never ends)
+    static int cell(float v) {
+        const float c = std::floor(v);
+        return c > -1e7f && c < 1e7f ? static_cast<int>(c) : c >= 1e7f ? 10000000 : c <= -1e7f ? -10000000 : 0;
+    }
 
     static void insert(std::vector<Tri>& list, std::unordered_map<int64_t, std::vector<uint32_t>>& grid, const Tri& t) {
         const uint32_t id = static_cast<uint32_t>(list.size());

@@ -762,6 +762,8 @@ public:
                     if (doc.has("relationships") && doc["relationships"].isArray())
                         for (const auto& r : doc["relationships"].arrVal)
                             if (r["relationshipType"].asString() == "RelationChildOf") parentOfId[r["source"].asString()] = r["destination"].asString();
+                    std::map<std::string, size_t> indexOfId;
+                    for (size_t i = 0; i < arr.size(); ++i) if (arr[i].has("id")) indexOfId[arr[i]["id"].asString()] = i;
                     for (size_t i = 0; i < arr.size(); ++i) {
                         const auto& ent = arr[i];
                         if (!ent.has("type") || ent.has("__removedByDelta")) continue;   // a removed instance brings nothing in
@@ -782,7 +784,21 @@ public:
                         // Compose the INSTANCE entity's placement onto the parent before descending, so the
                         // referenced template's geometry inherits where this instance sits in the world.
                         Transform inst = parseHstfEntityTransform(ent);
-                        float im[16], cm[16]; trsToMat4(inst, im); mat4mul4(parentMat, im, cm); // parent·instance (4×4)
+                        float im[16], cm[16]; trsToMat4(inst, im);
+                        // The instance's own parents in this file place it too (Haven2025 hangs a Seating_Hotspot
+                        // under each chair: read flat, all eight sat at the origin).
+                        {
+                            auto p = parentOfId.find(ent.has("id") ? ent["id"].asString() : std::string());
+                            for (int guard = 0; p != parentOfId.end() && guard < 64; ++guard) {
+                                auto pe = indexOfId.find(p->second);
+                                if (pe == indexOfId.end()) break;
+                                const Transform pt = parseHstfEntityTransform(arr[pe->second]);
+                                float pm[16], t[16]; trsToMat4(pt, pm); mat4mul4(pm, im, t); std::memcpy(im, t, sizeof t);
+                                inst = composeTransform(pt, inst);
+                                p = parentOfId.find(p->second);
+                            }
+                        }
+                        mat4mul4(parentMat, im, cm); // parent·(this file's parents)·instance (4×4)
                         // This instance's deltas target entities inside the template it places; deltas inherited from
                         // further out keep travelling down and apply after (they win).
                         HstfDeltas child;
@@ -807,6 +823,17 @@ public:
             };
             float identMat[16] = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
             loadHstfRec(*spacePath, 6, Transform{}, identMat, HstfDeltas{}, std::string());
+            // A hotspot on a seat (Haven2025's Seating_Hotspot under each chair) marks the seat, which seats already
+            // cover: kept, a teleport landing near a stool would snap onto its top, and the stool top would be walkable.
+            {
+                size_t dropped = 0;
+                world.hotspots.erase(std::remove_if(world.hotspots.begin(), world.hotspots.end(), [&](const WorldPoint& h) {
+                    for (const WorldPoint& s : world.seats)
+                        if (std::fabs(h.pos[0] - s.pos[0]) < 0.1f && std::fabs(h.pos[1] - s.pos[1]) < 0.1f && std::fabs(h.pos[2] - s.pos[2]) < 0.1f) { ++dropped; return true; }
+                    return false;
+                }), world.hotspots.end());
+                if (dropped) log("  %zu hotspot(s) on seats dropped", dropped);
+            }
             world.origin = world.empty() ? "" : "meta";
             log("  World: %zu spawns, %zu seats, %zu hotspots, %zu colliders", world.spawns.size(), world.seats.size(),
                 world.hotspots.size(), world.colliders.size());
@@ -852,6 +879,7 @@ public:
         //    ASTC-decoded ONCE; every later use copies the pixels.
         struct DecodedTex {
             bool ok = false; std::vector<u8> rgba; u32 w = 0, h = 0, fmt = 0; std::vector<u8> cube; u32 cubeSize = 0;
+            std::vector<u8> srgb;                          // an RGBA16F texture: its colour sRGB-encoded (rgba holds it linear)
             std::shared_ptr<const TexSource> src;          // deferred: still-compressed ASTC, rgba empty
             std::shared_ptr<const TexSource> cubeSrc;      // deferred cube: six ASTC faces, cube empty
         };
@@ -931,6 +959,14 @@ public:
                 return d;
             }
             d->ok = true; d->w = ti.width; d->h = ti.height; d->fmt = ti.formatCode;
+            if (ti.rawBpp == 8) {                    // straight from the halves: 8-bit linear first would band the darks
+                d->srgb.resize(d->rgba.size());
+                for (size_t q = 0; q < d->srgb.size(); ++q) {
+                    uint16_t hv; std::memcpy(&hv, texData.data() + ti.rawDataOffset + q * 2, 2);
+                    const float v = std::clamp(astc::astcHalf2Float(hv), 0.0f, 1.0f);
+                    d->srgb[q] = (u8)std::lround(((q & 3) == 3 ? v : v <= 0.0031308f ? v * 12.92f : 1.055f * std::pow(v, 1.0f / 2.4f) - 0.055f) * 255.0f);
+                }
+            }
             return d;
         };
 
@@ -947,6 +983,7 @@ public:
             auto d = decodeCached(*tp, false, md.isSkybox, true);
             if (!d->ok) return false;
             md.texRGBA = d->rgba; md.texW = d->w; md.texH = d->h; md.hasTexture = true; md.texSrc = d->src;
+            if (!d->srgb.empty()) md.texRGBA = d->srgb;   // an RGBA16F base colour is linear; the base texture is sampled as sRGB
             if (d->cubeSize) { md.cubeRGBA = d->cube; md.cubeSize = d->cubeSize; md.cubeSrc = d->cubeSrc; }
             log("  Texture: %s (%ux%u fmt=%u)", tp->c_str(), d->w, d->h, d->fmt);
             return true;
@@ -1142,29 +1179,63 @@ public:
         auto decodeReflCube = [&](const AssetKey& k, MeshData& md) {
             const std::string* rp = resolve(k);
             if (!rp) return;
-            auto raw = readTexture(*rp);
-            RendtxtrInfo ri;
-            if (!parseRendtxtrHeader(raw, ri) || ri.faces != 6 || ri.width != ri.height || (size_t)ri.rawDataOffset + ri.rawDataLen > raw.size()) {
-                log("  [skybox] reflectionMap %s is not a cube (%u faces, %ux%u)", rp->c_str(), ri.faces, ri.width, ri.height);
+            // A streamed cube keeps its top levels in the streams and the rest in the base file: the cooked, blurred
+            // levels the shaders read for rough surfaces (Cascadia: 1024 and 512 streamed, 256 to 16 in the base).
+            // readTexture takes the largest file alone, which left one sharp level and every floor a mirror; this
+            // takes each level, largest first, from whichever file holds it.
+            std::vector<std::vector<u8>> files;
+            files.push_back(readAsset(*rp));
+            const size_t slash = rp->rfind('/');
+            auto st = slash == std::string::npos ? texStreams.end() : texStreams.find(rp->substr(0, slash));
+            if (st != texStreams.end() && !std::getenv("FH_BASE_TEXTURES"))
+                for (const std::string& entry : st->second) {
+                    int idx = mz_zip_reader_locate_file(&sceneZip, entry.c_str(), nullptr, 0);
+                    if (idx < 0) continue;
+                    size_t sz = 0;
+                    void* d = mz_zip_reader_extract_to_heap(&sceneZip, idx, &sz, 0);
+                    if (!d) continue;
+                    files.emplace_back((u8*)d, (u8*)d + sz);
+                    mz_free(d);
+                }
+            std::map<u32, std::pair<const u8*, size_t>, std::greater<u32>> levels;   // size -> its six faces
+            RendtxtrInfo first;
+            u32 bw = 0, bh = 0;
+            for (const auto& f : files) {
+                RendtxtrInfo ri;
+                if (!parseRendtxtrHeader(f, ri) || ri.faces != 6 || ri.width != ri.height || (size_t)ri.rawDataOffset + ri.rawDataLen > f.size()) continue;
+                if (bw && (ri.blockW != bw || ri.blockH != bh)) continue;   // (one block size for the whole chain)
+                if (!bw) first = ri;
+                bw = ri.blockW; bh = ri.blockH;
+                size_t off = ri.rawDataOffset;
+                const size_t end = off + ri.rawDataLen;
+                for (u32 s = ri.width; s >= 1; s /= 2) {
+                    const size_t face = (size_t)((s + bw - 1) / bw) * ((s + bh - 1) / bh) * 16;
+                    if (off + face * 6 > end) break;
+                    levels.emplace(s, std::make_pair(f.data() + off, face * 6));
+                    off += face * 6;
+                    if (s == 1) break;
+                }
+            }
+            if (levels.empty()) {
+                log("  [skybox] reflectionMap %s is not a cube (%u faces, %ux%u)", rp->c_str(), first.faces, first.width, first.height);
                 return;
             }
-            size_t bytes = 0;
+            // The chain from the largest level down, as far as it has no gap.
+            const u32 top = levels.begin()->first;
+            auto t = std::make_shared<TexSource>();
             u32 mips = 0;
-            for (u32 s = ri.width; s >= 1; s /= 2) {
-                const size_t face = (size_t)((s + ri.blockW - 1) / ri.blockW) * ((s + ri.blockH - 1) / ri.blockH) * 16;
-                if (bytes + face * 6 > ri.rawDataLen) break;
-                bytes += face * 6;
+            for (u32 s = top; s >= 1; s /= 2) {
+                auto it = levels.find(s);
+                if (it == levels.end()) break;
+                t->astc.insert(t->astc.end(), it->second.first, it->second.first + it->second.second);
                 ++mips;
                 if (s == 1) break;
             }
-            if (!mips) return;
-            auto t = std::make_shared<TexSource>();
-            t->astc.assign(raw.begin() + ri.rawDataOffset, raw.begin() + ri.rawDataOffset + bytes);
-            t->w = t->h = ri.width; t->bw = ri.blockW; t->bh = ri.blockH; t->mips = mips; t->hdr = true; t->faces = 6;
+            t->w = t->h = top; t->bw = bw; t->bh = bh; t->mips = mips; t->hdr = true; t->faces = 6;
             md.reflCubeSrc = std::move(t);
             md.reflCubeHalf.clear();
-            md.reflCubeSize = ri.width; md.reflCubeMips = mips;
-            log("  [skybox] reflectionMap cube %ux%u, %u mips", ri.width, ri.height, mips);
+            md.reflCubeSize = top; md.reflCubeMips = mips;
+            log("  [skybox] reflectionMap cube %ux%u, %u mips (from %zu file%s)", top, top, mips, files.size(), files.size() == 1 ? "" : "s");
         };
 
         auto applyMat = [&](MatlmatlInfo& matInfo, MeshData& md) -> bool {
@@ -1873,6 +1944,18 @@ public:
                 }
 
                 if (applyMat(matInfo, md)) { gotTex = true; break; }
+            }
+
+            // Path 1b: no MaterialPlatformComponent -> the material the mesh was exported with (nested in the
+            // RENDMESH), which is what libshell draws it with. Horror's SM_skybox (unlit + skybox_d.png) and the
+            // hero lantern's candleFlame have no material component; without this they had no shader and vanished.
+            if (!gotTex && obj.matRefs.empty() && !obj.isSkybox) {
+                const std::vector<u8> own = rendMeshPartMaterial(meshData);
+                MatlmatlInfo matInfo;
+                if (!own.empty() && parseMatlmatl(own, matInfo)) {
+                    log("  Mesh's own material: shader ing=%016llX", (unsigned long long)matInfo.shaderIng);
+                    gotTex = applyMat(matInfo, md);
+                }
             }
 
             // Path 2: Fallback — only when ALL entities lack matRefs (v79_test-like APKs).

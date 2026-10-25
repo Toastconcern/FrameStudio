@@ -33,9 +33,22 @@ $scp = Find-Tool "scp"
 if ($HostName -notmatch "@") { $HostName = "steamos@$HostName" }
 
 # The name an environment gets on the headset: lowercase, spaces as dashes, only [a-z0-9._-] (as Studio names them).
+# When that drops characters (accents, other scripts) a short hash of the real name is added, so two such names don't
+# become the same file, and an all-non-Latin one doesn't become a bare ".fenv".
 function Frame-Name($path) {
-    $n = ([IO.Path]::GetFileName($path)).ToLowerInvariant() -replace " ", "-"
-    return ($n -replace "[^a-z0-9._-]", "")
+    $base = [IO.Path]::GetFileName($path)
+    $low = $base.ToLowerInvariant() -replace " ", "-"
+    $n = $low -replace "[^a-z0-9._-]", ""
+    $dot = $n.LastIndexOf(".")
+    $stem = if ($dot -ge 0) { $n.Substring(0, $dot) } else { $n }
+    if ($n -ne $low -or $stem -eq "") {
+        $sha = [Security.Cryptography.SHA1]::Create().ComputeHash([Text.Encoding]::UTF8.GetBytes($base))
+        $h = -join ($sha[0..3] | ForEach-Object { $_.ToString("x2") })
+        $ext = if ($dot -ge 0) { $n.Substring($dot) } else { "" }
+        if ($stem -eq "") { $stem = "environment" }
+        $n = "$stem-$h$ext"
+    }
+    return $n
 }
 
 $payload = Join-Path $PSScriptRoot "payload"
@@ -62,6 +75,11 @@ if ($Uninstall) {
         Say "copying $([IO.Path]::GetFileName($f)) -> $name"
         Push-Location (Split-Path -Parent (Resolve-Path $f))
         try { & $scp -q ([IO.Path]::GetFileName($f)) "${HostName}:frame-home/envs/$name.part" } finally { Pop-Location }
+        if ($LASTEXITCODE -ne 0) {   # (no half-copied file left behind, and the one shown stays as it was)
+            & $ssh $HostName "rm -f frame-home/envs/$name.part"
+            Say "couldn't copy $([IO.Path]::GetFileName($f)) (the headset's disk is full, or the connection dropped)"
+            continue
+        }
         & $ssh $HostName "mv -f frame-home/envs/$name.part frame-home/envs/$name"
     }
     & $ssh $HostName "sed -i 's/\r`$//' frame-home/.install/frame/install.sh; sh frame-home/.install/frame/install.sh"
@@ -70,7 +88,7 @@ if ($Uninstall) {
     $first = $Environments | Where-Object { $_ -match "\.fenv$" } | Select-Object -First 1
     if ($first -and (Test-Path $first)) {
         $name = Frame-Name $first
-        & $ssh $HostName "printf '%s\n' '$name' > frame-home/current"
+        & $ssh $HostName "if [ -f 'frame-home/envs/$name' ]; then printf '%s\n' '$name' > frame-home/current; fi"
     }
 }
 Say "done"

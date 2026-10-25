@@ -463,3 +463,31 @@ inline bool parseRendMesh(const std::vector<u8>& data,
 
     return totalV > 0 && !indices.empty();
 }
+
+// The material a mesh was exported with: LOD[0] -> Part[0] field[3] is a whole nested MATLMATL buffer (shader +
+// textures + matParams). libshell draws a mesh whose entity has no MaterialPlatformComponent with it (Horror's
+// SM_skybox: unlit + skybox_d.png; the hero lantern's candleFlame: candleflame.surface). Empty if it has none.
+inline std::vector<u8> rendMeshPartMaterial(const std::vector<u8>& data) {
+    const u64 SZ = data.size();
+    if (SZ < 14 || SZ > 0xFFFFFFF0u || memcmp(data.data() + 4, "MESH", 4) != 0) return {};
+    auto rd32 = [&](u64 o) -> u32 { return o + 4 <= SZ ? loadUnaligned<u32>(data.data() + o) : 0; };
+    auto field = [&](u64 tbl, u32 fi) -> u64 {   // absolute position of a table field, 0 if absent
+        if (tbl + 4 > SZ) return 0;
+        const int64_t vt = (int64_t)tbl - loadUnaligned<i32>(data.data() + tbl);
+        if (vt < 0 || (u64)vt + 4 > SZ) return 0;
+        const u64 slot = (u64)vt + 4 + (u64)fi * 2;
+        if (slot + 2 > (u64)vt + loadUnaligned<u16>(data.data() + vt) || slot + 2 > SZ) return 0;
+        const u16 fo = loadUnaligned<u16>(data.data() + slot);
+        return fo ? tbl + fo : 0;
+    };
+    auto deref = [&](u64 at) -> u64 { const u32 o = rd32(at); return at && o ? at + o : 0; };   // uoffset -> target
+    const u64 lods = deref(field(rd32(0), 1));
+    const u64 lod = lods && rd32(lods) ? deref(lods + 4) : 0;
+    const u64 parts = lod ? deref(field(lod, 0)) : 0;
+    const u64 part = parts && rd32(parts) ? deref(parts + 4) : 0;
+    const u64 mat = part ? deref(field(part, 3)) : 0;
+    if (!mat) return {};
+    const u64 n = rd32(mat);
+    if (n < 68 || mat + 4 + n > SZ || memcmp(data.data() + mat + 8, "MATL", 4) != 0) return {};
+    return std::vector<u8>(data.begin() + (size_t)(mat + 4), data.begin() + (size_t)(mat + 4 + n));
+}

@@ -11,7 +11,11 @@
 #include <string>
 #include <vector>
 
-constexpr u32 kSceneBakeVersion = 14;  // 2: world; 3: HDR maps as ASTC, binary world; 4: roles; 5: mesh refs; 6: gravity; 7: mesh paths; 8: ambience name; 9: compressed 8-bit lightmaps; 10: reflection cube as ASTC; 11: walkable area (and simplified colliders); 12: prepared and specialized shaders; 13: Clay / glTF CPU animation; 14: wall spots removed
+constexpr u32 kSceneBakeVersion = 15;  // 2: world; 3: HDR maps as ASTC, binary world; 4: roles; 5: mesh refs; 6: gravity; 7: mesh paths; 8: ambience name; 9: compressed 8-bit lightmaps; 10: reflection cube as ASTC; 11: walkable area (and simplified colliders); 12: prepared and specialized shaders; 13: Clay / glTF CPU animation; 14: wall spots removed; 15: the environment has splats (nothing new in here: they're .fenv members, and a reader older than splats must refuse it rather than show it without them)
+// What a scene is written as: the oldest version that holds it, so one without splats stays 14 (older Frame Homes still
+// open it). A reader of a file needs at least this.
+constexpr u32 kSceneBakeVersionNoSplats = 14;
+inline u32 sceneBakeVersionFor(const HslScene& scene) { return scene.splats.empty() ? kSceneBakeVersionNoSplats : kSceneBakeVersion; }
 
 struct VisibilityResult;
 struct ObjectEdit;

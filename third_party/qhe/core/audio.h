@@ -83,6 +83,13 @@ struct AudioPlayer {
                 sr, chs, (unsigned long long)frames, frames / (float)(sr > 0 ? sr : 1));
         return true;
     }
+    // Stops the device (no audio thread running, nothing mixed) until resumed; the loop carries on where it was.
+    bool paused = false;
+    void pause(bool on) {
+        if (!ok || on == paused) return;
+        paused = on;
+        if (on) ma_device_stop(&device); else ma_device_start(&device);
+    }
 
     // Interleaved s16 at any channel count -> stereo. 4+ channels: first-order ambisonics (ACN W,Y,Z,X: W carries most
     // energy; the homes' beds, Clay and HSL alike) -> L/R = W +- 0.7 Y; 5.1 / 7.1 (FL FR C LFE SL SR [BL BR], a sound
@@ -217,6 +224,6 @@ struct AudioPlayer {
         gain = vol;
         return startPCM(out.data(), (ma_uint64)(out.size() / chs), chs, sr, evenOut);
     }
-    void stop() { if (ok) { ma_device_uninit(&device); ok = false; } }
+    void stop() { if (ok) { ma_device_uninit(&device); ok = false; } paused = false; }
     ~AudioPlayer() { stop(); }
 };

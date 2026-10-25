@@ -10,6 +10,8 @@
 #include "core/parallel.h"             // par::forEach: animated meshes rebuilt across cores
 #include "fov_spirv.h"                 // the smooth-foveation pass
 #include "shader_bake.h"               // prepared and specialized shaders (made at bake, or here for APK homes)
+#include "spv_opt.h"                   // the SPIR-V optimizer over every program's shaders
+#include "spv_check.h"                 // SPIR-V from a .fenv checked before the driver sees it
 #include "tex_cache.h"                   // mip chains for textures shipped without one, built once
 
 #ifdef _WIN32
@@ -26,12 +28,22 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <tuple>
 #include <unordered_map>
 
 #define LOG(...)  do { std::fprintf(stderr, "[render] " __VA_ARGS__); std::fputc('\n', stderr); } while (0)
 #define VK_OK(x)  ([&]() { VkResult r_ = (x); if (r_ != VK_SUCCESS) { LOG("%s failed: %d", #x, r_); return false; } return true; }())
 
 namespace {
+
+// SPIR-V a home brought (its .fenv, or made from it) fit to hand the driver: spv_check.h. A malformed module is said
+// and its meshes skipped, as a module the driver refuses is.
+bool shaderOk(const std::vector<uint32_t>& code, const std::string& program) {
+    std::string why;
+    if (spvcheck::check(code, &why)) return true;
+    LOG("shader of %s is malformed SPIR-V (%s): not handed to the driver", program.c_str(), why.c_str());
+    return false;
+}
 
 std::string lower(std::string s) {
     for (char& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
@@ -384,6 +396,21 @@ static void imageBarrier(VkCommandBuffer c, VkImage img, VkImageAspectFlags aspe
     b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     b.image = img;
     b.subresourceRange = {aspect, baseMip, mips, 0, layers};
+    vkCmdPipelineBarrier(c, srcS, dstS, 0, 0, nullptr, 0, nullptr, 1, &b);
+}
+
+// A queue family ownership transfer of a frame shared with the compositor (all its layers, GENERAL throughout): the
+// release half (from our family to VK_QUEUE_FAMILY_EXTERNAL) or the acquire half (the reverse).
+static void ownershipBarrier(VkCommandBuffer c, VkImage img, uint32_t layers, uint32_t fromFamily, uint32_t toFamily,
+                             VkAccessFlags srcA, VkAccessFlags dstA, VkPipelineStageFlags srcS, VkPipelineStageFlags dstS) {
+    VkImageMemoryBarrier b = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    b.oldLayout = b.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    b.srcAccessMask = srcA;
+    b.dstAccessMask = dstA;
+    b.srcQueueFamilyIndex = fromFamily;
+    b.dstQueueFamilyIndex = toFamily;
+    b.image = img;
+    b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, layers};
     vkCmdPipelineBarrier(c, srcS, dstS, 0, 0, nullptr, 0, nullptr, 1, &b);
 }
 
@@ -938,7 +965,7 @@ bool HslRenderer::init(uint32_t eyeWidth, uint32_t eyeHeight) {
     {   // Pipeline cache: compiled shader pipelines persist across runs.
         std::vector<char> data;
         if (!pipelineCachePath.empty()) {
-            if (FILE* f = std::fopen(pipelineCachePath.c_str(), "rb")) {
+            if (FILE* f = texcache::open(std::filesystem::u8path(pipelineCachePath), false)) {   // (UTF-8: wide on Windows)
                 std::fseek(f, 0, SEEK_END);
                 const long n = std::ftell(f);
                 std::fseek(f, 0, SEEK_SET);
@@ -959,6 +986,7 @@ bool HslRenderer::init(uint32_t eyeWidth, uint32_t eyeHeight) {
     createTargets();
     createSharedResources();
     createGuidePipelines();
+    createSplatPipeline();
     ring_ = createBuffer(kRingSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, true);
     // Per-draw GPU timestamps: a slow frame names the objects that cost it.
     if (props.limits.timestampComputeAndGraphics && props.limits.timestampPeriod > 0 && !std::getenv("FH_NO_PROF")) {
@@ -1057,11 +1085,13 @@ void HslRenderer::createTargets() {
     dep.srcSubpass = 0;
     dep.dstSubpass = VK_SUBPASS_EXTERNAL;
     dep.srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-    dep.dstStageMask = external ? VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT : VK_PIPELINE_STAGE_TRANSFER_BIT;
-    if (finalColor == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL) dep.dstStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+    // One dependency for every kind (copied out, read by the smoothing pass, or the compositor's): render passes are
+    // compatible only when their dependencies are identical too, and the same pipelines draw in all of them
+    // (different ones were VUID-vkCmdDrawIndexed-renderPass-02684 on every export-pass draw).
+    (void)external;
+    dep.dstStageMask = VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT;
     dep.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-    dep.dstAccessMask = external ? VK_ACCESS_MEMORY_READ_BIT : VK_ACCESS_TRANSFER_READ_BIT;
-    if (finalColor == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL) dep.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    dep.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_MEMORY_READ_BIT;
     const uint32_t viewMask = (1u << viewCount) - 1, correlation = viewMask;   // both eyes in one pass (VR), or one view (editor)
     VkRenderPassMultiviewCreateInfo mv = {VK_STRUCTURE_TYPE_RENDER_PASS_MULTIVIEW_CREATE_INFO};
     mv.subpassCount = 1;
@@ -1195,18 +1225,20 @@ VkRenderPass HslRenderer::colorOnlyPass(VkImageLayout finalLayout) const {
     sub.colorAttachmentCount = 1;
     sub.pColorAttachments = &cref;
     VkSubpassDependency deps[2] = {};
-    deps[0].srcSubpass = VK_SUBPASS_EXTERNAL;    // the foveated pass's writes before this one reads them
-    deps[0].dstSubpass = 0;
+    deps[0].srcSubpass = VK_SUBPASS_EXTERNAL;    // the foveated pass's writes before this one reads them, and the
+    deps[0].dstSubpass = 0;                      // target's layout transition before this pass writes it
     deps[0].srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-    deps[0].dstStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+    deps[0].dstStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
     deps[0].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-    deps[0].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    deps[0].dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
     deps[1].srcSubpass = 0;
     deps[1].dstSubpass = VK_SUBPASS_EXTERNAL;
     deps[1].srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-    deps[1].dstStageMask = finalLayout == VK_IMAGE_LAYOUT_GENERAL ? VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT : VK_PIPELINE_STAGE_TRANSFER_BIT;
+    // (the same whichever the final layout: passes differing in a dependency aren't compatible, and one pipeline draws
+    // in both kinds)
+    deps[1].dstStageMask = VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT;
     deps[1].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-    deps[1].dstAccessMask = finalLayout == VK_IMAGE_LAYOUT_GENERAL ? VK_ACCESS_MEMORY_READ_BIT : VK_ACCESS_TRANSFER_READ_BIT;
+    deps[1].dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_MEMORY_READ_BIT;
     const uint32_t viewMask = (1u << viewCount) - 1;
     VkRenderPassMultiviewCreateInfo mv = {VK_STRUCTURE_TYPE_RENDER_PASS_MULTIVIEW_CREATE_INFO};
     mv.subpassCount = 1;
@@ -1534,20 +1566,23 @@ int HslRenderer::programFor(const ShaderProgramSrc& src) {
     plci.pPushConstantRanges = &pcr;
     vkCreatePipelineLayout(device_, &plci, nullptr, &p.layout);
 
-    auto module = [&](const std::vector<u32>& code) {
+    // (through the SPIR-V optimizer first: spv_opt.h; a module a .fenv carries made is used as it is)
+    auto module = [&](const std::vector<u32>& shipped) {
+        const std::vector<u32> code = spvopt::run(shipped, p.path);
         VkShaderModuleCreateInfo ci = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
         ci.codeSize = code.size() * 4;
         ci.pCode = code.data();
         VkShaderModule sm = VK_NULL_HANDLE;
-        if (code.empty() || vkCreateShaderModule(device_, &ci, nullptr, &sm) != VK_SUCCESS) sm = VK_NULL_HANDLE;
+        // (a .fenv's SPIR-V is checked before the driver sees it: spv_check.h)
+        if (code.empty() || !shaderOk(code, p.path) || vkCreateShaderModule(device_, &ci, nullptr, &sm) != VK_SUCCESS) sm = VK_NULL_HANDLE;
         return sm;
     };
     // (prepared by the bake for a .fenv: shader_bake.h)
-    p.vs = module(src.prepared ? src.vertInvariant : shaderbake::invariantPosition(src.vert));
+    p.vs = module(src.prepared && shaderbake::bakedUsable(src.vertInvariant) ? src.vertInvariant : shaderbake::invariantPosition(src.vert));
     p.fs = module(src.frag);
     p.src = &src;
     p.foldBlocks = spvspec::blocksRead(src.frag);
-    const std::vector<u32> alpha = src.prepared ? src.fragAlpha : shaderbake::alphaOnly(src.frag);
+    const std::vector<u32> alpha = src.prepared && shaderbake::bakedUsable(src.fragAlpha) ? src.fragAlpha : shaderbake::alphaOnly(src.frag);
     if (!alpha.empty()) p.fsAlpha = module(alpha);
     if (!p.vs || !p.fs) {                        // SPIR-V the driver rejects: this program's meshes are skipped
         LOG("shader module failed: %s", src.path.c_str());
@@ -1688,6 +1723,16 @@ VkPipeline HslRenderer::pipelineFor(Program& p, int blend, bool cull, bool sky, 
     dsi.depthTestEnable = sky && skyFirst() ? VK_FALSE : VK_TRUE;
     dsi.depthWriteEnable = blend == 0 && !sky && cut != kCutShade ? VK_TRUE : VK_FALSE;
     dsi.depthCompareOp = VK_COMPARE_OP_GREATER_OR_EQUAL;     // reversed-Z: clear 0, near -> 1
+    // A cut-out's shading pass: the samples whose depth is its own (the depth pass wrote it there through the same
+    // alpha-to-coverage mask, and nothing nearer covered it) are exactly the ones alpha-to-coverage with GREATER_OR_EQUAL
+    // let through, so EQUAL alone picks them: the same picture, and without alpha-to-coverage the GPU tests depth
+    // before shading (Turnip ran it after: every frond layer was shaded). Desert Terrace 2-4% less GPU time.
+    // FH_CUT_GE=1: the old way (A/B).
+    static const bool cutEqual = std::getenv("FH_CUT_GE") == nullptr;
+    if (cutEqual && cut == kCutShade && msi.alphaToCoverageEnable) {
+        msi.alphaToCoverageEnable = VK_FALSE;
+        dsi.depthCompareOp = VK_COMPARE_OP_EQUAL;
+    }
     VkPipelineColorBlendAttachmentState cba = {};
     cba.colorWriteMask = cut == kCutDepth ? 0 : 0xF;
     if (blend != 0) {
@@ -2351,23 +2396,32 @@ void HslRenderer::setSelection(int mesh) {
     if (!nv || md.indices.size() < 3) return;
     std::vector<float> v(nv * 5, 0.0f);
     for (size_t i = 0; i < nv; ++i) std::memcpy(&v[i * 5], &md.positions[i * 3], 12);
-    // Unique edges (shared by two triangles: drawn once).
+    // Unique edges (shared by two triangles: drawn once). Sorted keys, not a hash set: a few times faster, and
+    // selecting a big mesh in Studio held up a frame for it.
     std::vector<u32> edges, tris;
-    std::unordered_set<uint64_t> seen;
-    seen.reserve(md.indices.size());
+    std::vector<uint64_t> keys;
+    keys.reserve(md.indices.size());
+    tris.reserve(md.indices.size());
     for (size_t t = 0; t + 2 < md.indices.size(); t += 3) {
         const u32 idx[3] = {md.indices[t], md.indices[t + 1], md.indices[t + 2]};
         if (idx[0] >= nv || idx[1] >= nv || idx[2] >= nv) continue;
         tris.insert(tris.end(), idx, idx + 3);
         for (int e = 0; e < 3; ++e) {
             const u32 a = std::min(idx[e], idx[(e + 1) % 3]), b = std::max(idx[e], idx[(e + 1) % 3]);
-            if (seen.insert(static_cast<uint64_t>(a) << 32 | b).second) { edges.push_back(a); edges.push_back(b); }
+            keys.push_back(static_cast<uint64_t>(a) << 32 | b);
         }
     }
     if (tris.empty()) return;
+    std::sort(keys.begin(), keys.end());
+    keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
+    edges.reserve(keys.size() * 2);
+    for (uint64_t k : keys) { edges.push_back(static_cast<u32>(k >> 32)); edges.push_back(static_cast<u32>(k)); }
+    const bool batch = !loadCmd_ && !recordInto_;   // the three uploads in one submit (one wait, not three)
+    if (batch) beginUploadBatch();
     sel_.vbo = createDeviceBuffer(v.data(), v.size() * 4, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
     sel_.edges = createDeviceBuffer(edges.data(), edges.size() * 4, VK_BUFFER_USAGE_INDEX_BUFFER_BIT);
     sel_.tris = createDeviceBuffer(tris.data(), tris.size() * 4, VK_BUFFER_USAGE_INDEX_BUFFER_BIT);
+    if (batch) flushUploadBatch();
     if (!sel_.vbo.buf || !sel_.edges.buf || !sel_.tris.buf) { destroy(sel_.vbo); destroy(sel_.edges); destroy(sel_.tris); return; }
     sel_.edgeCount = static_cast<uint32_t>(edges.size());
     sel_.triCount = static_cast<uint32_t>(tris.size());
@@ -2442,7 +2496,8 @@ void HslRenderer::setStaticGuide(const std::vector<GuideVertex>& tris) {
     if (!device_) return;
     if (guide_.staticVbo.buf) { vkDeviceWaitIdle(device_); destroy(guide_.staticVbo); }
     guide_.staticVertexCount = 0;
-    if (tris.empty() || !guide_.visible) return;
+    static const bool noGuide = std::getenv("FH_NO_GUIDE") != nullptr;   // diagnostics: the home alone (no walk-area overlay)
+    if (tris.empty() || !guide_.visible || noGuide) return;
     guide_.staticVbo = createDeviceBuffer(tris.data(), tris.size() * sizeof(GuideVertex), VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
     if (guide_.staticVbo.buf) guide_.staticVertexCount = static_cast<uint32_t>(tris.size());
 }
@@ -3042,6 +3097,7 @@ bool HslRenderer::uploadMesh(const MeshData& md, int sceneIndex) {
     // objects came into view (the pipeline cache makes it near-instant on later opens).
     measureMesh(gm, md, nv);
     std::map<uint32_t, std::vector<u8>> set2Bytes;   // its constant uniform buffers, for variantFor
+    std::vector<uint64_t> lookSig;                    // what its material buffers and textures are (duplicate check)
 
     // set2: per-material resources, routed by name.
     VkDescriptorSetAllocateInfo ai = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
@@ -3099,6 +3155,12 @@ bool HslRenderer::uploadMesh(const MeshData& md, int sceneIndex) {
             gm.ubos.push_back(b);
             if (!skinning && r.kind == spv::ResKind::UniformBuffer && r.size)
                 set2Bytes[r.binding].assign(static_cast<const u8*>(b.mapped), static_cast<const u8*>(b.mapped) + r.size);
+            if (!skinning) {
+                uint64_t h = 0xcbf29ce484222325ull ^ r.binding;
+                const u8* bytes = static_cast<const u8*>(b.mapped);
+                for (size_t k = 0, n = std::min<size_t>(r.size, static_cast<size_t>(b.size)); k < n; ++k) h = (h ^ bytes[k]) * 0x100000001B3ull;
+                lookSig.push_back(h);
+            }
         } else {
             VkDescriptorImageInfo ii = {};
             ii.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
@@ -3107,7 +3169,10 @@ bool HslRenderer::uploadMesh(const MeshData& md, int sceneIndex) {
             if (r.kind != spv::ResKind::Sampler) {
                 slotPending_ = false;
                 ii.imageView = textureFor(r, gm, md);
+                // (a placeholder stands for the texture it waits for: two meshes are alike when they wait for the same one)
+                lookSig.push_back(reinterpret_cast<uintptr_t>(ii.imageView) ^ (static_cast<uint64_t>(r.binding) << 56));
                 if (slotPending_) {                  // a placeholder for now: patch this binding when it lands
+                    lookSig.push_back(reinterpret_cast<uintptr_t>(pendingKey_.first) * 2 + (pendingKey_.second ? 1 : 0));
                     waiting_[pendingKey_].push_back({meshes_.size(), r.binding, r.count, descriptorType(r.kind), ii.sampler});
                     slotPending_ = false;
                 }
@@ -3128,7 +3193,56 @@ bool HslRenderer::uploadMesh(const MeshData& md, int sceneIndex) {
     // objects came into view (the pipeline cache makes it near-instant on later opens).
     const auto tp0 = std::chrono::steady_clock::now();
     pipelineFor(p, gm.blend, gm.cull, gm.skybox, gm.alphaToCoverage, kCutNone, gm.variant);
+    if (gm.alphaToCoverage && gm.blend == 0 && (gm.variant >= 0 ? p.variants[gm.variant].fsAlpha : p.fsAlpha)) {
+        // ...and a cut-out's two passes (render(): its depth from the alpha-only shader, then shaded): made on first
+        // sight, they were a compile in the middle of a frame the first time a fern came into view.
+        pipelineFor(p, gm.blend, gm.cull, gm.skybox, gm.alphaToCoverage, kCutDepth, gm.variant);
+        pipelineFor(p, gm.blend, gm.cull, gm.skybox, gm.alphaToCoverage, kCutShade, gm.variant);
+    }
     g_loadPipeMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tp0).count();
+    // An exact copy of a solid mesh already in (the same vertices in the same place, the same shader, material
+    // values and textures): some APKs ship a part twice (the hand tutorials' chapters and "archive" copies), and the
+    // copy, at the same depth, shaded every one of its pixels a second time to the same colour. It stays loaded (a
+    // home edit can hide or move the first one) but isn't drawn while the first shows it (render()).
+    static const bool noDedupe = std::getenv("FH_NO_DEDUPE") != nullptr;   // A/B: every copy drawn
+    if (!noDedupe && !gm.dynamic && !gm.skybox && gm.blend == 0 && gm.skinUbo < 0 && !md.hasVat) {
+        uint64_t h = 0xcbf29ce484222325ull;
+        auto mix = [&h](const void* p, size_t n) {
+            const u8* b = static_cast<const u8*>(p);
+            for (size_t k = 0; k < n; ++k) h = (h ^ b[k]) * 0x100000001B3ull;
+        };
+        mix(vbo.data(), vbo.size());
+        mix(indices->data(), indices->size() * 4);
+        mix(gm.world, 64); mix(gm.color, 16); mix(gm.uvXform, sizeof gm.uvXform);
+        const int state[4] = {gm.program, gm.variant, gm.alphaToCoverage ? 1 : 0, gm.cull ? 1 : 0};
+        mix(state, sizeof state);
+        mix(lookSig.data(), lookSig.size() * 8);
+        const auto it = dedupe_.find(h);
+        if (it == dedupe_.end()) {
+            dedupe_[h] = meshes_.size();
+        } else {   // (the hash matched: the geometry checked in full before trusting it)
+            const GpuMesh& o = meshes_[it->second];
+            const MeshData& om = scene_->meshes[o.sceneIndex];
+            if (o.program == gm.program && o.variant == gm.variant && o.indexCount == gm.indexCount && !std::memcmp(o.world, gm.world, 64) &&
+                om.positions == md.positions && om.uvs == md.uvs && om.indices == md.indices) {
+                gm.dupOf = static_cast<int>(it->second);
+                ++loadDuplicates_;
+            }
+        }
+    }
+    // (see-through ones too: the hand tutorials' thousand-odd plants are alpha-blended; FH_NO_BLEND_BATCH=1 for A/B)
+    static const bool noBlendBatch = std::getenv("FH_NO_BLEND_BATCH") != nullptr;
+    if (p.clay && !gm.dynamic && !gm.skybox && (gm.blend == 0 || !noBlendBatch) && gm.skinUbo < 0 && !md.hasVat && gm.dupOf < 0) {   // (buildBatches)
+        uint64_t h = 0xcbf29ce484222325ull;
+        auto mix = [&h](const void* q, size_t n) {
+            const u8* b = static_cast<const u8*>(q);
+            for (size_t k = 0; k < n; ++k) h = (h ^ b[k]) * 0x100000001B3ull;
+        };
+        const int state[5] = {gm.program, gm.variant, gm.alphaToCoverage ? 1 : 0, gm.cull ? 1 : 0, gm.blend};
+        mix(state, sizeof state); mix(gm.color, 16); mix(gm.uvXform, sizeof gm.uvXform);
+        mix(lookSig.data(), lookSig.size() * 8);
+        gm.lookHash = h | 1;
+    }
     sceneToMesh_[sceneIndex] = meshes_.size();
     meshes_.push_back(std::move(gm));
     return true;
@@ -3149,12 +3263,13 @@ int HslRenderer::variantFor(Program& p, const std::map<uint32_t, std::vector<u8>
     const spvspec::Fetch fetch = shaderbake::fetchFor(sceneConsts_, p.sets, set2);
     const uint64_t key = shaderbake::variantKey(p.foldBlocks, fetch, floats) ^ (limit >= 0 ? 0x9E3779B97F4A7C15ull * (limit + 1) : 0);
     if (const auto it = p.variantFor.find(key); it != p.variantFor.end()) return it->second;
-    auto module = [&](const std::vector<u32>& c) {
+    auto module = [&](const std::vector<u32>& specialized) {
+        const std::vector<u32> c = spvopt::run(specialized, p.path);   // (spv_opt.h)
         VkShaderModuleCreateInfo ci = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
         ci.codeSize = c.size() * 4;
         ci.pCode = c.data();
         VkShaderModule sm = VK_NULL_HANDLE;
-        if (c.empty() || vkCreateShaderModule(device_, &ci, nullptr, &sm) != VK_SUCCESS) sm = VK_NULL_HANDLE;
+        if (c.empty() || !shaderOk(c, p.path) || vkCreateShaderModule(device_, &ci, nullptr, &sm) != VK_SUCCESS) sm = VK_NULL_HANDLE;
         return sm;
     };
     std::vector<u32> made, madeAlpha;
@@ -3162,7 +3277,7 @@ int HslRenderer::variantFor(Program& p, const std::map<uint32_t, std::vector<u8>
     const std::vector<u32>* alpha = nullptr;
     bool baked = false;
     for (const auto& bv : p.src->variants)
-        if (bv.key == key && limit < 0) { code = &bv.frag; alpha = &bv.fragAlpha; baked = true; break; }
+        if (bv.key == key && limit < 0 && shaderbake::bakedUsable(bv.frag)) { code = &bv.frag; alpha = &bv.fragAlpha; baked = true; break; }
     uint32_t folded = 0;
     if (!baked) {
         made = spvspec::specialize(p.src->frag, fetch, &folded, limit, floats);
@@ -3200,7 +3315,7 @@ int HslRenderer::variantFor(Program& p, const std::map<uint32_t, std::vector<u8>
 bool HslRenderer::load(const HslScene& scene) {
     beginLoad(scene);
     while (!loadStep(1e9)) {}
-    return !meshes_.empty();
+    return !meshes_.empty() || !splatObjs_.empty();
 }
 
 void HslRenderer::beginLoad(const HslScene& scene) {
@@ -3233,8 +3348,9 @@ void HslRenderer::beginLoad(const HslScene& scene) {
         const uint32_t size = sky->reflCubeSize, mips = sky->reflCubeMips;
         const auto t0 = std::chrono::steady_clock::now();
         // The shader picks a level by roughness over every level the cube has: Meta's cubes are cooked down to 16^2
-        // (256^2, 5 levels). One shipped with fewer (Cascadia's 1024^2 has mip 0 alone, every metal a sharp mirror)
-        // gets the rest of that chain blitted.
+        // (256^2, 5 levels; a streamed one like Cascadia's has 1024^2 and 512^2 in its streams, which the loader puts
+        // in front). One that still arrives with fewer (an environment baked before the loader did that: mip 0 alone,
+        // every floor a mirror) gets the rest of that chain blitted.
         uint32_t levels = 1;
         while ((size >> levels) >= 16) ++levels;
         const TexSource* src = sky->reflCubeSrc.get();
@@ -3284,6 +3400,8 @@ void HslRenderer::beginLoad(const HslScene& scene) {
     if (!sel_.lines) createSelectionPipelines();   // now, not on the first click (a 70 ms hitch)
     loadNext_ = 0;
     loadSkipped_ = 0;
+    loadDuplicates_ = 0;
+    dedupe_.clear();
     loadStart_ = std::chrono::steady_clock::now();
 }
 
@@ -3308,14 +3426,43 @@ bool HslRenderer::loadStep(double budgetMs) {
     }
     flushUploadBatch();
     if (loadNext_ < scene_->meshes.size()) return false;
+    if (!splatsUploaded_) uploadSplats();               // (hsl_renderer_splat.cpp)
     if (loadNext_ == scene_->meshes.size() && !loadDone_) {
         loadDone_ = true;
+        buildBatches();
         size_t variants = 0;
         for (const auto& p : programs_) variants += p.variants.size();
-        LOG("uploaded %zu meshes (%zu skipped), %zu shader programs (%zu specialized: %zu baked, %zu made now) in %.1fs", meshes_.size(),
-            loadSkipped_, programs_.size(), variants, specBaked_, specMade_, std::chrono::duration<double>(std::chrono::steady_clock::now() - loadStart_).count());
+        size_t batched = 0;
+        for (const Batch& b : batches_) batched += b.members.size();
+        LOG("uploaded %zu meshes (%zu skipped, %zu exact copies of another not drawn, %zu drawn as %zu batches), %zu shader programs (%zu specialized: %zu baked, %zu made now) in %.1fs",
+            meshes_.size(), loadSkipped_, loadDuplicates_, batched, batches_.size(), programs_.size(), variants, specBaked_, specMade_, std::chrono::duration<double>(std::chrono::steady_clock::now() - loadStart_).count());
+        if (spvopt::flags()) {
+            const spvopt::Stats st = spvopt::stats();
+            LOG("spir-v optimizer (flags %d): %u modules made in %.0f ms, %u reused, %u failed", spvopt::flags(), st.made, st.ms, st.cached, st.failed);
+        }
     }
     return true;
+}
+
+int HslRenderer::addMesh(int sceneIndex) {
+    if (!device_ || !scene_ || !loadDone_ || recordInto_ || sceneIndex < 0 || sceneIndex >= static_cast<int>(scene_->meshes.size())) return -1;
+    beginUploadBatch();
+    const bool ok = uploadMesh(scene_->meshes[sceneIndex], sceneIndex);
+    flushUploadBatch();
+    loadNext_ = scene_->meshes.size();                     // (nothing more for loadStep to bring in)
+    if (!ok) return -1;
+    GpuMesh& gm = meshes_.back();
+    gm.batch = -1;                                         // drawn alone (batches are made once, at load)
+    gm.dupOf = -1;                                         // (a copy pasted over its original still draws once moved)
+    requestTextures(gm);
+    return static_cast<int>(meshes_.size()) - 1;
+}
+
+void HslRenderer::reloadSplats() {
+    if (!device_ || !scene_) return;
+    vkDeviceWaitIdle(device_);
+    destroySplats();
+    uploadSplats();
 }
 
 float HslRenderer::loadProgress() const {
@@ -3328,6 +3475,7 @@ void HslRenderer::unload() {
     vkDeviceWaitIdle(device_);
     for (Buffer& b : frameStaging_) destroy(b);
     frameStaging_.clear();
+    destroySplats();
     for (auto& m : meshes_) {
         destroy(m.vbo);
         destroy(m.ibo);
@@ -3339,6 +3487,12 @@ void HslRenderer::unload() {
     sel_.mesh = -1;
     sel_.edgeCount = sel_.triCount = 0;
     meshes_.clear();
+    for (Batch& b : batches_) {   // (its set2 is its first part's, freed above; a sorted one's ibo is one of its sortIbo)
+        destroy(b.gm.vbo);
+        if (b.sorted) { for (Buffer& sb : b.sortIbo) destroy(sb); } else destroy(b.gm.ibo);
+    }
+    batches_.clear();
+    dedupe_.clear();
     cost_.clear();
     costMin_.clear(); costSeen_.clear(); std::fill(std::begin(costBaseRing_), std::end(costBaseRing_), 1e9f);
     doubled_ = -1;
@@ -3381,6 +3535,7 @@ void HslRenderer::unload() {
 
 void HslRenderer::setMeshWorld(size_t i, const float world[16]) {
     GpuMesh& gm = meshes_[i];
+    if (gm.batch >= 0 && std::memcmp(gm.baseWorld, world, 64) != 0) batches_[gm.batch].active = false;   // (drawn alone again)
     std::memcpy(gm.baseWorld, world, 64);
     placeMesh(gm);
 }
@@ -3408,6 +3563,159 @@ void HslRenderer::placeMesh(GpuMesh& gm) {
     for (int k = 0; k < 3; ++k)
         gm.centroid[k] = w[k] * gm.localCentroid[0] + w[4 + k] * gm.localCentroid[1] + w[8 + k] * gm.localCentroid[2] + w[12 + k];
     updateBounds(gm);
+}
+
+// Static batching (Batch, hsl_renderer.h): the solid Clay meshes uploadMesh gave a lookHash, grouped by that look and by
+// the 4 m cell their centre is in, each group of two or more made one mesh: their vertices moved into the world (the
+// shader then places them with an identity matrix), their indices one after another. Big meshes stay alone (one draw
+// is nothing next to their pixels, and they'd be held twice in memory).
+void HslRenderer::buildBatches() {
+    batches_.clear();
+    static const bool off = std::getenv("FH_NO_BATCH") != nullptr;   // A/B: every mesh its own draw
+    if (off || !scene_) return;
+    constexpr u32 kMaxPartVerts = 16384, kMaxBatchVerts = 262144;
+    // See-through parts are sorted back to front as one: a smaller cell keeps that order close to theirs one by one.
+    static const float kSolidCell = 4.0f, kBlendCell = std::getenv("FH_BLEND_CELL") ? static_cast<float>(std::atof(std::getenv("FH_BLEND_CELL"))) : 2.0f;
+    std::map<std::tuple<uint64_t, int, int, int>, std::vector<size_t>> groups;
+    for (size_t i = 0; i < meshes_.size(); ++i) {
+        const GpuMesh& gm = meshes_[i];
+        if (!gm.lookHash || gm.dupOf >= 0 || !gm.visible || gm.sceneIndex < 0 || static_cast<size_t>(gm.sceneIndex) >= scene_->meshes.size()) continue;
+        if (meshVerts(scene_->meshes[gm.sceneIndex]) > kMaxPartVerts) continue;
+        const float kCell = gm.blend ? std::max(0.25f, kBlendCell) : kSolidCell;
+        groups[{gm.lookHash, static_cast<int>(std::floor(gm.centroid[0] / kCell)), static_cast<int>(std::floor(gm.centroid[1] / kCell)),
+                static_cast<int>(std::floor(gm.centroid[2] / kCell))}].push_back(i);
+    }
+    std::vector<u8> vbo, all;
+    std::vector<float> normals;
+    std::vector<u32> indices;
+    for (auto& g : groups) {
+        std::vector<size_t>& parts = g.second;
+        if (parts.size() < 2) continue;
+        const GpuMesh& first = meshes_[parts.front()];
+        const Program& p = programs_[first.program];
+        int posOff = -1, nrmOff = -1;   // only float positions (and normals) can be moved; anything else stays alone
+        bool movable = true;
+        for (const auto& a : p.attrs) {
+            if (a.role == Role::Pos) { if (a.format == VK_FORMAT_R32G32B32_SFLOAT || a.format == VK_FORMAT_R32G32B32A32_SFLOAT) posOff = static_cast<int>(a.offset); else movable = false; }
+            if (a.role == Role::Normal) { if (a.format == VK_FORMAT_R32G32B32_SFLOAT || a.format == VK_FORMAT_R32G32B32A32_SFLOAT) nrmOff = static_cast<int>(a.offset); else movable = false; }
+        }
+        if (!movable || posOff < 0) continue;
+        for (size_t start = 0; start < parts.size();) {
+            // as many parts as fit in one batch
+            all.clear();
+            indices.clear();
+            std::vector<size_t> members;
+            std::vector<std::pair<u32, u32>> ranges;
+            u32 verts = 0;
+            for (; start < parts.size(); ++start) {
+                const GpuMesh& gm = meshes_[parts[start]];
+                const MeshData& md = scene_->meshes[gm.sceneIndex];
+                const u32 nv = meshVerts(md);
+                if (verts + nv > kMaxBatchVerts && !members.empty()) break;
+                if (std::any_of(md.indices.begin(), md.indices.end(), [nv](u32 i) { return i >= nv; })) continue;   // (damaged: alone)
+                buildVertices(p, md, vbo, normals);
+                if (vbo.size() != static_cast<size_t>(nv) * p.stride) continue;
+                // world position; normal by the inverse transpose (the cofactors), as the shader would have
+                const float* w = gm.world;
+                const float cof[9] = {w[5] * w[10] - w[6] * w[9], w[6] * w[8] - w[4] * w[10], w[4] * w[9] - w[5] * w[8],
+                                      w[2] * w[9] - w[1] * w[10], w[0] * w[10] - w[2] * w[8], w[1] * w[8] - w[0] * w[9],
+                                      w[1] * w[6] - w[2] * w[5], w[2] * w[4] - w[0] * w[6], w[0] * w[5] - w[1] * w[4]};
+                for (u32 v = 0; v < nv; ++v) {
+                    u8* base = vbo.data() + static_cast<size_t>(v) * p.stride;
+                    float q[3];
+                    std::memcpy(q, base + posOff, 12);
+                    const float o[3] = {w[0] * q[0] + w[4] * q[1] + w[8] * q[2] + w[12], w[1] * q[0] + w[5] * q[1] + w[9] * q[2] + w[13],
+                                        w[2] * q[0] + w[6] * q[1] + w[10] * q[2] + w[14]};
+                    std::memcpy(base + posOff, o, 12);
+                    if (nrmOff >= 0) {
+                        std::memcpy(q, base + nrmOff, 12);
+                        float n[3] = {cof[0] * q[0] + cof[3] * q[1] + cof[6] * q[2], cof[1] * q[0] + cof[4] * q[1] + cof[7] * q[2],
+                                      cof[2] * q[0] + cof[5] * q[1] + cof[8] * q[2]};
+                        const float l = std::sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
+                        if (l > 1e-12f) { n[0] /= l; n[1] /= l; n[2] /= l; }
+                        std::memcpy(base + nrmOff, n, 12);
+                    }
+                }
+                all.insert(all.end(), vbo.begin(), vbo.end());
+                ranges.push_back({static_cast<u32>(indices.size()), static_cast<u32>(md.indices.size())});
+                for (u32 i : md.indices) indices.push_back(verts + i);
+                verts += nv;
+                members.push_back(parts[start]);
+            }
+            if (members.size() < 2) continue;
+            Batch b;
+            GpuMesh& bm = b.gm;
+            bm.program = first.program; bm.variant = first.variant; bm.set2 = first.set2;
+            std::memcpy(bm.color, first.color, 16);
+            std::memcpy(bm.uvXform, first.uvXform, sizeof bm.uvXform);
+            bm.blend = first.blend; bm.cull = first.cull; bm.alphaToCoverage = first.alphaToCoverage;
+            b.sorted = first.blend != 0;
+            const float id[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+            std::memcpy(bm.baseWorld, id, 64);
+            for (int k = 0; k < 3; ++k) { bm.localMin[k] = 1e30f; bm.localMax[k] = -1e30f; }
+            for (size_t m : members)
+                for (int k = 0; k < 3; ++k) {
+                    bm.localMin[k] = std::min(bm.localMin[k], meshes_[m].worldMin[k]);
+                    bm.localMax[k] = std::max(bm.localMax[k], meshes_[m].worldMax[k]);
+                }
+            for (int k = 0; k < 3; ++k) bm.localCentroid[k] = 0.5f * (bm.localMin[k] + bm.localMax[k]);
+            placeMesh(bm);
+            beginUploadBatch();
+            bm.vbo = createDeviceBuffer(all.data(), all.size(), VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
+            if (b.sorted) {   // (written each frame the order changes: sortBatch)
+                for (Buffer& sb : b.sortIbo) sb = createBuffer(indices.size() * 4, VK_BUFFER_USAGE_INDEX_BUFFER_BIT, true);
+                if (b.sortIbo[0].mapped && b.sortIbo[1].mapped) bm.ibo = b.sortIbo[0];
+                b.indices = indices;
+                b.ranges = std::move(ranges);
+            } else {
+                bm.ibo = createDeviceBuffer(indices.data(), indices.size() * 4, VK_BUFFER_USAGE_INDEX_BUFFER_BIT);
+            }
+            flushUploadBatch();
+            bm.indexCount = b.sorted ? 0 : static_cast<uint32_t>(indices.size());
+            if (!bm.vbo.buf || !bm.ibo.buf) {   // (no memory: the parts draw alone)
+                destroy(bm.vbo);
+                if (b.sorted) { for (Buffer& sb : b.sortIbo) destroy(sb); } else destroy(bm.ibo);
+                continue;
+            }
+            for (size_t m : members) meshes_[m].batch = static_cast<int>(batches_.size());
+            b.members = std::move(members);
+            batches_.push_back(std::move(b));
+        }
+    }
+}
+
+// A see-through batch this frame (render(), after culling, meshes' inView still their own): the parts in view, far to
+// near by their centres as render() orders see-through meshes, their indices written in that order into this command
+// buffer's index buffer when it holds anything else (it was last read two frames ago: that frame's fence was waited).
+void HslRenderer::sortBatch(Batch& b, const float head[3]) {
+    std::vector<std::pair<float, u32>> order;
+    order.reserve(b.members.size());
+    for (u32 k = 0; k < b.members.size(); ++k) {
+        const GpuMesh& gm = meshes_[b.members[k]];
+        if (!gm.inView) continue;
+        float d = 0;
+        for (int c = 0; c < 3; ++c) d += (gm.centroid[c] - head[c]) * (gm.centroid[c] - head[c]);
+        order.push_back({d, k});
+    }
+    std::stable_sort(order.begin(), order.end(), [](const auto& x, const auto& y) { return x.first > y.first; });
+    const int s = cmdIndex_ & 1;
+    std::vector<u32>& was = b.written[s];
+    bool same = was.size() == order.size();
+    for (size_t k = 0; same && k < order.size(); ++k) same = was[k] == order[k].second;
+    if (!same) {
+        u32* dst = static_cast<u32*>(b.sortIbo[s].mapped);
+        u32 n = 0;
+        was.clear();
+        for (const auto& o : order) {
+            const auto& r = b.ranges[o.second];
+            std::memcpy(dst + n, b.indices.data() + r.first, static_cast<size_t>(r.second) * 4);
+            n += r.second;
+            was.push_back(o.second);
+        }
+        b.writtenCount[s] = n;
+    }
+    b.gm.ibo = b.sortIbo[s];
+    b.gm.indexCount = b.writtenCount[s];
 }
 
 void HslRenderer::resize(uint32_t eyeWidth, uint32_t eyeHeight) {
@@ -3659,7 +3967,10 @@ void HslRenderer::render(const EyeView eyes[2], float timeSec) {
     ta = clk::now();
     updateAnimations(timeSec);                  // bone matrices for skinned meshes (the GPU is idle here)
     tb = clk::now();
-    updateGlobals(eyes, timeSec);
+    {
+        EyeView late[2];
+        updateGlobals(latePose && latePose(late) ? late : eyes, timeSec);
+    }
     tg = clk::now();
     refreshDynamicMeshes(!early, true);         // animated Clay / glTF meshes: this frame's vertices + tint
     tc = clk::now();
@@ -3831,12 +4142,28 @@ void HslRenderer::render(const EyeView eyes[2], float timeSec) {
     const int frameNo_ = ++cullFrame;
     for (auto& gm : meshes_) {
         gm.inView = gm.skybox || (gm.visible && (inFrustum(gm, 0) || inFrustum(gm, 1)));   // (animated: bounds kept current)
+        if (gm.dupOf >= 0 && gm.inView) {   // an exact copy of a mesh that already draws these pixels (uploadMesh)
+            const GpuMesh& o = meshes_[gm.dupOf];
+            if (o.visible && !std::memcmp(o.world, gm.world, 64)) gm.inView = false;
+        }
         if (gm.inView && gm.visible) { ++drawn_; requestTextures(gm); }
         if (gm.debug && frameNo_ == 120)
             LOG("[cull] %s eye %.2f %.2f %.2f | visible %d inView %d dynamic %d | world box %.2f %.2f %.2f .. %.2f %.2f %.2f",
                 gm.debugName.c_str(), eyes[0].position[0], eyes[0].position[1], eyes[0].position[2], gm.visible, gm.inView, gm.dynamic,
                 gm.worldMin[0], gm.worldMin[1], gm.worldMin[2], gm.worldMax[0], gm.worldMax[1], gm.worldMax[2]);
     }
+    // A batch draws when any of its parts is in view, in their place (the debug views show the parts themselves).
+    for (Batch& b : batches_) {
+        b.gm.inView = false;
+        if (!b.active || debugView_ != kViewNormal) continue;
+        for (size_t m : b.members) b.gm.inView |= meshes_[m].inView;
+        if (b.sorted && b.gm.inView) {   // see-through: the parts in view, in their order
+            sortBatch(b, head);
+            b.gm.inView = b.gm.indexCount > 0;
+        }
+        for (size_t m : b.members) meshes_[m].inView = false;
+    }
+    auto meshAt = [&](size_t k) -> GpuMesh& { return k < meshes_.size() ? meshes_[k] : batches_[k - meshes_.size()].gm; };
 
     // Redundant state is not re-sent: consecutive meshes of one shader share its pipeline and its set 0 / set 1
     // (the same layout keeps them bound), so only set 2 and the push constants change between them.
@@ -3927,12 +4254,13 @@ void HslRenderer::render(const EyeView eyes[2], float timeSec) {
     static const int opaqueMode = std::getenv("FH_ORDER") ? std::atoi(std::getenv("FH_ORDER")) : 2;
     if (opaqueMode == 0) {
         for (auto& gm : meshes_) if (gm.blend == 0 && !gm.skybox) draw(gm);
+        for (auto& b : batches_) if (b.gm.blend == 0) draw(b.gm);
     } else {
         opaqueOrder_.clear();
-        for (size_t i = 0; i < meshes_.size(); ++i) {
-            const GpuMesh& gm = meshes_[i];
+        for (size_t i = 0; i < meshes_.size() + batches_.size(); ++i) {   // (past the meshes: the batches, at their first part)
+            const GpuMesh& gm = meshAt(i);
             if (gm.blend != 0 || gm.skybox || !gm.visible || !gm.inView) continue;
-            float d = static_cast<float>(i);
+            float d = static_cast<float>(i < meshes_.size() ? i : batches_[i - meshes_.size()].members.front());
             if (opaqueMode == 1) {   // distance to the box (0 inside it): a big floor around you is nearest, not its far-off centre
                 d = 0;
                 for (int k = 0; k < 3; ++k) {
@@ -3951,16 +4279,16 @@ void HslRenderer::render(const EyeView eyes[2], float timeSec) {
         size_t firstCut = opaqueOrder_.size();
         if (twoPass)
             for (size_t k = 0; k < opaqueOrder_.size(); ++k)
-                if (meshes_[opaqueOrder_[k].second].alphaToCoverage) { firstCut = k; break; }
-        for (size_t k = 0; k < firstCut; ++k) draw(meshes_[opaqueOrder_[k].second]);
+                if (meshAt(opaqueOrder_[k].second).alphaToCoverage) { firstCut = k; break; }
+        for (size_t k = 0; k < firstCut; ++k) draw(meshAt(opaqueOrder_[k].second));
         for (size_t k = firstCut; k < opaqueOrder_.size(); ++k) {
-            GpuMesh& gm = meshes_[opaqueOrder_[k].second];
+            GpuMesh& gm = meshAt(opaqueOrder_[k].second);
             const Program& cp = programs_[gm.program];
             if (gm.variant >= 0 ? !cp.variants[gm.variant].fsAlpha : !cp.fsAlpha) gm.cutOnce = true;   // no alpha-only shader: drawn the one way
             else draw(gm, kCutDepth);
         }
         for (size_t k = firstCut; k < opaqueOrder_.size(); ++k) {
-            GpuMesh& gm = meshes_[opaqueOrder_[k].second];
+            GpuMesh& gm = meshAt(opaqueOrder_[k].second);
             draw(gm, gm.cutOnce ? kCutNone : kCutShade);
         }
     }
@@ -3975,15 +4303,18 @@ void HslRenderer::render(const EyeView eyes[2], float timeSec) {
             }
         if (set) vkCmdSetViewport(cmd_, 0, 1, &vp);
     }
+    drawSplats(eyes, head, planes);                     // Gaussian splats: over what's solid and the sky, under what's see-through
+    if (splatsDrawn_) boundPipe = VK_NULL_HANDLE, boundLayout = VK_NULL_HANDLE;   // (they bound their own)
     std::vector<std::pair<float, size_t>> order;
-    for (size_t i = 0; i < meshes_.size(); ++i) {
-        if (meshes_[i].blend == 0 || meshes_[i].skybox) continue;
+    for (size_t i = 0; i < meshes_.size() + batches_.size(); ++i) {   // (past the meshes: the see-through batches, at their box's centre)
+        const GpuMesh& gm = meshAt(i);
+        if (gm.blend == 0 || gm.skybox || (i >= meshes_.size() && !gm.inView)) continue;
         float d = 0;
-        for (int k = 0; k < 3; ++k) d += (meshes_[i].centroid[k] - head[k]) * (meshes_[i].centroid[k] - head[k]);
+        for (int k = 0; k < 3; ++k) d += (gm.centroid[k] - head[k]) * (gm.centroid[k] - head[k]);
         order.push_back({d, i});
     }
     std::sort(order.begin(), order.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
-    for (auto& o : order) draw(meshes_[o.second]);
+    for (auto& o : order) draw(meshAt(o.second));
 
     if (debugView_ != kViewNormal && dbg_.draws.mapped) {
         // Each mesh's colour: its own (a hash of its index), its cost, or its kind.
@@ -4080,20 +4411,27 @@ void HslRenderer::render(const EyeView eyes[2], float timeSec) {
     if (queryPool_) vkCmdWriteTimestamp(cmd_, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, queryPool_, kMaxQueries - 2);
     if (!direct && exportSlot >= 0 && static_cast<size_t>(exportSlot) < exportImages_.size()) {   // the frame for the compositor (system mode), copied
         VkImage dst = exportImages_[exportSlot];
-        // GENERAL between frames: the layout both processes agree on (the compositor samples it as GENERAL).
-        imageBarrier(cmd_, dst, VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, viewCount, exportInited_[exportSlot] ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_UNDEFINED,
-                     VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+        // GENERAL between frames: the layout both processes agree on (the compositor samples it as GENERAL). What the
+        // slot held is discarded (UNDEFINED): the copy overwrites all of it, and the compositor never hands it back.
+        imageBarrier(cmd_, dst, VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, viewCount, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, 0,
+                     VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
         imageBarrier(cmd_, resolve_.image, VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, viewCount, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                      VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
         VkImageCopy cp = {};
         cp.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, viewCount};
         cp.dstSubresource = cp.srcSubresource;
         cp.extent = {width_, height_, 1};
-        vkCmdCopyImage(cmd_, resolve_.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &cp);
-        imageBarrier(cmd_, dst, VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, viewCount, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
-                     VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
-        exportInited_[exportSlot] = true;
+        vkCmdCopyImage(cmd_, resolve_.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst, VK_IMAGE_LAYOUT_GENERAL, 1, &cp);
     }
+    // The finished frame goes to the compositor: its image released from our queue family to the outside one (the
+    // compositor's layer acquires it before sampling, layer/frame_home_layer.cpp). GENERAL to GENERAL, so this is no
+    // layout transition and an older layer that doesn't acquire reads it exactly as before. The next frame into this
+    // slot discards it (UNDEFINED) rather than taking it back.
+    if (exportSlot >= 0 && static_cast<size_t>(exportSlot) < exportImages_.size())
+        ownershipBarrier(cmd_, exportImages_[exportSlot], viewCount, queueFamily_, VK_QUEUE_FAMILY_EXTERNAL,
+                         VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, 0,
+                         VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
     if (queryPool_) { vkCmdWriteTimestamp(cmd_, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, queryPool_, kMaxQueries - 1); profFrame_ = true; }
     timedSlot_ = exportSlot;
     if (perfThis) { vkCmdEndQuery(cmd_, perfPool_, 0); perfRecorded_ = true; }
@@ -4216,7 +4554,6 @@ bool HslRenderer::createExportImages(uint32_t n, std::vector<ExportImage>& out, 
     }
     exportImages_.clear();
     for (const ExportImage& e : out) exportImages_.push_back(e.image);
-    exportInited_.assign(out.size(), false);
     if (exportDirect) createExportFramebuffers();
     return true;
 }
@@ -4232,7 +4569,6 @@ bool HslRenderer::importWin32Images(uint32_t n, const uint64_t handles[], uint32
     for (VkDeviceMemory m : importMem_) vkFreeMemory(device_, m, nullptr);
     exportImages_.clear();
     importMem_.clear();
-    exportInited_.clear();
     exportSlot = -1;
     exportDirect = false;                               // copied in (the imported textures aren't our render targets)
     for (uint32_t i = 0; i < n; ++i) {
@@ -4274,7 +4610,6 @@ bool HslRenderer::importWin32Images(uint32_t n, const uint64_t handles[], uint32
         exportImages_.push_back(image);
         importMem_.push_back(mem);
     }
-    exportInited_.assign(n, false);
     LOG("system mode: imported %u compositor textures (%ux%u, %u layers)", n, w, h, viewCount);
     return true;
 }
@@ -4342,7 +4677,6 @@ void HslRenderer::destroyExportImages(std::vector<ExportImage>& images) {
     destroyExportFramebuffers();
     images.clear();
     exportImages_.clear();
-    exportInited_.clear();
     exportSlot = -1;
 }
 
@@ -4355,9 +4689,15 @@ bool HslRenderer::readback(uint32_t layer, std::vector<u8>& rgba) {
         VkBufferImageCopy copy = {};
         copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, layer, 1};
         copy.imageExtent = {width_, height_, 1};
-        if (lastExportSlot_ >= 0 && static_cast<size_t>(lastExportSlot_) < exportImages_.size())   // exportDirect: the frame is there
-            vkCmdCopyImageToBuffer(c, exportImages_[lastExportSlot_], VK_IMAGE_LAYOUT_GENERAL, b.buf, 1, &copy);
-        else vkCmdCopyImageToBuffer(c, resolve_.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, b.buf, 1, &copy);
+        if (lastExportSlot_ >= 0 && static_cast<size_t>(lastExportSlot_) < exportImages_.size()) {   // exportDirect: the frame is there
+            // (released to the compositor: taken back for the copy, then handed over again)
+            VkImage img = exportImages_[lastExportSlot_];
+            ownershipBarrier(c, img, viewCount, VK_QUEUE_FAMILY_EXTERNAL, queueFamily_, 0, VK_ACCESS_TRANSFER_READ_BIT,
+                             VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+            vkCmdCopyImageToBuffer(c, img, VK_IMAGE_LAYOUT_GENERAL, b.buf, 1, &copy);
+            ownershipBarrier(c, img, viewCount, queueFamily_, VK_QUEUE_FAMILY_EXTERNAL, 0, 0, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
+        } else vkCmdCopyImageToBuffer(c, resolve_.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, b.buf, 1, &copy);
     });
     rgba.assign(static_cast<u8*>(b.mapped), static_cast<u8*>(b.mapped) + size);
     destroy(b);
@@ -4369,6 +4709,7 @@ void HslRenderer::shutdown() {
     stopWorkers();
     unload();
     destroyGuide();
+    destroySplatPipeline();
     destroyDebug();
     for (VkImageView v : layerViews_) if (v) vkDestroyImageView(device_, v, nullptr);
     for (Image& i : pictures_) destroy(i);
@@ -4404,7 +4745,7 @@ void HslRenderer::shutdown() {
         if (!pipelineCachePath.empty() && vkGetPipelineCacheData(device_, pipelineCache_, &n, nullptr) == VK_SUCCESS && n) {
             std::vector<char> data(n);
             if (vkGetPipelineCacheData(device_, pipelineCache_, &n, data.data()) == VK_SUCCESS)
-                if (FILE* f = std::fopen(pipelineCachePath.c_str(), "wb")) { std::fwrite(data.data(), 1, n, f); std::fclose(f); }
+                if (FILE* f = texcache::open(std::filesystem::u8path(pipelineCachePath), true)) { std::fwrite(data.data(), 1, n, f); std::fclose(f); }
         }
         vkDestroyPipelineCache(device_, pipelineCache_, nullptr);
     }

@@ -70,6 +70,15 @@ add_library(lzma STATIC "${TP}/lzma/LzmaEnc.c" "${TP}/lzma/LzmaDec.c" "${TP}/lzm
     "${TP}/lzma/LzFindMt.c" "${TP}/lzma/Threads.c" "${TP}/lzma/CpuArch.c")
 target_include_directories(lzma PUBLIC "${TP}/lzma")
 
+# zstd 1.5.6 (BSD), decompression only: version 4 .spz splat files (src/splat_import.cpp). Single-threaded, plain C
+# (no amd64 assembly), so it builds the same everywhere.
+add_library(zstd STATIC "${TP}/zstd/common/debug.c" "${TP}/zstd/common/entropy_common.c"
+    "${TP}/zstd/common/error_private.c" "${TP}/zstd/common/fse_decompress.c" "${TP}/zstd/common/xxhash.c"
+    "${TP}/zstd/common/zstd_common.c" "${TP}/zstd/decompress/huf_decompress.c" "${TP}/zstd/decompress/zstd_ddict.c"
+    "${TP}/zstd/decompress/zstd_decompress.c" "${TP}/zstd/decompress/zstd_decompress_block.c")
+target_include_directories(zstd PUBLIC "${TP}/zstd")
+target_compile_definitions(zstd PRIVATE ZSTD_DISABLE_ASM)
+
 # The home loader: HSL / Clay / glTF homes, .fenv environments (baked scenes), Blender / Unity models.
 add_library(frame-scene STATIC
     src/hsl_scene.cpp
@@ -77,6 +86,8 @@ add_library(frame-scene STATIC
     src/anim_bake.cpp
     src/fenv_lzma.cpp
     src/model_import.cpp
+    src/splat_import.cpp
+    src/spv_opt.cpp
     "${TP}/ufbx/ufbx.c"
     "${TP}/qhe/cook/hzanim_acl.cpp"
     "${TP}/stb/stb_image_impl.c")
@@ -93,7 +104,15 @@ target_include_directories(frame-scene PUBLIC
 if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
     set_source_files_properties("${TP}/qhe/cook/hzanim_acl.cpp" PROPERTIES COMPILE_OPTIONS "-flax-vector-conversions")
 endif()
-target_link_libraries(frame-scene PUBLIC miniz lzma smolv ${ASTCENC_LIB} pthread)
+target_link_libraries(frame-scene PUBLIC miniz lzma zstd smolv ${ASTCENC_LIB} pthread)
+# The SPIRV-Tools optimizer for src/spv_opt.h (FH_SPV_OPT=1 at run time). Off: on the Frame it made no shader any
+# cheaper (Turnip's compiler already does what it does), and it is a large library to build everywhere.
+option(FRAME_SPV_OPT "Build in the SPIRV-Tools shader optimizer (third_party/spirv-tools)" OFF)
+if(FRAME_SPV_OPT)
+    add_subdirectory("${TP}/spirv-tools" spirv-tools EXCLUDE_FROM_ALL)
+    target_link_libraries(frame-scene PUBLIC spirv-tools-opt)
+    target_compile_definitions(frame-scene PUBLIC FH_HAVE_SPV_OPT)
+endif()
 # libdeflate when the system has it (the Frame, CI): APK scene.zips inflate several times faster than with miniz. Its
 # static library first, so a release build doesn't need it installed on the headset.
 find_library(LIBDEFLATE_LIB NAMES libdeflate.a deflate)
@@ -122,6 +141,7 @@ target_link_libraries(opusfile PUBLIC opus ogg)
 add_executable(frame-home
     src/main.cpp
     src/hsl_renderer.cpp
+    src/hsl_renderer_splat.cpp
     src/panorama.cpp
     "${TP}/stb/stb_vorbis_impl.c"
     "${TP}/miniaudio/miniaudio_impl.c")
@@ -149,6 +169,11 @@ target_link_libraries(fenv-tool PRIVATE frame-scene)
 # frame-switcher: the SteamVR dashboard panel that switches the environment.
 add_executable(frame-switcher src/switcher.cpp)
 target_include_directories(frame-switcher PRIVATE src "${TP}/stb" "${TP}/qhe" "${TP}/miniz" "${TP}/openvr")
+# Its Settings page shows the version: major.minor only (with the installed files' hash as the build), so a commit
+# that doesn't touch Frame Home leaves its binaries, and the hash updates go by, the same.
+file(READ "${CMAKE_SOURCE_DIR}/VERSION" FRAME_VERSION_BASE)
+string(STRIP "${FRAME_VERSION_BASE}" FRAME_VERSION_BASE)
+target_compile_definitions(frame-switcher PRIVATE FRAME_VERSION_BASE="${FRAME_VERSION_BASE}")
 if(FRAME_HOME_PC)
     target_include_directories(frame-switcher PRIVATE "${TP}/vulkan-headers/include")
 endif()
@@ -159,4 +184,34 @@ if(WIN32)
 endif()
 if(NOT FRAME_HOME_PC)
     set_target_properties(frame-switcher PROPERTIES BUILD_RPATH "${OPENVR_LIB_DIR}" INSTALL_RPATH "${OPENVR_LIB_DIR}")
+endif()
+
+# Tests (tests_loco/): -DFRAME_TESTS=ON, then build frame-tests and run ctest. Off by default: release builds skip them.
+option(FRAME_TESTS "Build the tests in tests_loco (cmake --build <dir> --target frame-tests; ctest --test-dir <dir>)" OFF)
+if(FRAME_TESTS)
+    enable_testing()
+    add_executable(loco_test tests_loco/loco_test.cpp)       # locomotion: floors, seats, stairs, gravity
+    add_executable(clip_test tests_loco/clip_test.cpp)       # locomotion never puts eyes in walls or feet through floors
+    foreach(t loco_test clip_test)
+        target_include_directories(${t} PRIVATE "${TP}/openvr")
+        target_link_libraries(${t} PRIVATE frame-scene ${FH_OPENVR})
+        if(NOT FRAME_HOME_PC)
+            set_target_properties(${t} PROPERTIES BUILD_RPATH "${OPENVR_LIB_DIR}")
+        endif()
+    endforeach()
+    add_executable(spv_check_test tests_loco/spv_check_test.cpp)   # the shader checker, on every shader Frame Home ships
+    target_include_directories(spv_check_test PRIVATE src)
+    add_test(NAME loco COMMAND loco_test)
+    add_test(NAME clip COMMAND clip_test)
+    add_test(NAME spv_check COMMAND spv_check_test)
+    set(FRAME_TEST_TARGETS loco_test clip_test spv_check_test)
+    if(NOT WIN32)   # the Frame Home <-> compositor layer shared state (Linux: memfd, the layer itself)
+        add_executable(env_share_test tests_loco/env_share_test.cpp)
+        target_include_directories(env_share_test PRIVATE src "${TP}/vulkan-headers/include")
+        target_link_libraries(env_share_test PRIVATE pthread)
+        add_test(NAME env_share_thread COMMAND env_share_test 2 thread)
+        add_test(NAME env_share_process COMMAND env_share_test 2 process)
+        list(APPEND FRAME_TEST_TARGETS env_share_test)
+    endif()
+    add_custom_target(frame-tests DEPENDS ${FRAME_TEST_TARGETS})
 endif()

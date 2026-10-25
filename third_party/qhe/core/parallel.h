@@ -7,6 +7,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <cstddef>
+#include <exception>
 #include <functional>
 #include <mutex>
 #include <thread>
@@ -32,6 +33,9 @@ public:
         std::unique_lock<std::mutex> g(m_);
         done_.wait(g, [&] { return left_ == 0; });
         fn_ = nullptr;
+        // An item that threw (a damaged file's bad_alloc, a parser's throw): rethrown here, once every thread is done
+        // with fn. Thrown on a pool thread it ended the process; on this one it left the pool running a dead fn.
+        if (error_) { std::exception_ptr e = error_; error_ = nullptr; g.unlock(); std::rethrow_exception(e); }
     }
 
     ~Pool() {
@@ -48,7 +52,14 @@ private:
     }
     void work() {
         inside_ = true;
-        for (size_t i; (i = next_.fetch_add(1)) < n_;) (*fn_)(i);
+        for (size_t i; (i = next_.fetch_add(1)) < n_;) {
+            try {
+                (*fn_)(i);
+            } catch (...) {
+                std::lock_guard<std::mutex> g(m_);
+                if (!error_) error_ = std::current_exception();
+            }
+        }
         inside_ = false;
     }
     void loop() {
@@ -74,6 +85,7 @@ private:
     std::atomic<size_t> next_{0};
     uint64_t gen_ = 0;
     bool stop_ = false;
+    std::exception_ptr error_;          // the first item of this forEach that threw (under m_)
     static inline thread_local bool inside_ = false;
 };
 

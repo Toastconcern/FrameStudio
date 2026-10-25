@@ -28,11 +28,17 @@
 #include "frame_pacer.h"
 #include "platform.h"
 #include "updater.h"
+
+#ifndef FRAME_VERSION
+#define FRAME_VERSION "(local)"   // (cmake/frame_version.cmake sets it: "v0.2.123", as the release is named)
+#endif
+static constexpr const char* kDiscordUrl = "https://discord.gg/yJDn59ErgK";   // the Frame Studio Discord server
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #define STBI_WRITE_NO_STDIO
 #include "stb_image_write.h"
 extern "C" unsigned char* stbi_load_from_memory(const unsigned char* buffer, int len, int* x, int* y, int* comp, int req_comp);
 extern "C" void stbi_image_free(void* retval_from_stbi_load);
+extern "C" int stbi_info_from_memory(const unsigned char* buffer, int len, int* x, int* y, int* comp);
 
 #include <imgui.h>
 #include <imgui_internal.h>              // the self-test reads ImGui's ID-conflict detector
@@ -157,10 +163,20 @@ std::string prettyHome(const std::string& apk) {
     return n.empty() ? narrow(fs::path(widen(apk)).stem().wstring()) : n;
 }
 
+// A panorama sky's copy ("dusk-1a2b3c4d.sky.hdr") as the picture was called: "dusk".
+std::string skyPanoramaName(const std::string& path) {
+    std::string n = narrow(fs::path(widen(path)).filename().wstring());
+    const size_t cut = n.rfind(".sky.");
+    if (cut != std::string::npos) n.resize(cut);
+    if (n.size() > 9 && n[n.size() - 9] == '-' && n.find_first_not_of("0123456789abcdef", n.size() - 8) == std::string::npos) n.resize(n.size() - 9);
+    return n;
+}
+
+// (a panorama sky isn't part of the name, unless it's all there is)
 std::string displayName(const std::vector<std::string>& apks) {
     std::string n;
-    for (const auto& p : apks) n += (n.empty() ? "" : " + ") + prettyHome(p);
-    return n;
+    for (const auto& p : apks) if (!isSkyPanoramaPath(p)) n += (n.empty() ? "" : " + ") + prettyHome(p);
+    return n.empty() && !apks.empty() ? skyPanoramaName(apks[0]) : n;
 }
 
 // The folder Frame Studio runs from (the Frame payload ships beside the exe, in frame/).
@@ -169,9 +185,13 @@ fs::path exeDir() { return platform::exeDir(); }
 // Studio's own files (settings, edits, recent homes, auto-saves): %APPDATA%\FrameStudio, ~/.local/share/FrameStudio,
 // ~/Library/Application Support/FrameStudio.
 fs::path dataDir() {
-    fs::path p = platform::userDataDir() / L"FrameStudio";
-    std::error_code ec;
-    fs::create_directories(p / L"edits", ec);
+    // Made once (asked for every frame by some panels: creating the folders each time was a millisecond a frame)
+    static const fs::path p = [] {
+        fs::path d = platform::userDataDir() / L"FrameStudio";
+        std::error_code ec;
+        fs::create_directories(d / L"edits", ec);
+        return d;
+    }();
     return p;
 }
 
@@ -274,6 +294,13 @@ Mat4 rendererProjection(float tx, float ty) {
 }
 
 // OpenGL-style projection for ImGuizmo and screen-space overlays.
+// A gizmo result worth keeping: ImGuizmo can hand back NaNs (a rotate ring dragged edge-on, a view squashed to
+// nothing mid-drag), and one would wreck what it moved (and be saved like that).
+static bool finiteMatrix(const float* m) {
+    for (int k = 0; k < 16; ++k) if (!std::isfinite(m[k])) return false;
+    return true;
+}
+
 void glProjection(float tx, float ty, float* m) {
     const float f = 2000.0f;
     std::memset(m, 0, 64);
@@ -335,6 +362,24 @@ struct Object {
     std::vector<std::string> folders;   // where it sits in its file (MeshData::path), outermost first
 };
 
+// A Gaussian splat object (HslScene::splats, the same index): Studio's side of it. It moves as a whole, from a gizmo
+// frame at its middle, like an Object; the scene's worldFromModel follows (pivot * offset).
+struct SplatItem {
+    bool hidden = false, deleted = false;
+    float pivot[16], pivot0[16];        // gizmo frame (now / as loaded)
+    float offset[16];
+    float lmin[3] = {0, 0, 0}, lmax[3] = {0, 0, 0};   // its splats' centres, in its own frame
+    size_t count = 0;
+};
+
+// An object copied (Copy, or carried across a reload once pasted): its mesh as it stands (world matrix in it; its
+// textures shared with the original's), its shader (for a home that hasn't it), and its Studio side.
+struct ClipMesh {
+    std::shared_ptr<const MeshData> md;
+    std::shared_ptr<const ShaderProgramSrc> prog;
+    Object meta;
+};
+
 // Outliner groups, in display order.
 enum Category { kArchitecture, kProps, kPlants, kLights, kTerrain, kSky, kCategoryCount };
 const char* kCategoryNames[kCategoryCount] = {"Architecture", "Furniture & Props", "Plants", "Lights & Glow", "Terrain & Water", "Sky"};
@@ -391,6 +436,7 @@ struct UndoStep {
     int group = 0;                      // steps sharing a non-zero group undo / redo together (one click, one Ctrl+Z)
     std::shared_ptr<HomeWorld> world;   // a world-layer edit: the whole layer as it was (object fields unused)
     std::shared_ptr<SoundState> sound;  // a sound edit: the sound as it was (object fields unused)
+    int splat = -1;                     // a splat object's edit (pivot, hidden, deleted are its; object unused)
 };
 
 // The world layer's kinds of things (Studio's world editor).
@@ -572,6 +618,7 @@ void applyTheme(float scale) {
     s.GrabMinSize = 8;
     s.IndentSpacing = 14;
     s.TabBarBorderSize = 0;
+    s.TabBarOverlineSize = 2;
     s.SeparatorTextBorderSize = 1;
     s.SeparatorTextPadding = ImVec2(0, 4);
     s.SeparatorTextAlign = ImVec2(0.0f, 0.5f);
@@ -611,10 +658,10 @@ void applyTheme(float scale) {
     c[ImGuiCol_Tab] = hex(kBar);
     c[ImGuiCol_TabHovered] = hex(kWidgetHover);
     c[ImGuiCol_TabSelected] = hex(kHeader);
-    c[ImGuiCol_TabSelectedOverline] = hex(0, 0);
+    c[ImGuiCol_TabSelectedOverline] = hex(kBlue);           // which of an area's tabs is open, at a glance
     c[ImGuiCol_TabDimmed] = hex(kBar);
     c[ImGuiCol_TabDimmedSelected] = hex(kHeader);
-    c[ImGuiCol_TabDimmedSelectedOverline] = hex(0, 0);
+    c[ImGuiCol_TabDimmedSelectedOverline] = hex(kBlue, 0.5f);
     c[ImGuiCol_DockingPreview] = hex(kBlue, 0.55f);
     c[ImGuiCol_DockingEmptyBg] = hex(kSplit);
     c[ImGuiCol_TableHeaderBg] = hex(kHeader);
@@ -646,6 +693,9 @@ struct Studio {
     uint32_t viewW = 0, viewH = 0;          // renderer size
     ImVec2 viewPos, viewSize;               // viewport rect (screen pixels) from the last UI frame
     bool rendered = false;                  // the renderer image holds a frame this tick
+    bool viewDrawn = false;                 // the UI drew that image this frame (the 3D view is rendered after it)
+    bool viewHasFrame = false;              // the renderer's image has been rendered since it was made (so it's in
+                                            // TRANSFER_SRC): a resize makes a new one, UNDEFINED until rendered
     float renderMs = 0;                     // status bar: smoothed 3D frame time
 
     // Home
@@ -661,6 +711,8 @@ struct Studio {
     std::string homeName;
     std::vector<Object> objects;
     int selected = -1;
+    std::vector<SplatItem> splatItems;      // per HslScene::splats entry
+    int splatSel = -1;                      // the selected splat object (selected and wKind are -1 then)
     bool dirty = false;
     std::vector<UndoStep> undo, redo;
     int undoGroup = 0, nextUndoGroup = 1;   // pushUndo tags steps with undoGroup while a batch is open
@@ -681,7 +733,7 @@ struct Studio {
     bool showCat[kShowCats] = {true, true, true, true, true, false, false, true, true, true};
     bool showMeshes = true;                 // the home's own objects
     bool isolating = false;                 // View > Show Only Selected (I)
-    int isoObject = -1, isoKind = -1, isoIndex = -1;
+    int isoObject = -1, isoKind = -1, isoIndex = -1, isoSplat = -1;
     bool gizmoHot = false;                  // the mouse was over the gizmo last frame (see viewport())
     HomeWorld dragBase;                     // the world layer as a gizmo drag began: scaling resizes from it
     std::shared_ptr<HomeWorld> fieldBefore; // properties: the world layer as the active field was clicked
@@ -711,6 +763,7 @@ struct Studio {
     bool showReport = false;
     std::unique_ptr<HomeReport> report;     // for reportScene
     const HslScene* reportScene = nullptr;
+    uint64_t reportGen = 0;                 // ...and the loadGen it was made for
     bool showHeadsetDebug = false;
     DebugSettings headsetDebug;             // statusMutex
     std::string headsetDebugStatus = "Not read from the headset yet", headsetReport;   // statusMutex
@@ -983,9 +1036,11 @@ struct Studio {
     void reportWindow() {
         if (!showReport) return;
         if (!scene) { showReport = false; return; }
-        if (!report || reportScene != scene.get()) {
+        // (the load as well as the address: a home opened after closing one can be given the same address)
+        if (!report || reportScene != scene.get() || reportGen != loadGen) {
             report = std::make_unique<HomeReport>(makeHomeReport(*scene, scene->world.walkGridCache ? &scene->world : nullptr));
             reportScene = scene.get();
+            reportGen = loadGen;
         }
         ImGui::SetNextWindowSize(ImVec2(640 * scale, 560 * scale), ImGuiCond_Appearing);
         ImGui::SetNextWindowPos(ImVec2(ImGui::GetIO().DisplaySize.x * 0.5f, ImGui::GetIO().DisplaySize.y * 0.5f), ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
@@ -1249,7 +1304,11 @@ struct Studio {
         if (!dirty) return true;
         const platform::Answer r = platform::ask("Frame Studio", "Save your changes to " + shownName() + " first?", true);
         if (r == platform::Answer::Cancel) return false;
-        if (r == platform::Answer::Yes) saveToLibrary();                               // (the environment saves from its own copies)
+        if (r == platform::Answer::Yes) {
+            if (saving && saver.joinable()) saver.join();             // an auto-save under way: this Save after it, not queued (closing doesn't wait for a queue)
+            saveToLibrary();                                           // (the environment saves from its own copies)
+            if (dirty) return false;                                   // it couldn't even start: stay, the changes are still here
+        }
         return true;
     }
 
@@ -1304,7 +1363,9 @@ struct Studio {
         loader = std::thread([this, paths, gen] {
             auto s = std::make_unique<HslScene>();
             std::string err;
-            const bool ok = loadHslScene(paths, *s, err);
+            bool ok = false;
+            try { ok = loadHslScene(paths, *s, err); }
+            catch (const std::exception&) { ok = false; err = "not enough memory to open it"; }   // (not an end to Studio)
             std::lock_guard<std::mutex> l(loadMutex);
             if (gen != loadGen) return;                   // stopped meanwhile: drop it
             if (ok) { loaded = std::move(s); loadState = 2; }
@@ -1315,22 +1376,32 @@ struct Studio {
     // Stops a load in progress: the background parse (let go, its result dropped) or the GPU upload after it.
     // Whatever home was open before the load stays closed (opening one already replaced it).
     void stopLoading() {
+        bool parsing;
         {
             std::lock_guard<std::mutex> l(loadMutex);
+            parsing = loadState == 1;
             ++loadGen;
             if (loadState == 1 && loader.joinable()) { loader.detach(); loadAbandoned = true; }
             else if (loader.joinable()) loader.join();
             loadState = 0;
             loaded.reset();
         }
-        if (uploading || texLoading || scene) {
+        if (parsing && carry.any && scene && !uploading && !texLoading) {
+            // the same environment being reloaded (Add Vista, Import Models): still the one open, with your changes
+            carry = Carry();
+            dirty = true;
+            updateTitle();
+        } else if (uploading || texLoading || scene) {
             vkDeviceWaitIdle(renderer.device());
             renderer.unload();
             ambience.stop();
             addedSound.stop();
             sound = SoundState();
+            dropWalkJob();
             scene.reset();
             objects.clear();
+            splatItems.clear();
+            splatSel = -1;
             undo.clear();
             redo.clear();
             homePaths.clear();
@@ -1347,7 +1418,7 @@ struct Studio {
 
     bool isLoading() const { return loadState == 1 || uploading || texLoading; }
     // Whether the window's picture can change without any input: the frame pacer stops drawing when it can't.
-    bool viewChangesByItself() const { return isLoading() || saving || flying || (scene && animPlaying); }
+    bool viewChangesByItself() const { return isLoading() || saving || flying || (scene && animPlaying) || walkJob; }   // (a walk bake: shown when done)
 
     // After loadPromptAfter seconds: keep waiting (asked again a minute later), stop loading, or close Studio now.
     void loadPrompt() {
@@ -1385,7 +1456,7 @@ struct Studio {
 
     // A footprint (the room) gets its baked lighting, sky and outside world from a vista: add one to it.
     void addVistaDialog() {
-        if (homePaths.empty()) return;
+        if (homePaths.empty() || loadState == 1 || saving) return;    // (open() would refuse the reload: the changes must stay unsaved)
         const std::vector<std::string> picked = platform::openFiles("Add a vista (e.g. Shell Env Vista Calming)", {{"Meta vista", {"*.apk"}}}, false);
         if (picked.empty()) return;
         carryAcrossReload();                                           // the same environment, with a vista now
@@ -1403,8 +1474,9 @@ struct Studio {
     // Pick the footprint, or the footprint and its vista together (Ctrl-click both).
     void openDialog() {
         const std::vector<std::string> picked = platform::openFiles("Open a home (footprint + vista together), an environment (.fenv), a bundle or models",
-            {{"Homes, environments and models", {"*.apk", "*.fenv", "*.fbundle", "*.glb", "*.gltf", "*.fbx", "*.obj"}}, {"Meta home", {"*.apk"}},
-             {"Frame environment", {"*.fenv"}}, {"Environment bundle", {"*.fbundle"}}, {"Model from Blender / Unity", {"*.glb", "*.gltf", "*.fbx", "*.obj"}}}, true);
+            {{"Homes, environments and models", {"*.apk", "*.fenv", "*.fbundle", "*.glb", "*.gltf", "*.fbx", "*.obj", "*.stl", "*.ply", "*.splat", "*.spz"}}, {"Meta home", {"*.apk"}},
+             {"Frame environment", {"*.fenv"}}, {"Environment bundle", {"*.fbundle"}}, {"Model (Blender, Unity, 3D print, scan)", {"*.glb", "*.gltf", "*.fbx", "*.obj", "*.stl", "*.ply"}},
+             {"Gaussian splats (Polycam, Luma, Scaniverse, Postshot...)", {"*.ply", "*.splat", "*.spz"}}}, true);
         if (picked.empty()) return;
         open(picked);
     }
@@ -1460,7 +1532,8 @@ struct Studio {
         if (loadState == 3) {
             if (loader.joinable()) loader.join();
             loadState = 0;
-            carry = Carry();                                           // (a reload that failed: its changes went with it)
+            if (carry.any && scene) { dirty = true; updateTitle(); }   // a reload that failed: the one open keeps its changes, unsaved
+            carry = Carry();
             platform::message("Couldn't open this home", loadError, platform::Icon::Warning);
             return;
         }
@@ -1484,10 +1557,14 @@ struct Studio {
         if (loader.joinable()) loader.join();
         loadState = 0;
         renderer.unload();
+        dropWalkJob();
         scene = std::move(loaded);
         windSign = 2;                       // read again off this home's floor
         walkShown.reset(); walkReport = WalkReport{}; walkSig = 0; walkPending = walkSaveNext = false; walkGuideDirty = true;
+        walkAsStored = !carry.any;          // a home just opened shows its saved area as it is (a reload carries edits: baked again)
         objects.clear();
+        splatItems.clear();
+        splatSel = -1;
         undo.clear();
         redo.clear();
         selected = -1;
@@ -1497,9 +1574,12 @@ struct Studio {
         dirty = false;
         homePaths = loadingPaths;
         homeName = displayName(homePaths);
-        if (!carry.any) envFile = homePaths.size() == 1 && isFenvPath(homePaths[0]) ? homePaths[0] : std::string();   // a home or models: a new one
+        // A home or models: a new one. So is an environment opened out of a bundle: its .fenv is a scratch copy
+        // (bundle-unpacked, emptied the next time a member is opened), and Save must not write the changes there.
+        if (!carry.any) envFile = homePaths.size() == 1 && isFenvPath(homePaths[0]) && !inBundleScratch(homePaths[0]) ? homePaths[0] : std::string();
         autosavedAt = std::chrono::steady_clock::now();
         addRecent(homePaths);
+        takeCarriedPastes();                          // (a reload: what was pasted in comes along)
         renderer.setDynamicMeshes(scene->animatedMeshes);
         renderer.beginLoad(*scene);
         animTime = animBase = 0;
@@ -1514,7 +1594,7 @@ struct Studio {
 
     // Once every mesh is on the GPU: the editable object list, saved edits, and the view.
     void buildObjects() {
-        if (renderer.meshCount() == 0)
+        if (renderer.meshCount() == 0 && scene->splats.empty())
             platform::message("Frame Studio", "Nothing in this home could be drawn with its shaders.", platform::Icon::Warning);
         for (size_t i = 0; i < renderer.meshCount(); ++i) {
             const MeshData& md = scene->meshes[renderer.meshSceneIndex(i)];
@@ -1555,14 +1635,18 @@ struct Studio {
             mul(inv, w, o.offset);
             objects.push_back(o);
         }
+        buildSplats();
         loadEdits();
+        if (objects.empty() && !splatItems.empty()) frameAll();   // splats alone: the view on them, wherever they were captured
         updateTitle();
     }
 
     // What an environment is comes from its file alone: a .fenv's world layer, edits, sound, name and picture; a
     // Meta home or models opened fresh, as they ship. Nothing is kept on the side between opens. The one exception is
     // a reload of the open home (Add Vista, Add Models): its unsaved changes are carried across it.
-    struct Carry { bool any = false; std::vector<ObjectEdit> objects; std::string world, title, image; SoundState sound; WorldSettings settings; } carry;
+    struct Carry { bool any = false; std::vector<ObjectEdit> objects; std::vector<std::pair<std::string, SplatItem>> splats; std::string world, title, image;
+                   SoundState sound; WorldSettings settings;
+                   std::vector<ClipMesh> pastedMeshes; std::vector<HslSplatObject> pastedSplats; } carry;   // (carryPastes)
     std::vector<ObjectEdit> currentObjectEdits() const {
         std::vector<ObjectEdit> v;
         for (const Object& o : objects) {
@@ -1579,10 +1663,13 @@ struct Studio {
         if (!scene) return;
         carry.any = true;
         carry.objects = currentObjectEdits();
+        carry.splats.clear();
+        for (size_t i = 0; i < splatItems.size(); ++i) carry.splats.push_back({scene->splats[i].name, splatItems[i]});
         carry.world = worldToJson(scene->world);
         carry.title = envTitle; carry.image = envImage;
         carry.sound = sound;
         carry.settings = worldSettings;
+        carryPastes();
     }
 
     void loadEdits() {
@@ -1592,6 +1679,7 @@ struct Studio {
             if (worldFromJson(carry.world, w)) { scene->world = std::move(w); worldEdited = true; }
             prepareWorld();
             objs = carry.objects;
+            restoreSplats(carry.splats);
             envTitle = carry.title; envImage = carry.image;
             worldSettings = carry.settings;
             sound = carry.sound;
@@ -1608,10 +1696,13 @@ struct Studio {
             worldSettings = WorldSettings();
             FenvManifest m;
             std::vector<uint8_t> thumb;
+            envMadeWith.clear();
             if (openHomeIsFenv() && fenvReadManifest(homePaths[0], m, &thumb)) {
+                envMadeWith = fenvMadeWith(m);
                 worldSettings = m.settings;
                 if (envTitle.empty() && m.name != homeName) envTitle = m.name;
-                if (own && !fe.image.empty() && !thumb.empty()) {          // its picture: the thumbnail it carries
+                // (the name comes from the file, which may be someone else's: only a plain file name, never a path)
+                if (own && safeImageName(fe.image) && !thumb.empty()) {    // its picture: the thumbnail it carries
                     std::error_code ec;
                     fs::create_directories(dataDir() / L"edits", ec);
                     std::ofstream out(dataDir() / L"edits" / fs::u8path(fe.image), std::ios::binary);
@@ -1696,6 +1787,8 @@ struct Studio {
         return static_cast<bool>(f);
     }
 
+    SoundState soundFieldBefore;            // a volume slider being dragged: the sound before it (its undo step)
+    bool soundFieldPushed = false;
     void pushSoundUndo(const SoundState& before) {
         UndoStep u = {};
         u.group = undoGroup;
@@ -1760,7 +1853,9 @@ struct Studio {
             int pc = static_cast<int>(std::lround(v * 100));
             ImGui::SetNextItemWidth(-1);
             const bool changed = ImGui::SliderInt(id, &pc, 0, 100, pc ? on : off);
-            if (ImGui::IsItemActivated()) pushSoundUndo(before);   // a drag is one undo step
+            // a drag is one undo step, taken when the value first changes (a click alone isn't an edit)
+            if (ImGui::IsItemActivated()) { soundFieldBefore = before; soundFieldPushed = false; }
+            if (changed && !soundFieldPushed) { pushSoundUndo(soundFieldBefore); soundFieldPushed = true; }
             if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", tip);
             if (!changed) return;
             const bool wasOff = v <= 0;
@@ -1781,10 +1876,8 @@ struct Studio {
             if (!addedSound.ok && ImGui::IsItemHovered()) ImGui::SetTooltip("It isn't playing here (no audio device?): see studio.log");
             percent("##soundvolume", sound.s.volume, "Background sound %d%%", "Background sound: silent",
                     "How loud your background sound plays, here and in Frame Home.", addedSound);
-            const float w = (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x) * 0.5f;
-            if (ImGui::Button("Replace…", ImVec2(w, 0))) chooseSound();
-            ImGui::SameLine();
-            if (ImGui::Button("Remove", ImVec2(w, 0))) {
+            if (rowButton("Replace…", true)) chooseSound();
+            if (rowButton("Remove")) {
                 pushSoundUndo(before);
                 sound.bytes.reset();
                 sound.s.file.clear();
@@ -1794,7 +1887,7 @@ struct Studio {
                 setStatus("Background sound removed");
             }
         } else {
-            if (ImGui::Button("Add Background Sound…", ImVec2(-1, 0))) chooseSound();
+            if (ImGui::Button("Add Background Sound…")) chooseSound();
             ImGui::PushTextWrapPos(0);
             ImGui::TextDisabled("Loops behind the home, on the Frame too. Ogg, Opus, WAV, MP3 or FLAC — or drop one on the window.");
             ImGui::PopTextWrapPos();
@@ -1810,10 +1903,13 @@ struct Studio {
         ambience.stop();
         addedSound.stop();
         sound = SoundState();
+        dropWalkJob();
         scene.reset();
-        walkShown.reset(); walkReport = WalkReport{}; walkSig = 0; walkPending = walkSaveNext = false;
+        walkShown.reset(); walkReport = WalkReport{}; walkSig = 0; walkPending = walkSaveNext = walkAsStored = false;
         renderer.setStaticGuide({}); walkGuideOn = false;
         objects.clear();
+        splatItems.clear();
+        splatSel = -1;
         undo.clear();
         redo.clear();
         homePaths.clear();
@@ -1825,21 +1921,24 @@ struct Studio {
     }
 
     // The start screen (nothing open): open a home, an environment or models, or pick up a recent one.
-    struct RecentInfo { std::string title, kind; };
+    struct RecentInfo { std::string title, kind; std::chrono::steady_clock::time_point at; };
     std::map<std::string, RecentInfo> recentInfo;
     const RecentInfo& recentDetails(const std::vector<std::string>& paths) {
         std::string key;
         for (const auto& p : paths) key += p + "|";
         auto it = recentInfo.find(key);
-        if (it != recentInfo.end()) return it->second;
+        // (read again now and then: a file comes back, is re-saved under another name, or goes missing)
+        if (it != recentInfo.end() && std::chrono::steady_clock::now() - it->second.at < std::chrono::seconds(10)) return it->second;
         RecentInfo info;
+        info.at = std::chrono::steady_clock::now();
         info.title = displayName(paths);
         if (paths.size() == 1 && isFenvPath(paths[0])) {
             FenvManifest m;
             if (fenvReadManifest(paths[0], m)) {
                 info.title = m.name.empty() ? info.title : m.name;
                 info.kind = "Frame environment" + std::string(m.scene.empty() ? "" : " \u00b7 baked") + (m.world.empty() ? "" : " \u00b7 world layer") +
-                            (m.models.empty() ? "" : " \u00b7 " + std::to_string(m.models.size()) + " models");
+                            (m.models.empty() ? "" : " \u00b7 " + std::to_string(m.models.size()) + " models") +
+                            (m.splats.empty() ? "" : " \u00b7 splats") + " \u00b7 " + (m.studioVersion.empty() ? "made before v0.2" : "Studio " + m.studioVersion);
             } else info.kind = "Frame environment (missing)";
         } else {
             size_t models = 0;
@@ -1902,13 +2001,16 @@ struct Studio {
         y += ImGui::GetTextLineHeight() + 22 * scale;
         ImGui::SetCursorScreenPos(ImVec2(x0, y));
         const float bigH = ImGui::GetFrameHeight() * 1.7f;
-        const ImVec2 big(w * 0.62f, bigH), side(w - big.x - 10 * scale, bigH);
+        const ImVec2 big(w * 0.62f, bigH), side((w - big.x - 20 * scale) * 0.5f, bigH);
         pushPrimary();
         if (ImGui::Button("Open Home, Environment or Model\u2026", big)) openDialog();
         ImGui::PopStyleColor(3);
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("Ctrl+O \u00b7 or drop files on the window");
         ImGui::SameLine(0, 10 * scale);
         if (ImGui::Button("Controls (F1)", side)) showControls = true;
+        ImGui::SameLine(0, 10 * scale);
+        if (ImGui::Button("Discord", side)) platform::openPath(kDiscordUrl);
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Join the Frame Studio Discord: help, bug reports, feature requests\n%s", kDiscordUrl);
         y += big.y + 30 * scale;
         const float rowH = ImGui::GetTextLineHeight() * 2.0f + 22 * scale;
         auto listTitle = [&](const char* t) {
@@ -1965,19 +2067,96 @@ struct Studio {
     }
 
     // Adds Blender / Unity models to the open home (it reloads with them; edits are kept by index).
-    void importModelDialog() {
-        if (!scene) return;
+    void importModelDialog(bool splats = false) {
+        if (!scene || loadState == 1 || saving) return;               // (open() would refuse the reload: the changes must stay unsaved)
         if (homePaths.size() == 1 && isFenvPath(homePaths[0])) {
-            platform::message("Frame Studio", "This environment is a saved .fenv. Open its original home to add models, or add models to a new environment.");
+            platform::message("Frame Studio", "This environment is a saved .fenv. Open its original home to add models or splats, or add them to a new environment.");
             return;
         }
-        const std::vector<std::string> picked = platform::openFiles("Add models from Blender or Unity", {{"Models", {"*.glb", "*.gltf", "*.fbx", "*.obj"}}}, true);
-        if (picked.empty()) return;
-        std::vector<std::string> paths = homePaths;
+        const std::vector<std::string> picked = splats
+            ? platform::openFiles("Add Gaussian splats (a capture from Polycam, Luma, Scaniverse, Postshot...)", {{"Gaussian splats", {"*.ply", "*.splat", "*.spz"}}}, true)
+            : platform::openFiles("Add models (Blender, Unity, 3D print, scan)", {{"Models", {"*.glb", "*.gltf", "*.fbx", "*.obj", "*.stl", "*.ply"}}}, true);
+        importFiles(picked);
+    }
+    // Models or splats added to the open home: it loads again with them, its changes carried across.
+    void importFiles(const std::vector<std::string>& picked) {
+        if (picked.empty() || !scene || loadState == 1 || saving) return;
+        if (homePaths.size() == 1 && isFenvPath(homePaths[0])) {
+            platform::message("Frame Studio", "This environment is a saved .fenv. Open its original home to add models or splats, or add them to a new environment.");
+            return;
+        }
+        std::vector<std::string> paths, sky;
+        for (const std::string& p : homePaths) (isSkyPanoramaPath(p) ? sky : paths).push_back(p);
         paths.insert(paths.end(), picked.begin(), picked.end());
+        paths.insert(paths.end(), sky.begin(), sky.end());             // a panorama sky stays last (edits go by mesh index)
         carryAcrossReload();
         dirty = false;                                                 // (carried: nothing to ask about)
         open(paths, false);
+    }
+
+    // The sky: an equirectangular panorama (.hdr, .jpg, .png) in place of the home's own. Copied (named by its
+    // content) into Studio's data folder as "<name>-<hash>.sky.<ext>", which loads as a model does: the six faces of
+    // a sky cube (model_import.h). Saved into the .fenv's baked scene, so Frame Home shows it as it is.
+    std::string skyPanorama() const {
+        for (const std::string& p : homePaths) if (isSkyPanoramaPath(p)) return p;
+        return {};
+    }
+    void setSkyPanorama(const std::string& copy) {                     // "" = the home's own sky again
+        if (!scene || loadState == 1 || saving) return;
+        if (homePaths.size() == 1 && isFenvPath(homePaths[0])) {
+            platform::message("Frame Studio", "This environment is a saved .fenv. Open its original home to change its sky, or add the sky to a new environment.");
+            return;
+        }
+        std::vector<std::string> paths;
+        for (const std::string& p : homePaths) if (!isSkyPanoramaPath(p)) paths.push_back(p);
+        if (!copy.empty()) paths.push_back(copy);
+        if (paths == homePaths) return;
+        carryAcrossReload();
+        dirty = false;                                                 // (carried; the reload marks it changed)
+        open(paths, false);
+    }
+    void chooseSkyPanorama() {
+        if (!scene || loadState == 1 || saving) return;
+        const std::vector<std::string> picked = platform::openFiles("A 360° panorama for the sky (equirectangular, twice as wide as it is tall)",
+            {{"Panoramas", {"*.hdr", "*.jpg", "*.jpeg", "*.png"}}}, false);
+        if (picked.empty()) return;
+        std::string why;
+        const std::string copy = copySkyPanorama(fs::path(widen(picked.front())), why);
+        if (copy.empty()) { platform::message("Frame Studio", why, platform::Icon::Warning); return; }
+        setSkyPanorama(copy);
+    }
+    // The panorama checked (readable, 2:1) and copied into Studio's folder: the copy's path, or "" and why not.
+    std::string copySkyPanorama(const fs::path& src, std::string& why) {
+        std::ifstream in(src, std::ios::binary);
+        const std::vector<u8> bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        int w = 0, h = 0, c = 0;
+        if (bytes.empty() || !stbi_info_from_memory(bytes.data(), static_cast<int>(bytes.size()), &w, &h, &c)) {
+            why = "That isn't a picture Frame Studio can read (.hdr, .jpg or .png): " + narrow(src.filename().wstring());
+            return {};
+        }
+        if (h <= 0 || w < h * 19 / 10 || w > h * 21 / 10) {
+            char msg[256];
+            std::snprintf(msg, sizeof msg, "That picture is %d × %d. A 360° panorama is twice as wide as it is tall (for example 4096 × 2048).", w, h);
+            why = msg;
+            return {};
+        }
+        uint32_t hsh = 2166136261u;
+        for (u8 b : bytes) hsh = (hsh ^ b) * 16777619u;
+        char hx[16];
+        std::snprintf(hx, sizeof hx, "%08x", hsh);
+        std::string ext = narrow(src.extension().wstring());
+        for (char& ch : ext) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+        std::wstring stem = src.stem().wstring();
+        for (wchar_t& ch : stem) if (std::wcschr(L"<>:\"/\\|?*.", ch) || ch < 32) ch = L'-';
+        const fs::path dir = dataDir() / L"skies", dst = dir / (stem + L"-" + widen(hx) + L".sky" + widen(ext));
+        std::error_code ec;
+        fs::create_directories(dir, ec);
+        if (!fs::exists(dst, ec)) {
+            std::ofstream out(dst, std::ios::binary);
+            out.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+            if (!out) { why = "Couldn't copy the panorama into Frame Studio's folder."; return {}; }
+        }
+        return narrow(dst.wstring());
     }
 
     // File > Save (Ctrl+S): the environment, into its own file: an environment opened saves back into itself; a Meta
@@ -1985,15 +2164,14 @@ struct Studio {
     std::string envFile;                    // the .fenv it saves to ("" = new: named on its first save)
     void saveToLibrary() {
         if (saving) { saveQueued = true; return; }                     // after the one under way (an auto-save)
-        if (!scene || uploading) return;
+        if (!scene || uploading || !splatBudgetOk("Save")) return;
         if (envFile.empty()) {
-            std::wstring name = widen(shownName());
-            for (wchar_t& c : name) if (std::wcschr(L"<>:\"/\\|?*", c) || c < 32) c = L'-';
+            const std::wstring name = fileStem(shownName());
             fs::path p = libraryDir() / (name + L".fenv");
             for (int n = 2; fs::exists(p); ++n) p = libraryDir() / (name + L" " + std::to_wstring(n) + L".fenv");
             envFile = narrow(p.wstring());
         }
-        saveEnvironment(envFile);
+        if (!saveEnvironment(envFile)) return;                         // (didn't start: still unsaved)
         dirty = false;                                                 // (back on if the save fails)
         updateTitle();
     }
@@ -2001,10 +2179,23 @@ struct Studio {
     // 10 kept. The environment's own file only changes when you save it.
     bool saveQueued = false;
     std::chrono::steady_clock::time_point autosavedAt;
-    fs::path versionsDir() const {
-        std::wstring name = widen(shownName());
+    fs::path versionsDir() const { return libraryDir() / L"Versions" / fileStem(shownName()); }
+    // A name (typed, or from a file someone else made) as one file or folder name: what Windows won't take becomes "-",
+    // trailing dots and spaces go, and a name that's nothing else (".", "..": the folder above), or one of Windows'
+    // device names (CON, NUL, COM1...), is changed. As a folder ".." made Versions\.. My Environments itself, and the
+    // auto-save's "keep the last 10" deleted the environments there.
+    static std::wstring fileStem(const std::string& shown) {
+        std::wstring name = widen(shown);
         for (wchar_t& c : name) if (std::wcschr(L"<>:\"/\\|?*", c) || c < 32) c = L'-';
-        return libraryDir() / L"Versions" / name;
+        while (!name.empty() && (name.back() == L'.' || name.back() == L' ')) name.pop_back();
+        while (!name.empty() && name.front() == L' ') name.erase(name.begin());
+        if (name.empty()) return L"Environment";
+        std::wstring upper = name.substr(0, name.find(L'.'));
+        for (wchar_t& c : upper) if (c >= L'a' && c <= L'z') c = static_cast<wchar_t>(c - L'a' + L'A');
+        static const wchar_t* kDevices[] = {L"CON", L"PRN", L"AUX", L"NUL", L"COM1", L"COM2", L"COM3", L"COM4", L"COM5", L"COM6", L"COM7", L"COM8", L"COM9",
+                                            L"LPT1", L"LPT2", L"LPT3", L"LPT4", L"LPT5", L"LPT6", L"LPT7", L"LPT8", L"LPT9"};
+        for (const wchar_t* d : kDevices) if (upper == d) { const size_t dot = name.find(L'.'); name.insert(dot == std::wstring::npos ? name.size() : dot, L"-"); return name; }
+        return name;
     }
     std::vector<fs::path> versions() const {
         std::vector<fs::path> v;
@@ -2023,7 +2214,8 @@ struct Studio {
         std::wcsftime(stamp, 64, L"%Y-%m-%d %H-%M-%S", &tm);
         saveEnvironment(narrow((versionsDir() / (std::wstring(stamp) + L".fenv")).wstring()), false);
         const std::vector<fs::path> v = versions();
-        for (size_t i = 10; i < v.size(); ++i) fs::remove(v[i], ec);
+        for (size_t i = 10; i < v.size(); ++i)   // (not one opened and saved as the environment itself: that's yours now)
+            if (envFile.empty() || !fs::equivalent(v[i], fs::path(widen(envFile)), ec)) fs::remove(v[i], ec);
     }
 
     // The environments in My Environments, newest first.
@@ -2038,21 +2230,27 @@ struct Studio {
         return out;
     }
 
+    // A name as a save dialog's suggested file: what Windows won't take in a file name (the dialog fails to open with
+    // it), and quotes (the Linux / macOS dialogs refuse a default path with one), become "-".
+    static std::string suggestedFileName(std::string name) {
+        for (char& c : name) if (static_cast<unsigned char>(c) < 32 || std::strchr("<>:\"/\\|?*'+", c)) c = '-';
+        return name;
+    }
+
     // File > Save As: the open home with its edits, world layer, models and a thumbnail, as one .fenv anywhere.
     void saveEnvironmentDialog() {
-        if (!scene || saving || uploading) return;
-        std::string name = shownName();
-        for (char& c : name) if (c == '+' || c == '/' || c == '\\' || c == ':') c = '-';
+        if (!scene || saving || uploading || !splatBudgetOk("Save")) return;
+        const std::string name = suggestedFileName(shownName());
         const std::string path = platform::saveFile("Save as a Frame environment", name + ".fenv", {{"Frame environment", {"*.fenv"}}}, "fenv");
         if (path.empty()) return;
         envFile = path;                                                // Save goes there from now on
-        saveEnvironment(envFile);
+        if (!saveEnvironment(envFile)) return;                         // (didn't start: still unsaved)
         dirty = false;
         updateTitle();
     }
 
-    // remember: list it under Open Recent (not for the installer's own copies).
-    void saveEnvironment(const std::string& out, bool remember = true) {
+    // remember: list it under Open Recent (not for the installer's own copies). False when it couldn't start.
+    bool saveEnvironment(const std::string& out, bool remember = true) {
         // Everything the file needs is gathered and baked here, on the UI thread: the worker only packs and writes,
         // from its own copies, so editing, loading another home or closing this one meanwhile can't pull the scene
         // out from under it. Baking is a memory copy (well under a second); packing is the slow part.
@@ -2067,7 +2265,7 @@ struct Studio {
         if (!e.empty() && !hasEdits) {   // never report "Saved" for a file missing its edits
             std::lock_guard<std::mutex> l(statusMutex);
             saveStatus = "Couldn't save: the object edits couldn't be written to " + narrow(tmpEdits.wstring());
-            return;
+            return false;
         }
         std::vector<u8> thumb = imageThumb();             // the picture chosen for it, else the view from where you start
         if (thumb.empty()) thumb = spawnThumb();
@@ -2102,9 +2300,16 @@ struct Studio {
         std::vector<std::vector<std::string>> sourceFiles = scene->sourceFiles;
         std::shared_ptr<const std::vector<uint8_t>> soundBytes = sound.bytes;
         const std::string soundFile = sound.s.file;
+        std::vector<HslSplatObject> splatObjs;                         // (their splats shared, not copied: written out on the worker)
+        for (size_t i = 0; i < splatItems.size() && i < scene->splats.size(); ++i) if (!splatItems[i].deleted) splatObjs.push_back(scene->splats[i]);
+        if (toOptimize) toOptimize->splats = splatObjs;                // (what it bakes says whether it needs splats: only kept ones count)
         saver = std::thread([this, out, name, worldJson, editsPath, settings, thumb, packing, remember, baked, soundBytes, soundFile, blob = std::move(blob),
+                             splatObjs = std::move(splatObjs),
                              apkPaths = std::move(apkPaths), sources = std::move(sources), sourceFiles = std::move(sourceFiles), toOptimize,
                              objectEdits = std::move(objectEdits)]() mutable {
+          // (out of memory baking or packing a big home: a failed save, said so, never an exception that ends Studio
+          // with the changes unsaved)
+          try {
             if (toOptimize) {
                 { std::lock_guard<std::mutex> l(statusMutex); saveStatus = "Saving: finding what can't be seen from anywhere you can be\u2026"; }
                 VisibilityResult vis;
@@ -2121,21 +2326,41 @@ struct Studio {
             FenvManifest m;
             m.name = name;
             m.settings = settings;
+            m.studioVersion = FRAME_VERSION;
             std::vector<FenvMember> members;
             std::string err;
             if (baked) { FenvMember b; b.name = m.scene = "scene.bin"; b.bytes = std::move(blob); b.lzma = true; b.packing = packing; members.push_back(std::move(b)); }
+            // Member names taken so far: two of the same file name (a footprint and a vista both pulled as base.apk,
+            // two models called chair) each get their own, "2-base.apk", as fenv-tool pack names them.
+            std::set<std::string> taken;
+            const auto unique = [&](const std::string& folder, const std::string& n0) {
+                std::string n = folder + n0;
+                for (int k = 2; !taken.insert(n).second; ++k) n = folder + std::to_string(k) + "-" + n0;
+                return n;
+            };
             for (size_t i = 0; i < apkPaths.size(); ++i) {
                 const HslSourceInfo info = i < sources.size() ? sources[i] : HslSourceInfo{};
                 const std::string& path = apkPaths[i];
+                if (info.role == "Splats") continue;                   // as splat members, below
                 if (info.role == "Model") {
                     if (baked) continue;
-                    const fs::path base = fs::u8path(path).parent_path();
-                    const std::string dir = "models/" + fs::u8path(path).stem().u8string() + "/";
+                    const std::string dir = unique("models/", fs::u8path(path).stem().u8string()) + "/";
                     const std::vector<std::string> files = i < sourceFiles.size() && !sourceFiles[i].empty() ? sourceFiles[i] : std::vector<std::string>{path};
+                    // Kept as laid out on disk, from the folder all its files share (a texture in ../textures stays where
+                    // the model's own path to it points); files with nothing in common (another drive) go by their name.
+                    fs::path base = fs::u8path(path).parent_path();
+                    for (const std::string& f : files) {
+                        const fs::path p = fs::u8path(f).parent_path();
+                        for (;;) {
+                            const std::string r = p.lexically_relative(base).u8string();   // ("" for another drive)
+                            if (base.empty() || base == base.root_path() || (!r.empty() && r.rfind("..", 0) != 0)) break;
+                            base = base.parent_path();
+                        }
+                    }
                     for (const std::string& f : files) {
                         std::error_code ec;
-                        fs::path rel = fs::relative(fs::u8path(f), base, ec);
-                        if (ec || rel.empty() || rel.u8string().rfind("..", 0) == 0) rel = fs::u8path(f).filename();
+                        fs::path rel = fs::u8path(f).lexically_relative(base);
+                        if (rel.empty() || rel.u8string().rfind("..", 0) == 0 || rel.is_absolute()) rel = fs::u8path(f).filename();
                         FenvMember mm; mm.name = dir + rel.generic_u8string(); mm.file = f;
                         if (fs::equivalent(fs::u8path(f), fs::u8path(path), ec)) m.models.push_back(mm.name);
                         members.push_back(mm);
@@ -2143,13 +2368,17 @@ struct Studio {
                     continue;
                 }
                 FenvSource src;
-                src.file = "apks/" + fs::u8path(path).filename().u8string();
+                src.file = unique("apks/", fs::u8path(path).filename().u8string());
                 src.role = info.role; src.format = info.format; src.package = info.package; src.version = info.version;
                 m.sources.push_back(src);
                 if (!baked) { FenvMember a; a.name = src.file; a.file = path; a.store = true; members.push_back(a); }
             }
             if (!baked) {   // a baked scene carries the world layer itself (in binary): no second, text copy
                 FenvMember wj; wj.name = m.world = "world.json"; wj.bytes.assign(worldJson.begin(), worldJson.end()); members.push_back(std::move(wj));
+            }
+            if (!splatObjs.empty()) {
+                { std::lock_guard<std::mutex> l(statusMutex); saveStatus = "Saving: packing the splats\u2026"; }
+                addSplatMembers(splatObjs, m, members);
             }
             if (!editsPath.empty()) { FenvMember ed; ed.name = m.edits = "edits.json"; ed.file = editsPath; members.push_back(ed); }
             if (soundBytes && !soundFile.empty()) {   // beside edits.json, which names it
@@ -2178,18 +2407,25 @@ struct Studio {
             if (ok && remember) savedEnvironment = out;
             if (!ok && remember) saveFailed = true;
             saving = false;
+          } catch (const std::exception& ex) {
+            std::fprintf(stderr, "[studio] save of %s failed: %s\n", out.c_str(), ex.what());
+            { std::lock_guard<std::mutex> l(statusMutex); saveStatus = "Couldn't save: not enough memory to write " + fs::u8path(out).filename().u8string(); }
+            if (remember) saveFailed = true;
+            saving = false;
+          }
         });
+        return true;
     }
 
     // Headset > Send to Frame: the environment as it is now (saved or not), as one file, becomes the headset's current one.
     void sendToFrame() {
-        if (!scene || sending || uploading) return;
+        if (!scene || sending || uploading || !splatBudgetOk("Send")) return;
         sendAsOneFile();
     }
 
     // Bytes (a sound, a file of the home), saved to a file of your choice under `name`.
     void saveSoundAs(const std::vector<uint8_t>& bytes, std::string name) {
-        for (char& c : name) if (std::strchr("<>:\"/\\|?*", c)) c = '-';
+        name = suggestedFileName(name);
         const std::string ext = narrow(fs::path(widen(name)).extension().wstring());   // ".ogg"
         std::vector<platform::FileFilter> filters;
         if (ext.size() > 1) filters.push_back({ext.substr(1) + " file", {"*" + ext}});
@@ -2212,6 +2448,7 @@ struct Studio {
     void calculateBestSettings() {
         if (!scene || tuning || saving) return;
         if (tuner.joinable()) tuner.join();
+        tuneGen = loadGen;                                             // the home it measures (another opened meanwhile doesn't get its result)
         std::error_code ec;
         fs::create_directories(dataDir() / L"install", ec);
         const std::string fenv = narrow((dataDir() / L"install" / L"_tune.fenv").wstring());
@@ -2222,7 +2459,8 @@ struct Studio {
         worldSettings = keep;
         tuning = true;
         const std::string host8 = hostArg();
-        tuner = std::thread([this, fenv, host8] {
+        const u32 needs = sceneBakeVersionFor(*scene);
+        tuner = std::thread([this, fenv, host8, needs] {
             const std::wstring ssh = sshTool(L"ssh") + L"-o BatchMode=yes -o ConnectTimeout=8 " + widen(host8) + L" ";
             const std::wstring scp = sshTool(L"scp") + L"-q -o BatchMode=yes -o ConnectTimeout=8 ";
             setTuneStatus("Baking the world to measure…");
@@ -2234,7 +2472,7 @@ struct Studio {
             setTuneStatus("Copying it to the headset\u2026");
             int rc = run(ssh + L"\"mkdir -p /tmp/frame-tune && rm -f /tmp/frame-tune/log\"", L"", out);
             if (rc != 0) { setTuneStatus("Can't reach the headset (" + host8 + "): " + lastLine(out)); tuning = false; return; }
-            if (const std::string why = headsetCantOpen(host8); !why.empty()) { fs::remove(f, ec); setTuneStatus("Not measured. " + why); tuning = false; return; }
+            if (const std::string why = headsetCantOpen(host8, needs); !why.empty()) { fs::remove(f, ec); setTuneStatus("Not measured. " + why); tuning = false; return; }
             out.clear();
             rc = run(scp + L"\"" + f.filename().wstring() + L"\" " + widen(host8) + L":/tmp/frame-tune/tune.fenv", f.parent_path().wstring(), out);
             fs::remove(f, ec);
@@ -2281,13 +2519,15 @@ struct Studio {
     }
     WorldSettings tunedResult;              // (statusMutex) taken up by the UI thread
     bool tunedReady = false;
+    uint64_t tuneGen = 0;                   // loadGen of the home being measured
 
     std::string envTitle;                   // "" = the home's own name
+    std::string envMadeWith;                // an opened .fenv's maker (fenvMadeWith); "" for a home or models
     std::string envImage;                   // file name in the edits folder ("" = a view of it, taken when saved)
     std::string shownName() const { return envTitle.empty() ? homeName : envTitle; }
     void chooseImage() {
         const std::vector<std::string> picked = platform::openFiles("A picture for this environment",
-            {{"Pictures", {"*.png", "*.jpg", "*.jpeg", "*.bmp"}}}, false);
+            {{"Pictures", {"*.png", "*.jpg", "*.jpeg", "*.bmp", "*.tga", "*.gif", "*.psd"}}}, false);
         if (picked.empty()) return;
         const fs::path src(widen(picked.front()));
         std::ifstream in(src, std::ios::binary);
@@ -2333,7 +2573,9 @@ struct Studio {
             for (int k = 0; k < 3; ++k) cam.pivot[k] = eye[k] + fwd[k] * cam.dist;
             renderer.setSelection(-1);
             if (walkGuideOn) { renderer.setStaticGuide({}); walkGuideOn = false; walkGuideDirty = true; }   // (back next frame)
-            renderViewport();
+            // Mid-UI (a Save from a menu or a key): at the size the frame began with. Resizing here would free the 3D
+            // view's picture (its image view and ImGui texture) that this frame's draw list has already drawn.
+            renderViewport(!viewTex);
         }
         std::vector<u8> rgba;
         const uint32_t w = renderer.width(), h = renderer.height();
@@ -2356,15 +2598,21 @@ struct Studio {
     }
 
     // The picture as the .fenv's thumbnail: 512 px wide, PNG (empty: none chosen, or it doesn't read).
+    // A picture's name in the edits folder as a file may give it: one plain file name (no folders, "..", drive or root).
+    static bool safeImageName(const std::string& name) {
+        if (name.empty() || name == "." || name == ".." || name.find_first_of("/\\:") != std::string::npos) return false;
+        const fs::path p = fs::u8path(name);
+        return p.filename() == p && !p.has_root_path();
+    }
     std::vector<u8> imageThumb() const {
         std::vector<u8> png;
-        if (envImage.empty()) return png;
+        if (!safeImageName(envImage)) return png;
         std::ifstream in(editsFile().parent_path() / fs::u8path(envImage), std::ios::binary);
         const std::vector<u8> bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
         int w = 0, h = 0, c = 0;
-        unsigned char* px = bytes.empty() ? nullptr : stbi_load_from_memory(bytes.data(), static_cast<int>(bytes.size()), &w, &h, &c, 4);
+        unsigned char* px = bytes.empty() || bytes.size() > 0x7fffffff ? nullptr : stbi_load_from_memory(bytes.data(), static_cast<int>(bytes.size()), &w, &h, &c, 4);
         if (!px) return png;
-        const int tw = std::min(512, w), th = std::max(1, h * tw / std::max(1, w));
+        const int tw = std::min(512, w), th = static_cast<int>(std::max<int64_t>(1, static_cast<int64_t>(h) * tw / std::max(1, w)));
         std::vector<u8> scaled(static_cast<size_t>(tw) * th * 4);
         for (int y = 0; y < th; ++y)
             for (int x = 0; x < tw; ++x) {   // box filter over the source pixels each covers
@@ -2385,14 +2633,14 @@ struct Studio {
 
     // Why the headset's Frame Home can't open what this Studio saves, or "" when it can: its fenv-tool names the newest
     // baked scene it opens ("scene N"; a build from before that question prints its usage instead).
-    std::string headsetCantOpen(const std::string& host8) {
+    std::string headsetCantOpen(const std::string& host8, u32 needs) {
         std::string out;
         const int rc = run(sshTool(L"ssh") + L"-o BatchMode=yes -o ConnectTimeout=8 " + widen(host8) + L" \"frame-home/bin/fenv-tool version\"", L"", out);
         if (rc == 127 || out.find("not found") != std::string::npos)
             return "Frame Home isn't installed on the headset: Headset > Install on Steam Frame first.";
         const size_t at = out.find("scene ");
         const long reads = at == std::string::npos ? 0 : std::strtol(out.c_str() + at + 6, nullptr, 10);
-        if (reads >= static_cast<long>(kSceneBakeVersion)) return {};
+        if (reads >= static_cast<long>(needs)) return {};
         return "The headset's Frame Home is older than this Frame Studio and can't open what it saves: "
                "Headset > Install on Steam Frame updates it.";
     }
@@ -2402,6 +2650,7 @@ struct Studio {
     // Send left there go, so the headset lists it once.
     void sendAsOneFile() {
         if (saving) { setStatus("Wait for the environment being saved to finish, then send."); return; }
+        if (installing) { setStatus("Wait for Frame Home's install to finish, then send."); return; }   // (it ships the same copy of this home)
         if (sender.joinable()) sender.join();
         std::error_code ec;
         fs::create_directories(dataDir() / L"install", ec);
@@ -2412,7 +2661,8 @@ struct Studio {
         std::vector<std::string> old;                                  // the pair as separately sent before
         for (const auto& p : homePaths) old.push_back(frameName(p));
         const std::string editsName = frameName(homePaths.front()), host8 = hostArg();
-        sender = std::thread([this, fenv, old, editsName, host8] {
+        const u32 needs = sceneBakeVersionFor(*scene);
+        sender = std::thread([this, fenv, old, editsName, host8, needs] {
             const std::wstring ssh = sshTool(L"ssh") + L"-o BatchMode=yes -o ConnectTimeout=8 ";
             const std::wstring scp = sshTool(L"scp") + L"-q -o BatchMode=yes -o ConnectTimeout=8 ";
             const std::wstring host = widen(host8), dir = widen(kFrameEnvDir);
@@ -2426,7 +2676,7 @@ struct Studio {
             setStatus("Connecting to the Frame\u2026");
             int rc = run(ssh + host + L" \"mkdir -p " + dir + L"\"", L"", out);
             if (rc != 0) { setStatus("Can't reach the Frame: " + lastLine(out)); sending = false; return; }
-            if (const std::string why = headsetCantOpen(host8); !why.empty()) { setStatus("Not sent. " + why); sending = false; return; }
+            if (const std::string why = headsetCantOpen(host8, needs); !why.empty()) { setStatus("Not sent. " + why); sending = false; return; }
             std::error_code ec2;
             char msg[200];
             std::snprintf(msg, sizeof msg, "Copying %s (%.0f MB)\u2026", name.c_str(), fs::file_size(f, ec2) / 1048576.0);
@@ -2466,13 +2716,15 @@ struct Studio {
 
     void refreshVisibility() {
         for (const Object& o : objects) renderer.setMeshVisible(o.mesh, objectShown(o));
+        refreshSplats();
     }
 
     // View > Show Only Selected: the selected object or world item alone, until pressed again.
     void toggleIsolate() {
         if (isolating) isolating = false;
-        else if (selected >= 0) { isolating = true; isoObject = selected; isoKind = isoIndex = -1; }
-        else if (wKind >= 0 && wIndex >= 0) { isolating = true; isoObject = -1; isoKind = wKind; isoIndex = wIndex; }
+        else if (selected >= 0) { isolating = true; isoObject = selected; isoKind = isoIndex = isoSplat = -1; }
+        else if (wKind >= 0 && wIndex >= 0) { isolating = true; isoObject = isoSplat = -1; isoKind = wKind; isoIndex = wIndex; }
+        else if (splatSel >= 0) { isolating = true; isoObject = isoKind = isoIndex = -1; isoSplat = splatSel; }
         refreshVisibility();
     }
 
@@ -2595,12 +2847,15 @@ struct Studio {
         mul(o.pivot, o.offset, c.world);
         std::vector<u32> remap(md.positions.size() / 3, UINT32_MAX);
         c.indices.reserve(tris.size() * 3);
-        for (u32 t : tris)
+        const size_t nv = md.positions.size() / 3;
+        for (u32 t : tris) {
+            if (static_cast<size_t>(t) + 2 >= md.indices.size() || md.indices[t] >= nv || md.indices[t + 1] >= nv || md.indices[t + 2] >= nv) continue;
             for (int k = 0; k < 3; ++k) {
                 const u32 v = md.indices[t + k];
                 if (remap[v] == UINT32_MAX) { remap[v] = static_cast<u32>(c.positions.size() / 3); c.positions.insert(c.positions.end(), &md.positions[v * 3], &md.positions[v * 3] + 3); }
                 c.indices.push_back(remap[v]);
             }
+        }
         if (simplify) simplifySurfaceMesh(c.positions, c.indices, surfaceCellFor(c.world));   // for walking on, not for looking at
         return c;
     }
@@ -2631,8 +2886,10 @@ struct Studio {
     void setSurfaces(const std::vector<size_t>& objs, int mode) {
         if (!scene) return;
         pushWorldUndo();
+        const int count = wKind >= 0 ? worldCount(wKind) : 0;
         for (size_t i : objs)
             if (mode == kSurfNone || canBeSurface(objects[i])) makeSurface(objects[i], mode);
+        if (wKind >= 0 && worldCount(wKind) != count) wKind = wIndex = -1;   // (surfaces made or removed: the selected index moved)
         worldReplaced();
     }
 
@@ -2781,8 +3038,45 @@ struct Studio {
     uint64_t walkSig = 0;
     std::chrono::steady_clock::time_point walkChanged;
     bool walkPending = false, walkSaveNext = false, walkSliding = false, walkGuideDirty = true, walkGuideOn = false;
+    bool walkAsStored = false;              // the next bake is the one on opening the home: a saved area is shown as saved
     float walkBakeMs = 0;
     size_t walkGuideVerts = 0;              // --selftest: what the viewport draws of it
+    // A bake after an edit runs on its own thread (a big home's takes most of a second: the window froze for it).
+    // It reads the scene's meshes (left alone meanwhile: CPU animation waits for it, and a new or closed home joins it
+    // first) and its own copies of the world layer and of where the objects are now.
+    struct WalkJob {
+        std::thread thread;
+        std::atomic<bool> done{false};
+        bool save = false, saveNext = false, asStored = false;
+        uint64_t sig = 0;                   // walkSignature() when it started: anything else when it ends, and it's stale
+        WalkParams params;
+        HomeWorld world;
+        std::vector<std::array<float, 16>> mats;
+        std::vector<const float*> mw;
+        std::vector<char> removed;
+        std::shared_ptr<const WalkGrid> grid;
+        WalkReport report;
+        float ms = 0;
+        // ...and what used to follow it on the UI thread: the saved area read back (just opened), the new one written
+        // out for saving, and the viewport's picture of it (with the guide's categories as they were when it started)
+        std::shared_ptr<const WalkGrid> stored;
+        std::string encoded;
+        bool encodedSet = false, guideWalk = false, guideGrey = false, guideBuilt = false;
+        std::vector<GuideVertex> guide;
+        const WalkGrid* guideOf = nullptr;  // (grid or stored)
+        ~WalkJob() { if (thread.joinable()) thread.join(); }
+    };
+    std::unique_ptr<WalkJob> walkJob;
+    std::shared_ptr<const WalkGrid> walkGuideGrid;   // a guide built on the bake thread: for this area...
+    bool walkGuideWalk = false, walkGuideGrey = false;   // ...these categories
+    std::vector<GuideVertex> walkGuideReady;
+    // Waits for a bake in progress and drops it (an edit it was saving is saved by the next one).
+    void dropWalkJob() {
+        if (!walkJob) return;
+        if (walkJob->saveNext) walkSaveNext = true;
+        if (walkJob->asStored) walkAsStored = true;   // (the next bake shows the saved area as it is instead, unless edited)
+        walkJob.reset();
+    }
 
     bool walkSaved() const { return scene && !scene->world.walkGrid.empty(); }
 
@@ -2854,11 +3148,18 @@ struct Studio {
         }
         const uint64_t sig = walkSignature();
         if (sig != walkSig) { walkSig = sig; walkPending = true; walkChanged = now; }
-        if (walkPending && !walkSliding && !ImGuizmo::IsUsingAny() && (!walkShown || now - walkChanged > std::chrono::milliseconds(250))) rebakeWalk();
+        finishWalkBake();
+        if (walkPending && !walkJob && !walkSliding && !ImGuizmo::IsUsingAny() && (!walkShown || now - walkChanged > std::chrono::milliseconds(250))) {
+            if (g_selfTestRun) rebakeWalk();   // (the self-test checks the area the frame after an edit)
+            else startWalkBake();
+        }
         const bool on = walkShown && showWorld && (showCat[kShowWalkArea] || showCat[kShowUnreached]) && !(isolating && isoObject < 0 && isoKind >= 0);
         if (on != walkGuideOn || (on && walkGuideDirty)) {
             std::vector<GuideVertex> v;
-            if (on) v = walkGuide();
+            if (on && walkGuideGrid == walkShown && walkGuideWalk == showCat[kShowWalkArea] && walkGuideGrey == showCat[kShowUnreached]) v.swap(walkGuideReady);
+            else if (on) v = walkGuide();
+            walkGuideGrid.reset();
+            walkGuideReady.clear();
             walkGuideVerts = v.size();
             renderer.setStaticGuide(v);   // it changes only with the walk area: uploaded once, not every frame
             walkGuideOn = on;
@@ -2867,15 +3168,89 @@ struct Studio {
     }
 
     void rebakeWalk() {
+        dropWalkJob();
         walkPending = false;
         const bool save = walkSaved() || walkSaveNext;
         WalkReport rep;
         std::shared_ptr<const WalkGrid> g = bakeWalk(save ? walkEdit : WalkParams{}, &rep);
+        // Just opened, nothing edited yet: the saved area is what Frame Home walks, so the view shows exactly that and
+        // it stays as saved (a bake here can differ by a few bytes: rewriting it would call an untouched home edited).
+        const bool asStored = walkAsStored && save && !walkSaveNext && !dirty;   // (an edit made while it loaded: baked)
+        walkAsStored = false;
+        applyWalkBake(std::move(g), rep, save, asStored);
+    }
+
+    // rebakeWalk() on the bake thread: started here, its result taken by finishWalkBake() a few frames later.
+    void startWalkBake() {
+        walkPending = false;
+        auto job = std::make_unique<WalkJob>();
+        job->save = walkSaved() || walkSaveNext;
+        job->saveNext = walkSaveNext;
+        job->asStored = walkAsStored && job->save && !walkSaveNext && !dirty;
+        walkAsStored = false;
+        job->params = job->save ? walkEdit : WalkParams{};
+        job->world = scene->world;
+        job->mw.assign(scene->meshes.size(), nullptr);
+        job->removed.assign(scene->meshes.size(), 0);
+        job->mats.resize(objects.size());
+        for (size_t i = 0; i < objects.size(); ++i) {
+            const Object& o = objects[i];
+            if (o.scene < 0 || o.scene >= static_cast<int>(scene->meshes.size())) continue;
+            mul(o.pivot, o.offset, job->mats[i].data());
+            job->mw[o.scene] = job->mats[i].data();
+            job->removed[o.scene] = o.deleted;
+        }
+        job->sig = walkSignature();
+        job->guideWalk = showCat[kShowWalkArea];
+        job->guideGrey = showCat[kShowUnreached];
+        WalkJob* j = job.get();
+        const HslScene* sc = scene.get();
+        job->thread = std::thread([j, sc] {
+            const auto t0 = std::chrono::steady_clock::now();
+            j->grid = bakeWalkGrid(*sc, j->world, j->params, &j->report, &j->mw, &j->removed);
+            j->ms = std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - t0).count();
+            if (j->asStored) j->stored = j->world.walkGridCache ? j->world.walkGridCache : decodeWalkGrid(j->world.walkGrid);
+            if (j->save && j->grid && !j->asStored) { j->encoded = encodeWalkGrid(*j->grid); j->encodedSet = true; }
+            const WalkGrid* shown = j->asStored && j->stored ? j->stored.get() : j->grid.get();
+            if (shown && (j->guideWalk || j->guideGrey)) { j->guide = walkGuideOf(*shown, j->guideWalk, j->guideGrey); j->guideOf = shown; j->guideBuilt = true; }
+            j->done = true;
+        });
+        walkJob = std::move(job);
+    }
+    void finishWalkBake() {
+        if (!walkJob || !walkJob->done) return;
+        std::unique_ptr<WalkJob> j = std::move(walkJob);
+        j->thread.join();
+        if (walkSignature() != j->sig) {   // edited while it baked: bake again (this one's save goes with that one)
+            if (j->saveNext) walkSaveNext = true;
+            // ...and so does "show the saved area as it is" (the next start checks again that nothing was edited):
+            // dropped, the next bake would rewrite the area and call a home that was only opened changed
+            if (j->asStored) walkAsStored = true;
+            walkPending = true;
+            return;
+        }
+        walkBakeMs = j->ms;
+        applyWalkBake(std::move(j->grid), j->report, j->save, j->asStored, j->encodedSet ? &j->encoded : nullptr, j->stored);
+        if (j->guideBuilt && walkShown.get() == j->guideOf) {
+            walkGuideGrid = walkShown;
+            walkGuideWalk = j->guideWalk;
+            walkGuideGrey = j->guideGrey;
+            walkGuideReady = std::move(j->guide);
+        }
+    }
+
+    // (encoded / stored: done on the bake thread already)
+    void applyWalkBake(std::shared_ptr<const WalkGrid> g, const WalkReport& rep, bool save, bool asStored, const std::string* encoded = nullptr,
+                       std::shared_ptr<const WalkGrid> stored = nullptr) {
+        if (asStored) {
+            if (!scene->world.walkGridCache) scene->world.walkGridCache = stored ? stored : decodeWalkGrid(scene->world.walkGrid);
+            if (scene->world.walkGridCache) g = scene->world.walkGridCache;
+        }
         walkReport = rep;
         walkShown = g;
         walkGuideDirty = true;
-        if (save && g) {
-            std::string enc = encodeWalkGrid(*g);
+        if (save && g && !asStored) {
+            std::string enc = encoded ? *encoded : encodeWalkGrid(*g);
             if (enc != scene->world.walkGrid) {
                 scene->world.walkGrid = std::move(enc);
                 dirty = worldEdited = true;
@@ -2915,9 +3290,9 @@ struct Studio {
     }
 
     // The viewport's picture of it (the renderer's guide pass: depth-tested, a quarter strength behind things).
-    std::vector<GuideVertex> walkGuide() const {
+    std::vector<GuideVertex> walkGuide() const { return walkGuideOf(*walkShown, showCat[kShowWalkArea], showCat[kShowUnreached]); }
+    static std::vector<GuideVertex> walkGuideOf(const WalkGrid& g, bool showWalk, bool showGrey) {   // (the bake thread's too)
         std::vector<GuideVertex> v;
-        const WalkGrid& g = *walkShown;
         const float cs = g.p.cell, lift = 0.025f;
         auto vert = [&](float x, float y, float z, const float* c) { GuideVertex q; q.pos[0] = x; q.pos[1] = y; q.pos[2] = z; std::memcpy(q.rgba, c, 16); v.push_back(q); };
         auto quad = [&](const float* a, const float* b, const float* c, const float* d, const float* col) {
@@ -2926,7 +3301,6 @@ struct Studio {
         };
         static const float kCol[3][4] = {{0.10f, 0.78f, 0.30f, 0.40f}, {0.10f, 0.55f, 1.00f, 0.60f}, {0.50f, 0.50f, 0.50f, 0.22f}};
         static const float kEdge[4] = {1.00f, 0.45f, 0.08f, 0.95f};
-        const bool showWalk = showCat[kShowWalkArea], showGrey = showCat[kShowUnreached];
         // the walkable area as it's walked: its smooth outline (WalkGrid::outline), with the edge as a strip on the
         // floor and a low kerb (seen from above and from the side)
         if (showWalk)
@@ -3236,17 +3610,14 @@ struct Studio {
             const WalkParams& p = presets[i].p;
             const bool on = std::fabs(p.step - walkEdit.step) < 1e-4f && std::fabs(p.radius - walkEdit.radius) < 1e-4f && std::fabs(p.gap - walkEdit.gap) < 1e-4f && std::fabs(p.headroom - walkEdit.headroom) < 1e-4f;
             ImGui::PushStyleColor(ImGuiCol_Button, on ? hex(kGo) : hex(kWidget, 0.55f));
-            if (ImGui::Button(presets[i].name, ImVec2(bw, 0)) && !on) { pushWorldUndo(); const float mb = walkEdit.metaBounds; walkEdit = p; walkEdit.metaBounds = mb; walkSettingsChanged(); }
+            if (ImGui::Button(presets[i].name, ImVec2(bw, 0)) && !on) { pushWorldUndo(); walkEdit = p; walkSettingsChanged(); }
             ImGui::PopStyleColor();
             if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", presets[i].tip);
         }
         walkSliding = false;
         auto slider = [&](const char* name, float* v, float lo, float hi, float unit, const char* fmt, const char* tip) {
-            ImGui::AlignTextToFramePadding();
-            ImGui::TextDisabled("%s", name);
-            ImGui::SameLine(88 * scale);
+            fieldLabel(name);
             float shown = *v * unit;
-            ImGui::SetNextItemWidth(-1);
             const bool changed = ImGui::SliderFloat((std::string("##walk") + name).c_str(), &shown, lo * unit, hi * unit, fmt);
             if (ImGui::IsItemActivated()) pushWorldUndo();
             if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", tip);
@@ -3257,12 +3628,8 @@ struct Studio {
         slider("Headroom", &walkEdit.headroom, 1.0f, 2.4f, 1, "%.2f m", "The clear height a floor needs. Lower than this under something (a table, a shelf, a low beam): not walkable.");
         slider("Body radius", &walkEdit.radius, 0.0f, 0.5f, 100, "%.0f cm", "How close you get to walls, furniture and ledges.");
         slider("Bridge gaps", &walkEdit.gap, 0.0f, 0.6f, 100, "up to %.0f cm", "Seams and holes in the floor up to this wide are walked over (at the floor's height), so you never drop into a crack.");
-        bool stop = walkEdit.metaBounds >= 0.5f;
-        if (ImGui::Checkbox("Stop at Meta's invisible walls", &stop)) { pushWorldUndo(); walkEdit.metaBounds = stop ? 1.0f : 0.0f; walkSettingsChanged(); }
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Quest homes are made to be seen from one spot: invisible walls keep you there (a terrace's far end,\n"
-                              "Space Station's other rooms, most of Cascadia). Off (the default), you walk to everything modelled beyond them.");
-        if (ImGui::Button(walkSaved() ? "Auto-generate Again" : "Auto-generate Walkable Surfaces", ImVec2(-1, 0))) autoGenerate();
+        ImGui::Spacing();
+        if (ImGui::Button(walkSaved() ? "Auto-generate Again" : "Auto-generate Walkable Surfaces")) autoGenerate();
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("Bakes where you can walk from everything solid in the home and saves it with it (one undo step),\n"
                               "and adds walls along its edges, seats on chairs and sofas and teleport hotspots.\n"
@@ -3294,6 +3661,8 @@ struct Studio {
         for (WorldCollider& c : scene->world.colliders) recenterMesh(c);
     }
 
+    float fieldPivot[16] = {};              // an Object field being dragged: the pivot before it (its undo step)
+    bool fieldPivotPushed = false;
     void pushUndo(size_t i, const float* pivotBefore = nullptr) {
         UndoStep u;
         u.object = i;
@@ -3493,7 +3862,7 @@ struct Studio {
         p.pos[0] = x; p.pos[1] = y; p.pos[2] = z;
         p.yaw = cam.yaw;
         if (kind == kSpawn) { p.name = "Spawn " + std::to_string(w.spawns.size() + 1); w.spawns.push_back(p); }
-        else if (kind == kSeat) { p.name = "Seat " + std::to_string(w.seats.size() + 1); p.pos[1] = y + 0.45f; p.exit[2] = 0.5f; w.seats.push_back(p); }
+        else if (kind == kSeat) { p.name = "Seat " + std::to_string(w.seats.size() + 1); p.pos[1] = y + 0.45f; p.exit[2] = -0.5f; w.seats.push_back(p); }   // (stand up in front: seat-local -Z, the way its arrow points)
         else if (kind == kHotspot) { p.name = "Hotspot " + std::to_string(w.hotspots.size() + 1); w.hotspots.push_back(p); }
         else if (kind == kCollider) {
             WorldCollider c;
@@ -3638,11 +4007,15 @@ struct Studio {
                 back.group = group;
                 back.world = std::make_shared<HomeWorld>(scene->world);
                 to.push_back(back);
+                const int count = wKind >= 0 ? worldCount(wKind) : 0;
                 scene->world = *u.world;
                 worldEdited = true;
+                // items came or went: the selected index may be another item now (Delete would delete that one)
+                if (wKind >= 0 && worldCount(wKind) != count) wKind = wIndex = -1;
                 worldReplaced();
                 continue;
             }
+            if (u.splat >= 0) { stepSplat(u, to, group); continue; }
             Object& o = objects[u.object];
             UndoStep back = {u.object, {}, o.hidden, o.deleted, group};
             std::memcpy(back.pivot, o.pivot, 64);
@@ -3658,6 +4031,7 @@ struct Studio {
     }
 
     void deleteSelected() {
+        if (splatSel >= 0) { deleteSplat(static_cast<size_t>(splatSel)); return; }
         if (selected < 0) return;
         beginBatch();
         const bool floor = drawnFloorIndex(objects[selected]) >= 0;
@@ -3684,19 +4058,437 @@ struct Studio {
         beginBatch();
         for (size_t i = 0; i < objects.size(); ++i) {
             Object& o = objects[i];
-            if (!o.deleted && !o.hidden && std::memcmp(o.pivot, o.pivot0, 64) == 0) continue;
+            const bool gone = isPasted(o);                         // (a pasted one wasn't in the home: it goes)
+            if (o.deleted == gone && !o.hidden && std::memcmp(o.pivot, o.pivot0, 64) == 0) continue;
             pushUndo(i);
             std::memcpy(o.pivot, o.pivot0, 64);
-            o.deleted = o.hidden = false;
+            o.deleted = gone;
+            o.hidden = false;
             apply(o);
         }
+        for (size_t i = 0; i < splatItems.size(); ++i) {
+            SplatItem& sp = splatItems[i];
+            const bool gone = i >= fileSplats;
+            if (sp.deleted == gone && !sp.hidden && std::memcmp(sp.pivot, sp.pivot0, 64) == 0) continue;
+            pushSplatUndo(i);
+            std::memcpy(sp.pivot, sp.pivot0, 64);
+            sp.deleted = gone;
+            sp.hidden = false;
+            applySplat(i);
+        }
         endBatch();
+    }
+
+    // ── Copy and paste (Ctrl+C / Ctrl+X / Ctrl+V, Ctrl+D duplicates): whatever is selected — an object, a splat
+    // object, a spawn, seat, hotspot, surface, wall or gravity zone. The copy is held here (an object's mesh with its
+    // textures shared, a splat object's splats shared), and the system clipboard gets a text form of it under a
+    // header of its own: world items paste from that text into another Frame Studio too, and text that isn't one is
+    // ignored. Paste puts the copy where the view looks (on the floor there as the original stood on its own),
+    // beside the original when that is where the view looks; Duplicate puts it beside the original. One undo step.
+    static constexpr const char* kClipHeader = "Frame Studio clipboard v1 ";
+    struct Clip {
+        uint64_t token = 0;                 // the system clipboard's text says this while it's this copy
+        std::vector<ClipMesh> meshes;
+        std::vector<std::pair<HslSplatObject, SplatItem>> splats;
+        HomeWorld world;                    // world items
+        float centre[3] = {0, 0, 0};        // the copied thing's middle,
+        float base = 0;                     // ...its bottom,
+        float lift = 0;                     // ...how far that was over the floor under it,
+        bool hasLift = false;               // ...(when there was one)
+        float width = 1;                    // ...and how wide it is (m)
+        std::string what;                   // its name, for the status bar
+        bool cut = false;                   // cut (its original is gone): pasted where the view is on it, it goes back there
+        bool empty() const { return meshes.empty() && splats.empty() && world.spawns.empty() && world.seats.empty() && world.hotspots.empty() &&
+                                    world.colliders.empty() && world.gravity.empty(); }
+    } clipboard;
+    std::string testClipboard;              // the self-test's system clipboard (a test never touches yours)
+    std::string clipNote;                   // "Copied Seat 2", shown in the status bar for a few seconds
+    std::chrono::steady_clock::time_point clipNoteAt;
+    size_t fileMeshes = 0, fileSplats = 0;  // the meshes and splat objects the home's files have (past them: pasted)
+    bool isPasted(const Object& o) const { return o.scene >= static_cast<int>(fileMeshes); }
+
+    void note(const std::string& s) { clipNote = s; clipNoteAt = std::chrono::steady_clock::now(); }
+    void setClipText(const std::string& s) { if (g_selfTestRun) testClipboard = s; else ImGui::SetClipboardText(s.c_str()); }
+    std::string clipText() const {
+        if (g_selfTestRun) return testClipboard;
+        const char* t = ImGui::GetClipboardText();
+        return t ? t : "";
+    }
+    bool canCopy() const {
+        return scene && !uploading && loadState != 1 && ((selected >= 0 && selected < static_cast<int>(objects.size())) || (wKind >= 0 && wIndex >= 0) ||
+                                                         (splatSel >= 0 && static_cast<size_t>(splatSel) < splatItems.size()));
+    }
+    bool canPaste() const { return scene && !uploading && loadState != 1 && !saving; }
+
+    // Not the sky, and not animated (skinned, vertex-animated, moved by the home's animation): its copy would stand
+    // still in a pose, or not draw at all.
+    bool objectCopyable(const Object& o) const {
+        if (!scene || o.deleted || o.scene < 0 || o.scene >= static_cast<int>(scene->meshes.size())) return false;
+        const MeshData& md = scene->meshes[o.scene];
+        const bool animated = std::find(scene->animatedMeshes.begin(), scene->animatedMeshes.end(), o.scene) != scene->animatedMeshes.end();
+        return !(o.skybox || md.isSkybox || md.hasVat || !md.skinJoints.empty() || animated || renderer.meshDynamic(o.mesh));
+    }
+    // A copy of what's selected (false, and why in the status bar, when it can't be copied).
+    bool clipOfSelection(Clip& c) {
+        if (!canCopy()) return false;
+        float mn[3], mx[3];
+        auto box = [&](const float* lo, const float* hi) {
+            for (int k = 0; k < 3; ++k) c.centre[k] = (lo[k] + hi[k]) * 0.5f;
+            c.base = lo[1];
+            c.width = std::max(0.2f, std::max(hi[0] - lo[0], hi[2] - lo[2]));
+        };
+        if (wKind >= 0) {
+            if (wIndex >= worldCount(wKind)) return false;
+            c.what = worldName(wKind, wIndex);
+            if (WorldPoint* p = worldPoint(wKind, wIndex)) {
+                (wKind == kSpawn ? c.world.spawns : wKind == kSeat ? c.world.seats : c.world.hotspots).push_back(*p);
+                for (int k = 0; k < 3; ++k) { mn[k] = p->pos[k] - 0.3f; mx[k] = p->pos[k] + 0.3f; }
+                box(mn, mx);
+                c.base = p->pos[1];
+            } else if (wKind == kCollider) {
+                const WorldCollider& wc = scene->world.colliders[wIndex];
+                if (!wc.mesh.empty()) { note("That surface is its object's: copy the object"); return false; }
+                c.world.colliders.push_back(wc);
+                if (wc.kind == WorldCollider::Mesh) {
+                    const std::vector<float> wp = worldMeshPositions(wc);
+                    for (int k = 0; k < 3; ++k) { mn[k] = 1e30f; mx[k] = -1e30f; }
+                    for (size_t v = 0; v + 2 < wp.size(); v += 3)
+                        for (int k = 0; k < 3; ++k) { mn[k] = std::min(mn[k], wp[v + k]); mx[k] = std::max(mx[k], wp[v + k]); }
+                    if (wp.empty()) for (int k = 0; k < 3; ++k) mn[k] = mx[k] = wc.world[12 + k];
+                } else {
+                    const float r = wc.kind == WorldCollider::Box ? std::max({wc.half[0], wc.half[1], wc.half[2]}) : wc.radius + wc.length * 0.5f;
+                    for (int k = 0; k < 3; ++k) { mn[k] = wc.world[12 + k] - r; mx[k] = wc.world[12 + k] + r; }
+                    if (wc.kind == WorldCollider::Box) { mn[1] = wc.world[13] - wc.half[1]; mx[1] = wc.world[13] + wc.half[1]; }
+                }
+                box(mn, mx);
+            } else if (wKind == kGravity) {
+                const WorldGravity& g = scene->world.gravity[wIndex];
+                c.world.gravity.push_back(g);
+                const float r = g.kind == WorldGravity::Planet ? g.radius : std::max(g.half[0], g.half[2]);
+                for (int k = 0; k < 3; ++k) { mn[k] = g.world[12 + k] - r; mx[k] = g.world[12 + k] + r; }
+                box(mn, mx);
+            } else return false;
+        } else if (splatSel >= 0) {
+            const size_t i = static_cast<size_t>(splatSel);
+            if (i >= scene->splats.size() || splatItems[i].deleted) return false;
+            HslSplatObject so = scene->splats[i];             // (its splats shared, not copied)
+            mul(splatItems[i].pivot, splatItems[i].offset, so.worldFromModel);
+            c.splats.push_back({so, splatItems[i]});
+            c.what = so.name;
+            splatWorldBounds(i, mn, mx);
+            box(mn, mx);
+        } else {
+            const Object& o = objects[selected];
+            if (o.deleted || o.scene < 0 || o.scene >= static_cast<int>(scene->meshes.size())) return false;
+            const MeshData& md = scene->meshes[o.scene];
+            if (!objectCopyable(o)) {
+                note(o.skybox || md.isSkybox ? "The sky can't be copied" : "Animated objects can't be copied yet");
+                return false;
+            }
+            ClipMesh cm;
+            auto m = std::make_shared<MeshData>(md);           // (its textures are shared; the geometry is its own)
+            m->hasWorldMatrix = true;
+            mul(o.pivot, o.offset, m->worldMatrix);
+            static const float kId[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+            std::memcpy(m->animXform, kId, 64);
+            cm.md = std::move(m);
+            if (const ShaderProgramSrc* p = findProgram(*scene, md.shaderPath)) cm.prog = std::make_shared<ShaderProgramSrc>(*p);   // (for another home)
+            cm.meta = o;
+            c.meshes.push_back(std::move(cm));
+            c.what = o.label;
+            worldBounds(o, mn, mx);
+            box(mn, mx);
+        }
+        float f;
+        c.hasLift = floorUnder(c.centre[0], c.centre[2], c.base + 0.3f, f);
+        c.lift = c.hasLift ? c.base - f : 0;
+        return true;
+    }
+
+    // The text form on the system clipboard: the header and this copy's token, what it is, then its world items.
+    std::string clipToText(const Clip& c) const {
+        char b[512];
+        std::snprintf(b, sizeof b, "%s%016llx\n{\"what\":\"%s\",\"centre\":[%.5g,%.5g,%.5g],\"base\":%.5g,\"lift\":%.5g,\"hasLift\":%s,\"width\":%.5g,\"objects\":%zu,\"splats\":%zu}\n",
+                      kClipHeader, static_cast<unsigned long long>(c.token), "", c.centre[0], c.centre[1], c.centre[2], c.base, c.lift, c.hasLift ? "true" : "false",
+                      c.width, c.meshes.size(), c.splats.size());
+        std::string s = b;
+        {   // the name, escaped as JSON (it may be anyone's)
+            std::string q;
+            for (char ch : c.what) { if (ch == '"' || ch == '\\') q += '\\'; if (static_cast<unsigned char>(ch) >= 0x20) q += ch; }
+            const size_t at = s.find("\"what\":\"") + 8;
+            s.insert(at, q);
+        }
+        return s + worldToJson(c.world);
+    }
+    // The clipboard's text as a copy: this one (its token), else the world items another Studio copied. False: it
+    // isn't Frame Studio's (anything else on the clipboard), or it's unreadable.
+    bool clipFromText(const std::string& text, Clip& c) const {
+        if (text.compare(0, std::strlen(kClipHeader), kClipHeader) != 0) return false;
+        const size_t l1 = text.find('\n');
+        const size_t l2 = l1 == std::string::npos ? std::string::npos : text.find('\n', l1 + 1);
+        if (l2 == std::string::npos) return false;
+        const unsigned long long token = std::strtoull(text.substr(std::strlen(kClipHeader), l1 - std::strlen(kClipHeader)).c_str(), nullptr, 16);
+        if (token != 0 && token == clipboard.token && !clipboard.empty()) { c = clipboard; return true; }
+        try {
+            const tinyjson::Value v = tinyjson::parse(text.substr(l1 + 1, l2 - l1 - 1));
+            if (!v.isObject()) return false;
+            c = Clip();
+            c.what = v["what"].asString();
+            for (size_t k = 0; k < 3; ++k) c.centre[k] = static_cast<float>(v["centre"][k].asFloat());
+            c.base = static_cast<float>(v["base"].asFloat());
+            c.lift = static_cast<float>(v["lift"].asFloat());
+            c.hasLift = v["hasLift"].boolVal;
+            c.width = std::clamp(static_cast<float>(v["width"].asFloat()), 0.2f, 1000.0f);
+            if (!worldFromJson(text.substr(l2 + 1), c.world)) return false;
+            c.world.walkGrid.clear();
+            for (float x : {c.centre[0], c.centre[1], c.centre[2], c.base, c.lift})
+                if (!std::isfinite(x) || std::fabs(x) > 1e6f) return false;
+            if (c.empty() && (v["objects"].asFloat() > 0 || v["splats"].asFloat() > 0)) {
+                c.what = "objects from another Frame Studio window";   // (their meshes stay in that one)
+            }
+            return true;
+        } catch (...) {
+            return false;
+        }
+    }
+
+    // Edit > Copy / Cut.
+    bool copySelection(bool cut = false) {
+        Clip c;
+        if (!clipOfSelection(c)) return false;
+        static uint64_t serial = 0;
+        c.token = (static_cast<uint64_t>(std::chrono::steady_clock::now().time_since_epoch().count()) * 2654435761u) ^ ++serial;
+        if (c.token == 0) c.token = 1;
+        c.cut = cut;
+        clipboard = std::move(c);
+        setClipText(clipToText(clipboard));
+        if (cut) {
+            if (wKind >= 0) deleteWorld(); else deleteSelected();
+            note("Cut " + clipboard.what);
+        } else {
+            note("Copied " + clipboard.what);
+        }
+        return true;
+    }
+    // Edit > Paste: the clipboard's copy, where the view looks.
+    bool pasteClipboard() {
+        if (!canPaste()) return false;
+        Clip c;
+        if (!clipFromText(clipText(), c)) { note("Nothing Frame Studio can paste is on the clipboard"); return false; }
+        if (c.empty()) { note("Only world items paste between Frame Studio windows; copy " + c.what + " in this one"); return false; }
+        float to[3] = {cam.pivot[0], c.centre[1], cam.pivot[2]};
+        if (std::hypot(to[0] - c.centre[0], to[2] - c.centre[2]) < std::max(0.3f, c.width * 0.5f)) {
+            if (c.cut) { std::copy_n(c.centre, 3, to); return pasteClip(c, false, to); }   // (cut from here: back where it was)
+            return pasteClip(c, true);                                                    // (on the original: beside it)
+        }
+        return pasteClip(c, false, to);
+    }
+    // Edit > Duplicate: the selection again, beside itself (the clipboard is left as it was).
+    bool duplicateSelection() {
+        if (!canPaste()) return false;
+        Clip c;
+        if (!clipOfSelection(c)) return false;
+        return pasteClip(c, true);
+    }
+
+    // A name not yet used: its own when that's free (cut and pasted back, from another window), else "Chair copy",
+    // "Chair copy 2"...
+    static std::string copyName(const std::string& name, const std::function<bool(const std::string&)>& taken) {
+        if (!name.empty() && !taken(name)) return name;
+        std::string base = name;
+        const size_t at = base.rfind(" copy");
+        if (at != std::string::npos && (at + 5 == base.size() || std::all_of(base.begin() + at + 5, base.end(), [](char ch) { return ch == ' ' || std::isdigit(static_cast<unsigned char>(ch)); })))
+            base.erase(at);
+        std::string n = base + " copy";
+        for (int k = 2; taken(n); ++k) n = base + " copy " + std::to_string(k);
+        return n;
+    }
+
+    // Puts a copy in: beside its original (along the view's right, its width over), or with its middle at `to`'s x,
+    // z, standing as high over the floor there as it stood over its own. Selected, one undo step.
+    bool pasteClip(const Clip& c, bool beside, const float* to = nullptr) {
+        if (!canPaste() || c.empty()) return false;
+        float d[3] = {0, 0, 0};
+        if (beside || !to) {
+            const float sy = std::sin(cam.yaw), cy = std::cos(cam.yaw);   // the view's right, on the floor
+            d[0] = cy * (c.width + 0.25f); d[2] = -sy * (c.width + 0.25f);
+        } else {
+            d[0] = to[0] - c.centre[0]; d[2] = to[2] - c.centre[2];
+            float f;
+            if (c.hasLift && floorUnder(to[0], to[2], c.base + 0.3f, f)) d[1] = f + c.lift - c.base;
+        }
+        float t[16];
+        translation(t, d[0], d[1], d[2]);
+        beginBatch();
+        int lastObj = -1, lastSplat = -1, lastKind = -1, lastIndex = -1;
+        for (const ClipMesh& cm : c.meshes) { const int i = pasteMesh(cm, t); if (i >= 0) lastObj = i; }
+        for (const auto& sp : c.splats) { const int i = pasteSplat(sp.first, t); if (i >= 0) lastSplat = i; }
+        const HomeWorld& w = c.world;
+        if (!w.spawns.empty() || !w.seats.empty() || !w.hotspots.empty() || !w.colliders.empty() || !w.gravity.empty()) {
+            pushWorldUndo();
+            HomeWorld& hw = scene->world;
+            auto points = [&](const std::vector<WorldPoint>& from, std::vector<WorldPoint>& into, int kind) {
+                for (WorldPoint p : from) {
+                    for (int k = 0; k < 3; ++k) p.pos[k] += d[k];
+                    p.name = copyName(p.name, [&](const std::string& n) { return std::any_of(into.begin(), into.end(), [&](const WorldPoint& q) { return q.name == n; }); });
+                    p.hidden = false;
+                    into.push_back(p);
+                    lastKind = kind; lastIndex = static_cast<int>(into.size()) - 1;
+                }
+            };
+            points(w.spawns, hw.spawns, kSpawn);
+            points(w.seats, hw.seats, kSeat);
+            points(w.hotspots, hw.hotspots, kHotspot);
+            for (WorldCollider wc : w.colliders) {
+                if (!wc.mesh.empty()) continue;                  // (an object's own surface follows that object)
+                for (int k = 0; k < 3; ++k) wc.world[12 + k] += d[k];
+                wc.name = copyName(wc.name, [&](const std::string& n) { return std::any_of(hw.colliders.begin(), hw.colliders.end(), [&](const WorldCollider& q) { return q.name == n; }); });
+                wc.hidden = false;
+                hw.colliders.push_back(std::move(wc));
+                lastKind = kCollider;
+                lastIndex = combineTouching(static_cast<int>(hw.colliders.size()) - 1);
+            }
+            for (WorldGravity g : w.gravity) {
+                for (int k = 0; k < 3; ++k) g.world[12 + k] += d[k];
+                g.name = copyName(g.name, [&](const std::string& n) { return std::any_of(hw.gravity.begin(), hw.gravity.end(), [&](const WorldGravity& q) { return q.name == n; }); });
+                g.priority = static_cast<int>(hw.gravity.size());   // a newer zone wins where they overlap
+                g.hidden = false;
+                hw.gravity.push_back(g);
+                lastKind = kGravity; lastIndex = static_cast<int>(hw.gravity.size()) - 1;
+            }
+            walkPending = true;
+        }
+        endBatch();
+        selected = splatSel = -1; wKind = wIndex = -1;
+        if (lastKind >= 0) { wKind = lastKind; wIndex = lastIndex; }
+        else if (lastSplat >= 0) splatSel = lastSplat;
+        else if (lastObj >= 0) selected = lastObj;
+        else { note("Couldn't paste " + c.what); return false; }
+        dirty = true;
+        updateTitle();
+        note("Pasted " + c.what);
+        return true;
+    }
+
+    // An object's copy: its mesh appended to the home and drawn (moved by t). Its index, or -1.
+    int pasteMesh(const ClipMesh& cm, const float t[16]) {
+        if (!cm.md) return -1;
+        dropWalkJob();                                       // (a bake on its thread reads the meshes)
+        MeshData md = *cm.md;
+        mul(t, cm.md->worldMatrix, md.worldMatrix);
+        md.name = copyName(cm.meta.name, [&](const std::string& n) { return std::any_of(objects.begin(), objects.end(), [&](const Object& o) { return o.name == n; }); });
+        if (cm.prog && !findProgram(*scene, md.shaderPath)) scene->programs[md.shaderPath.empty() ? cm.prog->path : md.shaderPath] = *cm.prog;   // (from another home)
+        const bool sources = scene->meshSource.size() == scene->meshes.size();
+        const int si = static_cast<int>(scene->meshes.size());
+        scene->meshes.push_back(std::move(md));
+        if (sources) scene->meshSource.push_back(std::clamp(cm.meta.source, 0, std::max(0, static_cast<int>(scene->apkPaths.size()) - 1)));
+        const int ri = renderer.addMesh(si);
+        if (ri < 0) {
+            scene->meshes.pop_back();
+            if (sources) scene->meshSource.pop_back();
+            return -1;
+        }
+        Object o = cm.meta;
+        o.mesh = static_cast<size_t>(ri);
+        o.scene = si;
+        o.name = scene->meshes[si].name;
+        o.label = cleanName(o.name);
+        o.hidden = false;
+        o.deleted = true;                                    // (as it was before the paste: the undo step's state)
+        float p[16];
+        mul(t, cm.meta.pivot, p);
+        std::memcpy(o.pivot, p, 64);
+        std::memcpy(o.pivot0, p, 64);
+        objects.push_back(o);
+        const size_t i = objects.size() - 1;
+        pushUndo(i);
+        objects[i].deleted = false;
+        apply(objects[i]);
+        return static_cast<int>(i);
+    }
+
+    // A splat object's copy (its splats shared), moved by t. Its index, or -1.
+    int pasteSplat(const HslSplatObject& from, const float t[16]) {
+        if (!from.splats || from.splats->empty()) return -1;
+        HslSplatObject so = from;
+        mul(t, from.worldFromModel, so.worldFromModel);
+        so.name = copyName(from.name, [&](const std::string& n) { return std::any_of(scene->splats.begin(), scene->splats.end(), [&](const HslSplatObject& q) { return q.name == n; }); });
+        so.hidden = false;
+        so.source = -1;
+        scene->splats.push_back(so);
+        splatItems.push_back(splatItemFor(so));
+        renderer.reloadSplats();
+        const size_t i = splatItems.size() - 1;
+        splatItems[i].deleted = true;                        // (the undo step's state: not there)
+        pushSplatUndo(i);
+        splatItems[i].deleted = false;
+        applySplat(i);
+        return static_cast<int>(i);
+    }
+    // A splat object's Studio side (its box, and its gizmo frame at its middle), as buildSplats makes it.
+    static SplatItem splatItemFor(const HslSplatObject& so) {
+        SplatItem it;
+        for (int k = 0; k < 3; ++k) { it.lmin[k] = 1e30f; it.lmax[k] = -1e30f; }
+        if (so.splats)
+            for (const Splat& s : *so.splats)
+                for (int k = 0; k < 3; ++k) { it.lmin[k] = std::min(it.lmin[k], s.pos[k]); it.lmax[k] = std::max(it.lmax[k], s.pos[k]); }
+        it.count = so.splats ? so.splats->size() : 0;
+        if (!it.count) for (int k = 0; k < 3; ++k) it.lmin[k] = it.lmax[k] = 0;
+        const float c[3] = {(it.lmin[0] + it.lmax[0]) * 0.5f, (it.lmin[1] + it.lmax[1]) * 0.5f, (it.lmin[2] + it.lmax[2]) * 0.5f};
+        float wc[3], inv[16];
+        point(so.worldFromModel, c, wc);
+        translation(it.pivot0, wc[0], wc[1], wc[2]);
+        std::memcpy(it.pivot, it.pivot0, 64);
+        translation(inv, -wc[0], -wc[1], -wc[2]);
+        mul(inv, so.worldFromModel, it.offset);
+        return it;
+    }
+
+    // Reloading the home (Add Models, Add Vista, a sky): what was pasted into it comes along, as it is now.
+    void carryPastes() {
+        carry.pastedMeshes.clear();
+        carry.pastedSplats.clear();
+        carry.objects.erase(std::remove_if(carry.objects.begin(), carry.objects.end(), [&](const ObjectEdit& x) { return x.index >= static_cast<int>(fileMeshes); }),
+                            carry.objects.end());
+        for (const Object& o : objects) {
+            if (!isPasted(o) || o.deleted || o.scene >= static_cast<int>(scene->meshes.size())) continue;
+            ClipMesh cm;
+            auto m = std::make_shared<MeshData>(scene->meshes[o.scene]);
+            mul(o.pivot, o.offset, m->worldMatrix);
+            m->hasWorldMatrix = true;
+            if (const ShaderProgramSrc* p = findProgram(*scene, m->shaderPath)) cm.prog = std::make_shared<ShaderProgramSrc>(*p);
+            cm.md = std::move(m);
+            cm.meta = o;
+            carry.pastedMeshes.push_back(std::move(cm));
+        }
+        for (size_t i = fileSplats; i < splatItems.size() && i < scene->splats.size(); ++i) {
+            if (splatItems[i].deleted) continue;
+            HslSplatObject so = scene->splats[i];
+            mul(splatItems[i].pivot0, splatItems[i].offset, so.worldFromModel);   // (as pasted: carry.splats puts its move back)
+            carry.pastedSplats.push_back(so);
+        }
+    }
+    // The home just loaded: how much of it its files gave, then (a reload) what was pasted into it before.
+    void takeCarriedPastes() {
+        fileMeshes = scene->meshes.size();
+        fileSplats = scene->splats.size();
+        if (!carry.any) return;
+        for (const ClipMesh& cm : carry.pastedMeshes) {
+            if (!cm.md) continue;
+            if (cm.prog && !findProgram(*scene, cm.md->shaderPath)) scene->programs[cm.md->shaderPath.empty() ? cm.prog->path : cm.md->shaderPath] = *cm.prog;
+            const bool sources = scene->meshSource.size() == scene->meshes.size();
+            scene->meshes.push_back(*cm.md);
+            if (sources) scene->meshSource.push_back(std::clamp(cm.meta.source, 0, std::max(0, static_cast<int>(scene->apkPaths.size()) - 1)));
+        }
+        for (const HslSplatObject& so : carry.pastedSplats) scene->splats.push_back(so);
     }
 
     void unhideAll() {
         beginBatch();
         for (size_t i = 0; i < objects.size(); ++i)
             if (objects[i].hidden && !objects[i].deleted) { pushUndo(i); objects[i].hidden = false; apply(objects[i]); }
+        for (size_t i = 0; i < splatItems.size(); ++i)
+            if (splatItems[i].hidden && !splatItems[i].deleted) toggleSplatHidden(i);
         endBatch();
     }
 
@@ -3718,6 +4510,7 @@ struct Studio {
     }
 
     void frameSelected() {
+        if (splatSel >= 0) { float mn[3], mx[3]; splatWorldBounds(static_cast<size_t>(splatSel), mn, mx); frameBounds(mn, mx); return; }
         if (selected < 0) return;
         float mn[3], mx[3];
         worldBounds(objects[selected], mn, mx);
@@ -3732,6 +4525,13 @@ struct Studio {
             float a[3], b[3];
             worldBounds(o, a, b);
             if (b[0] - a[0] > 500 || b[1] - a[1] > 500 || b[2] - a[2] > 500) continue;   // distant backdrops
+            for (int k = 0; k < 3; ++k) { mn[k] = std::min(mn[k], a[k]); mx[k] = std::max(mx[k], b[k]); }
+            any = true;
+        }
+        for (size_t i = 0; i < splatItems.size(); ++i) {
+            if (splatItems[i].deleted || splatItems[i].hidden || !splatItems[i].count) continue;
+            float a[3], b[3];
+            splatWorldBounds(i, a, b);
             for (int k = 0; k < 3; ++k) { mn[k] = std::min(mn[k], a[k]); mx[k] = std::max(mx[k], b[k]); }
             any = true;
         }
@@ -3857,20 +4657,334 @@ struct Studio {
         return best;
     }
 
+    // ── Gaussian splat objects (HslScene::splats): moved, hidden, deleted and picked whole ──
+    // The renderer reads each one's placement and visibility from the scene every frame; Studio keeps the rest here.
+
+    // What the headset draws smoothly (each splat a blended quad in both eyes): up to kSplatsSmooth at full frame rate,
+    // kSplatsMost at all.
+    static constexpr size_t kSplatsSmooth = 400000, kSplatsMost = 1000000;
+    static std::string withCommas(size_t n) {
+        std::string d = std::to_string(n), out;
+        for (size_t k = 0; k < d.size(); ++k) { if (k && (d.size() - k) % 3 == 0) out += ','; out += d[k]; }
+        return out;
+    }
+    size_t splatTotal() const {                     // the splats the environment keeps (not the deleted ones)
+        size_t n = 0;
+        for (const SplatItem& sp : splatItems) if (!sp.deleted) n += sp.count;
+        return n;
+    }
+    bool splatShown(size_t i) const {
+        const SplatItem& sp = splatItems[i];
+        if (sp.hidden || sp.deleted) return false;
+        if (isolating) return static_cast<int>(i) == isoSplat;
+        return showMeshes;
+    }
+    void applySplat(size_t i) {
+        mul(splatItems[i].pivot, splatItems[i].offset, scene->splats[i].worldFromModel);
+        scene->splats[i].hidden = !splatShown(i);
+    }
+    void refreshSplats() {
+        if (!scene || scene->splats.size() != splatItems.size()) return;
+        for (size_t i = 0; i < splatItems.size(); ++i) scene->splats[i].hidden = !splatShown(i);
+    }
+    // Once the home is up: each splat object's box, and its gizmo frame at its middle (as an object's).
+    void buildSplats() {
+        splatItems.clear();
+        splatSel = -1;
+        for (const HslSplatObject& so : scene->splats) {
+            SplatItem it;
+            for (int k = 0; k < 3; ++k) { it.lmin[k] = 1e30f; it.lmax[k] = -1e30f; }
+            if (so.splats)
+                for (const Splat& s : *so.splats)
+                    for (int k = 0; k < 3; ++k) { it.lmin[k] = std::min(it.lmin[k], s.pos[k]); it.lmax[k] = std::max(it.lmax[k], s.pos[k]); }
+            it.count = so.splats ? so.splats->size() : 0;
+            if (!it.count) for (int k = 0; k < 3; ++k) it.lmin[k] = it.lmax[k] = 0;
+            const float c[3] = {(it.lmin[0] + it.lmax[0]) * 0.5f, (it.lmin[1] + it.lmax[1]) * 0.5f, (it.lmin[2] + it.lmax[2]) * 0.5f};
+            float wc[3], inv[16];
+            point(so.worldFromModel, c, wc);
+            translation(it.pivot0, wc[0], wc[1], wc[2]);
+            std::memcpy(it.pivot, it.pivot0, 64);
+            translation(inv, -wc[0], -wc[1], -wc[2]);
+            mul(inv, so.worldFromModel, it.offset);
+            splatItems.push_back(it);
+        }
+    }
+    // A reload of the same environment (Import Models, Add Vista): each splat object as it was, by name.
+    void restoreSplats(const std::vector<std::pair<std::string, SplatItem>>& carried) {
+        std::vector<char> taken(splatItems.size(), 0);
+        for (const auto& [name, was] : carried)
+            for (size_t i = 0; i < splatItems.size(); ++i) {
+                if (taken[i] || scene->splats[i].name != name) continue;
+                taken[i] = 1;
+                std::memcpy(splatItems[i].pivot, was.pivot, 64);
+                splatItems[i].hidden = was.hidden;
+                splatItems[i].deleted = was.deleted;
+                applySplat(i);
+                break;
+            }
+    }
+    void pushSplatUndo(size_t i, const float* pivotBefore = nullptr) {
+        UndoStep u = {};
+        u.splat = static_cast<int>(i);
+        std::memcpy(u.pivot, pivotBefore ? pivotBefore : splatItems[i].pivot, 64);
+        u.hidden = splatItems[i].hidden;
+        u.deleted = splatItems[i].deleted;
+        u.group = undoGroup;
+        undo.push_back(u);
+        redo.clear();
+        dirty = true;
+        updateTitle();
+    }
+    // step() for a splat object's edit: back as the step has it, and the way it is now onto `to`.
+    void stepSplat(const UndoStep& u, std::vector<UndoStep>& to, int group) {
+        if (static_cast<size_t>(u.splat) >= splatItems.size()) return;
+        SplatItem& sp = splatItems[u.splat];
+        UndoStep back = {};
+        back.splat = u.splat;
+        back.group = group;
+        back.hidden = sp.hidden;
+        back.deleted = sp.deleted;
+        std::memcpy(back.pivot, sp.pivot, 64);
+        to.push_back(back);
+        std::memcpy(sp.pivot, u.pivot, 64);
+        sp.hidden = u.hidden;
+        sp.deleted = u.deleted;
+        applySplat(static_cast<size_t>(u.splat));
+        if (sp.deleted && splatSel == u.splat) splatSel = -1;
+    }
+    void toggleSplatHidden(size_t i) {
+        pushSplatUndo(i);
+        splatItems[i].hidden = !splatItems[i].hidden;
+        applySplat(i);
+    }
+    void deleteSplat(size_t i) {
+        pushSplatUndo(i);
+        splatItems[i].deleted = true;
+        applySplat(i);
+        if (splatSel == static_cast<int>(i)) splatSel = -1;
+    }
+    void splatWorldBounds(size_t i, float* mn, float* mx) const {
+        const SplatItem& sp = splatItems[i];
+        for (int k = 0; k < 3; ++k) { mn[k] = 1e30f; mx[k] = -1e30f; }
+        for (int c = 0; c < 8; ++c) {
+            const float p[3] = {c & 1 ? sp.lmax[0] : sp.lmin[0], c & 2 ? sp.lmax[1] : sp.lmin[1], c & 4 ? sp.lmax[2] : sp.lmin[2]};
+            float q[3];
+            point(scene->splats[i].worldFromModel, p, q);
+            for (int k = 0; k < 3; ++k) { mn[k] = std::min(mn[k], q[k]); mx[k] = std::max(mx[k], q[k]); }
+        }
+    }
+    // The nearest splat object shown whose box the ray under a viewport pixel goes through, and how far along the ray
+    // (pickRay's measure). From inside a box (a captured room around you): where the ray leaves it, so what's in it
+    // can still be clicked.
+    int pickSplat(float px, float py, float& outT) const {
+        outT = 1e30f;
+        if (!scene || viewSize.x < 1 || viewSize.y < 1 || scene->splats.size() != splatItems.size()) return -1;
+        float origin[3], dir[3];
+        mouseRay(px, py, origin, dir);
+        int best = -1;
+        for (size_t i = 0; i < splatItems.size(); ++i) {
+            const SplatItem& sp = splatItems[i];
+            float inv[16];
+            if (!sp.count || !splatShown(i) || !invert(scene->splats[i].worldFromModel, inv)) continue;
+            float lo[3], ld[3];
+            point(inv, origin, lo);
+            direction(inv, dir, ld);
+            float t0 = -1e30f, t1 = 1e30f;
+            bool miss = false;
+            for (int k = 0; k < 3 && !miss; ++k) {
+                if (std::fabs(ld[k]) < 1e-12f) { miss = lo[k] < sp.lmin[k] || lo[k] > sp.lmax[k]; continue; }
+                float a = (sp.lmin[k] - lo[k]) / ld[k], b = (sp.lmax[k] - lo[k]) / ld[k];
+                if (a > b) std::swap(a, b);
+                t0 = std::max(t0, a);
+                t1 = std::min(t1, b);
+                miss = t0 > t1;
+            }
+            if (miss || t1 <= 0) continue;
+            const float t = t0 > 0 ? t0 : t1;
+            if (t < outT) { outT = t; best = static_cast<int>(i); }
+        }
+        return best;
+    }
+    // A click in the view: the nearest home object or splat object under it is the selection (nothing: none).
+    void pickSelect(float px, float py) {
+        float tm = 1e30f, ts = 1e30f;
+        const int m = pickRay(px, py, -1, &tm, nullptr), sp = pickSplat(px, py, ts);
+        selected = sp >= 0 && (m < 0 || ts < tm) ? -1 : m;
+        splatSel = selected < 0 ? sp : -1;
+    }
+    // The selected splat object's gizmo (the viewport's, as an object's): one undo step per drag.
+    void splatGizmo(ImDrawList* dl, const float* view, const float* proj, bool allowed, bool& shown, bool& over) {
+        const size_t i = static_cast<size_t>(splatSel);
+        SplatItem& sp = splatItems[i];
+        ImGuizmo::SetOrthographic(false);
+        ImGuizmo::SetGizmoSizeClipSpace(0.14f);
+        ImGuizmo::SetDrawlist(dl);
+        ImGuizmo::SetRect(viewPos.x, viewPos.y, viewSize.x, viewSize.y);
+        const ImGuizmo::OPERATION op = tool == Tool::Move ? ImGuizmo::TRANSLATE : tool == Tool::Rotate ? ImGuizmo::ROTATE : ImGuizmo::SCALE;
+        float before[16];
+        std::memcpy(before, sp.pivot, 64);
+        const float v = tool == Tool::Rotate ? 15.0f : tool == Tool::Scale ? 0.1f : 0.25f, snapValues[3] = {v, v, v};
+        ImGuizmo::Enable(allowed || ImGuizmo::IsUsing());
+        shown = true;
+        if (ImGuizmo::Manipulate(view, proj, op, localSpace ? ImGuizmo::LOCAL : ImGuizmo::WORLD, sp.pivot, nullptr, ImGui::GetIO().KeyCtrl ? snapValues : nullptr)) {
+            if (finiteMatrix(sp.pivot)) applySplat(i); else std::memcpy(sp.pivot, before, 64);
+        }
+        const bool using_ = ImGuizmo::IsUsing();
+        if (using_ && !gizmoWasUsing) pushSplatUndo(i, before);
+        gizmoWasUsing = using_;
+        over = ImGuizmo::IsOver() || using_;
+    }
+    // The selected splat object's box in the view (a mesh's highlight is its triangles; a splat object has none).
+    void drawSplatBox(ImDrawList* dl, size_t i) {
+        if (i >= splatItems.size() || !splatShown(i) || !splatItems[i].count) return;
+        const SplatItem& sp = splatItems[i];
+        ImVec2 c[8];
+        bool in[8];
+        for (int k = 0; k < 8; ++k) {
+            const float p[3] = {k & 1 ? sp.lmax[0] : sp.lmin[0], k & 2 ? sp.lmax[1] : sp.lmin[1], k & 4 ? sp.lmax[2] : sp.lmin[2]};
+            float q[3];
+            point(scene->splats[i].worldFromModel, p, q);
+            in[k] = screenOf(q, c[k]);
+        }
+        for (int a = 0; a < 8; ++a)
+            for (int bit : {1, 2, 4})
+                if (!(a & bit) && in[a] && in[a | bit]) dl->AddLine(c[a], c[a | bit], col(kOrange, 0.9f), 1.5f * scale);
+    }
+    // The Outliner's splat objects: a group of their own, each row its name, its splat count and its eye.
+    void splatRows(const std::string& f, float h) {
+        ImGui::PushID("splats");
+        const float w = ImGui::GetContentRegionAvail().x;
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        const ImVec2 p = ImGui::GetCursorScreenPos();
+        const uint32_t tint = 0x3fb8a6;
+        dl->AddRectFilled(p, ImVec2(p.x + w, p.y + h), col(mix(kList, tint, 0.16f)));
+        dl->AddRectFilled(p, ImVec2(p.x + 2 * scale, p.y + h), col(tint, 0.8f));
+        const bool open = !f.empty() || !collapsed.count(2600);
+        if (ImGui::Selectable("##splathdr", false, ImGuiSelectableFlags_AllowOverlap, ImVec2(w, h)) && f.empty()) { if (open) collapsed.insert(2600); else collapsed.erase(2600); }
+        const float ty = p.y + (h - ImGui::GetTextLineHeight()) * 0.5f;
+        dl->AddText(ImVec2(p.x + 8 * scale, ty), col(tint), (std::string(open ? "▾  " : "▸  ") + "Gaussian Splats").c_str());
+        const std::string total = withCommas(splatTotal());
+        dl->AddText(ImVec2(p.x + w - ImGui::CalcTextSize(total.c_str()).x - 10 * scale, ty), col(kDim), total.c_str());
+        for (size_t i = 0; open && i < splatItems.size(); ++i) {
+            const SplatItem& sp = splatItems[i];
+            std::string n = scene->splats[i].name;
+            for (char& ch : n) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+            if (sp.deleted || (!f.empty() && n.find(f) == std::string::npos)) continue;
+            ImGui::PushID(static_cast<int>(i));
+            const ImVec2 rp = ImGui::GetCursorScreenPos();
+            const bool sel = splatSel == static_cast<int>(i);
+            if (ImGui::Selectable("##splatrow", sel, ImGuiSelectableFlags_AllowOverlap | ImGuiSelectableFlags_AllowDoubleClick, ImVec2(w, h))) {
+                splatSel = static_cast<int>(i);
+                selected = -1;
+                wKind = wIndex = -1;
+                if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) frameSelected();
+            }
+            const float ix = rp.x + 24 * scale, iy = rp.y + h * 0.5f, r = h * 0.09f;   // its icon: a little cloud of dots
+            for (const ImVec2& d : {ImVec2(-1.2f, 0.6f), ImVec2(0.0f, -0.9f), ImVec2(1.2f, 0.4f), ImVec2(0.1f, 0.9f)})
+                dl->AddCircleFilled(ImVec2(ix + d.x * r * 1.6f, iy + d.y * r * 1.6f), r, col(sp.hidden ? kDim : tint));
+            const std::string cnt = withCommas(sp.count);
+            const float cw = ImGui::CalcTextSize(cnt.c_str()).x;
+            dl->PushClipRect(rp, ImVec2(rp.x + w - h - cw - 16 * scale, rp.y + h), true);
+            dl->AddText(ImVec2(ix + 12 * scale, rp.y + (h - ImGui::GetTextLineHeight()) * 0.5f), col(sp.hidden ? kDim : sel ? 0xffffff : kText),
+                        scene->splats[i].name.c_str());
+            dl->PopClipRect();
+            dl->AddText(ImVec2(rp.x + w - h - cw - 10 * scale, rp.y + (h - ImGui::GetTextLineHeight()) * 0.5f), col(kDim), cnt.c_str());
+            ImGui::SetCursorScreenPos(ImVec2(rp.x + w - h - 4 * scale, rp.y + h * 0.1f));
+            if (eyeButton("eye", !sp.hidden)) toggleSplatHidden(i);
+            ImGui::SetCursorScreenPos(ImVec2(rp.x, rp.y + h));
+            ImGui::PopID();
+        }
+        ImGui::PopID();
+    }
+    // Properties > Object for a splat object: its name and size, where it is, and what the headset makes of the splats.
+    void splatPanel() {
+        const size_t i = static_cast<size_t>(splatSel);
+        SplatItem& sp = splatItems[i];
+        ImGui::TextUnformatted(scene->splats[i].name.c_str());
+        ImGui::TextDisabled("Gaussian splats · %s splats", withCommas(sp.count).c_str());
+        ImGui::Spacing();
+        float t[3], r[3], sc[3];
+        ImGuizmo::DecomposeMatrixToComponents(sp.pivot, t, r, sc);
+        bool changed = false;
+        auto pivotField = [&](bool edited) {        // one undo step per field, the first time it really changes
+            if (ImGui::IsItemActivated()) { std::memcpy(fieldPivot, sp.pivot, 64); fieldPivotPushed = false; }
+            if (edited && !fieldPivotPushed) { pushSplatUndo(i, fieldPivot); fieldPivotPushed = true; }
+            changed |= edited;
+        };
+        fieldLabel("Location");
+        pivotField(ImGui::DragFloat3("##sloc", t, 0.01f, 0, 0, "%.3f m"));
+        fieldLabel("Rotation");
+        tidyZero(r, 0.001f);
+        pivotField(ImGui::DragFloat3("##srot", r, 0.5f, 0, 0, "%.1f°"));
+        fieldLabel("Scale");
+        pivotField(ImGui::DragFloat3("##sscl", sc, 0.01f, 0.001f, 1000.0f, "%.3f"));
+        if (changed) {
+            float was[16];
+            std::memcpy(was, sp.pivot, 64);
+            ImGuizmo::RecomposeMatrixFromComponents(t, r, sc, sp.pivot);
+            if (finiteMatrix(sp.pivot)) applySplat(i); else std::memcpy(sp.pivot, was, 64);   // (typed "1e39" or "nan")
+        }
+        // The headset's budget, for all the splats the environment keeps
+        const size_t total = splatTotal();
+        const uint32_t c = total > kSplatsMost ? 0xff5a4a : total > kSplatsSmooth ? 0xffd84a : 0x4cd964;
+        fieldLabel("Headset");
+        const ImVec2 dp = ImGui::GetCursorScreenPos();
+        const float sz = ImGui::GetTextLineHeight();
+        ImGui::GetWindowDrawList()->AddCircleFilled(ImVec2(dp.x + sz * 0.35f, dp.y + ImGui::GetFrameHeight() * 0.5f), sz * 0.3f, col(c));
+        ImGui::Dummy(ImVec2(sz * 0.7f, ImGui::GetFrameHeight()));
+        ImGui::SameLine(0, 4 * scale);
+        ImGui::AlignTextToFramePadding();
+        ImGui::PushStyleColor(ImGuiCol_Text, hex(c));
+        ImGui::TextWrapped("%s splats in all: %s", withCommas(total).c_str(),
+                           total > kSplatsMost ? "too many to draw smoothly" : total > kSplatsSmooth ? "may need Half frame rate" : "fine at full frame rate");
+        ImGui::PopStyleColor();
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Up to 400,000 splats keep the Steam Frame at its full frame rate. More may need Environment > Frame rate:\n"
+                              "Half; over a million won't stay smooth. Delete or hide what you don't need, or crop the capture.");
+        ImGui::Spacing();
+        bool visible = !sp.hidden;
+        if (ImGui::Checkbox("Visible", &visible)) toggleSplatHidden(i);
+        ImGui::SameLine();
+        if (ImGui::Button("Reset")) { pushSplatUndo(i); std::memcpy(sp.pivot, sp.pivot0, 64); applySplat(i); }
+        ImGui::SameLine();
+        if (ImGui::Button(isolating ? "Show All" : "Only This")) toggleIsolate();
+        ImGui::SameLine();
+        pushDanger();
+        if (ImGui::Button("Delete")) deleteSplat(i);
+        ImGui::PopStyleColor(3);
+    }
+    // Save or Send with more splats than the headset draws smoothly: asked first (true: go on).
+    bool splatBudgetOk(const char* what) {
+        const size_t total = splatTotal();
+        if (total <= kSplatsMost || testing) return true;
+        return platform::ask("Frame Studio", withCommas(total) + " splats are more than the Steam Frame draws smoothly (a million at most, 400,000 at its full "
+                             "frame rate).\n\n" + what + " it anyway?", false, platform::Icon::Warning) == platform::Answer::Yes;
+    }
+
     // ── Per frame ──
 
-    void renderViewport() {
-        rendered = false;
+    // The 3D view's image at the viewport's size (Settings: its resolution). Done before the UI, which draws it.
+    bool sizeViewport() {
         const uint32_t w = static_cast<uint32_t>(std::max(0.0f, viewSize.x * studioPerf.viewScale)),
-                       h = static_cast<uint32_t>(std::max(0.0f, viewSize.y * studioPerf.viewScale));   // Settings: viewport resolution
-        if (!scene || w < 8 || h < 8) return;
+                       h = static_cast<uint32_t>(std::max(0.0f, viewSize.y * studioPerf.viewScale));
+        if (!scene || w < 8 || h < 8) return false;
         if (w != viewW || h != viewH) {
             renderer.resize(w, h);
+            viewHasFrame = false;
             if (viewTex) ImGui_ImplVulkan_RemoveTexture(viewTex);
             viewTex = ImGui_ImplVulkan_AddTexture(viewSampler, renderer.layerView(0), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
             viewW = w;
             viewH = h;
         }
+        return true;
+    }
+
+    // The frame loop calls it after the UI (resize false: the UI has drawn the image as sized), so the camera and
+    // gizmo moves the UI just made show this frame, not the next one.
+    void renderViewport(bool resize = true) {
+        rendered = false;
+        if (resize ? !sizeViewport() : (!scene || viewW < 8 || viewH < 8 || !viewTex)) return;
+        const uint32_t w = viewW, h = viewH;
         const float ty = std::tan(kFovY * 0.5f), tx = ty * w / h;
         float pose[16], view[16];
         cam.pose(pose);
@@ -3892,7 +5006,7 @@ struct Studio {
                     animTime = std::fmod(animTime, animLength);
                 }
             }
-            if (scene->animate && !scene->animatedMeshes.empty()) scene->animate(animTime, scene->meshes);
+            if (scene->animate && !scene->animatedMeshes.empty() && !walkJob) scene->animate(animTime, scene->meshes);   // (a walk bake reads the meshes)
         }
         // Clay / glTF loops are baked on the CPU above. HSL shaders (water, flipbooks, VAT, sway) and rigs read the
         // clock the way the headset does, never wrapping: wrapping it made every shader animation jump each loop.
@@ -3900,6 +5014,7 @@ struct Studio {
         // Smoothed cost of the 3D frame (includes waiting for the previous one on the GPU).
         renderMs = renderMs * 0.9f + 0.1f * std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - r0).count();
         rendered = true;
+        viewHasFrame = true;
     }
 
     void shortcuts() {
@@ -3917,6 +5032,11 @@ struct Studio {
         if (ImGuizmo::IsUsingAny() || gizmoWasUsing || ImGui::IsAnyItemActive()) return;
         if (ctrl && !shift && ImGui::IsKeyPressed(ImGuiKey_Z)) step(undo, redo);
         if ((ctrl && shift && ImGui::IsKeyPressed(ImGuiKey_Z)) || (ctrl && ImGui::IsKeyPressed(ImGuiKey_Y))) step(redo, undo);
+        // Copy, cut, paste, duplicate (never while typing: a text field has the keys then, see above)
+        if (ctrl && !shift && !alt && ImGui::IsKeyPressed(ImGuiKey_C, false)) copySelection(false);
+        if (ctrl && !shift && !alt && ImGui::IsKeyPressed(ImGuiKey_X, false)) copySelection(true);
+        if (ctrl && !shift && !alt && ImGui::IsKeyPressed(ImGuiKey_V, false)) pasteClipboard();
+        if (ctrl && !shift && !alt && ImGui::IsKeyPressed(ImGuiKey_D, false)) duplicateSelection();
         // Blender's numpad views (Ctrl: from the opposite side)
         if (scene && ImGui::IsKeyPressed(ImGuiKey_Keypad1, false)) viewFrom(ctrl ? kPi : 0, 0);
         if (scene && ImGui::IsKeyPressed(ImGuiKey_Keypad3, false)) viewFrom(ctrl ? -kPi * 0.5f : kPi * 0.5f, 0);
@@ -3926,7 +5046,7 @@ struct Studio {
         if (ImGui::IsKeyPressed(ImGuiKey_T, false)) showToolbar = !showToolbar;
         if (!scene) return;
         if (shift && ImGui::IsKeyPressed(ImGuiKey_A, false)) { ImGui::OpenPopup("##addAtMouse"); return; }
-        if (alt && ImGui::IsKeyPressed(ImGuiKey_A, false)) { selected = -1; wKind = wIndex = -1; }
+        if (alt && ImGui::IsKeyPressed(ImGuiKey_A, false)) { selected = splatSel = -1; wKind = wIndex = -1; }
         if (ImGui::IsKeyPressed(ImGuiKey_Space, false)) animPlaying = !animPlaying;
         if (shift && ImGui::IsKeyPressed(ImGuiKey_LeftArrow, false)) { animTime = 0; animTick = std::chrono::steady_clock::now(); }
         if (shift && ImGui::IsKeyPressed(ImGuiKey_RightArrow, false)) { animTime = animLength; animTick = std::chrono::steady_clock::now(); }
@@ -3937,17 +5057,17 @@ struct Studio {
         if (tool == Tool::DrawFloor && ImGui::IsKeyPressed(ImGuiKey_LeftBracket)) floorBrush = std::max(0.05f, floorBrush / 1.25f);
         if (tool == Tool::DrawFloor && ImGui::IsKeyPressed(ImGuiKey_RightBracket)) floorBrush = std::min(5.0f, floorBrush * 1.25f);
         // X asks first (Blender's "OK? Delete"); Delete deletes
-        if (ImGui::IsKeyPressed(ImGuiKey_X, false) && (selected >= 0 || wKind >= 0)) ImGui::OpenPopup("##deleteAsk");
+        if (ImGui::IsKeyPressed(ImGuiKey_X, false) && (selected >= 0 || wKind >= 0 || splatSel >= 0)) ImGui::OpenPopup("##deleteAsk");
         if (ImGui::IsKeyPressed(ImGuiKey_Delete, false)) { if (wKind >= 0) deleteWorld(); else deleteSelected(); }
         if (ImGui::IsKeyPressed(ImGuiKey_W, false)) showWorld = !showWorld;
         if (ImGui::IsKeyPressed(ImGuiKey_I, false) || ImGui::IsKeyPressed(ImGuiKey_KeypadDivide, false)) toggleIsolate();
-        if (ImGui::IsKeyPressed(ImGuiKey_H, false)) { if (alt) unhideAll(); else if (selected >= 0) toggleHidden(selected); }
+        if (ImGui::IsKeyPressed(ImGuiKey_H, false)) { if (alt) unhideAll(); else if (selected >= 0) toggleHidden(selected); else if (splatSel >= 0) toggleSplatHidden(splatSel); }
         if (ImGui::IsKeyPressed(ImGuiKey_F, false) || ImGui::IsKeyPressed(ImGuiKey_KeypadDecimal, false)) { if (wKind >= 0) frameWorld(wKind, wIndex); else frameSelected(); }
         if (ImGui::IsKeyPressed(ImGuiKey_Home, false)) frameAll();
         if (ImGui::IsKeyPressed(ImGuiKey_Keypad0, false) || ImGui::IsKeyPressed(ImGuiKey_P, false)) cam.playerView();
         if (ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
             if (isolating) toggleIsolate();
-            selected = -1; wKind = wIndex = -1;
+            selected = splatSel = -1; wKind = wIndex = -1;
         }
     }
 
@@ -4210,6 +5330,26 @@ struct Studio {
         if (ImGui::MenuItem(objects[i].hidden ? "Unhide" : "Hide", "H")) toggleHidden(i);
         if (ImGui::MenuItem(isolating ? "Show All" : "Show Only This", "I")) { selected = static_cast<int>(i); wKind = wIndex = -1; toggleIsolate(); }
         if (ImGui::MenuItem("Delete", "X")) { selected = static_cast<int>(i); wKind = wIndex = -1; deleteSelected(); }
+        ImGui::Separator();
+        clipItems();
+    }
+    // A world item's right-click menu (the viewport, the explorer): the selected one.
+    void worldItemMenu() {
+        if (!scene || wKind < 0 || wIndex < 0 || wIndex >= worldCount(wKind)) { clipItems(); return; }
+        ImGui::TextUnformatted(worldName(wKind, wIndex).c_str());
+        ImGui::Separator();
+        if (ImGui::MenuItem("Frame", "F")) frameWorld(wKind, wIndex);
+        if (ImGui::MenuItem("Delete", "Delete")) deleteWorld();
+        ImGui::Separator();
+        clipItems();
+    }
+    // Copy / Cut / Paste / Duplicate (Edit menu, right-click menus): on what's selected.
+    void clipItems() {
+        const bool can = canCopy();
+        if (ImGui::MenuItem("Copy", "Ctrl+C", false, can)) copySelection(false);
+        if (ImGui::MenuItem("Cut", "Ctrl+X", false, can)) copySelection(true);
+        if (ImGui::MenuItem("Paste", "Ctrl+V", false, canPaste())) pasteClipboard();
+        if (ImGui::MenuItem("Duplicate", "Ctrl+D", false, can && canPaste())) duplicateSelection();
     }
 
     // ── Files: everything inside the open home's files, by what each thing was. Meta's homes keep each file as it
@@ -4334,7 +5474,7 @@ struct Studio {
             describe(path, folders, f);
             FileDir* d = &dir;
             for (const auto& fo : folders) d = &d->dirs[fo];
-            if (depth < 2 && isArchiveName(f.name) && st.m_uncomp_size < (1ull << 31)) {
+            if (depth < 2 && isArchiveName(f.name) && st.m_uncomp_size < (1ull << 29)) {   // (its declared size is allocated: 512 MB at most)
                 std::vector<uint8_t> bytes(static_cast<size_t>(st.m_uncomp_size));
                 mz_zip_archive in = {};
                 if (mz_zip_reader_extract_to_mem(&z, i, bytes.data(), bytes.size(), 0) && mz_zip_reader_init_mem(&in, bytes.data(), bytes.size(), 0)) {
@@ -4361,7 +5501,7 @@ struct Studio {
         { std::lock_guard<std::mutex> l(filesMutex); fileTrees.clear(); }
         filesReader = std::thread([this, paths = homePaths, key] {
             std::vector<FileTree> trees;
-            for (const auto& p : paths) {
+            for (const auto& p : paths) try {   // (a damaged archive's sizes running memory out: that file isn't listed)
                 FileTree t;
                 t.file = p;
                 mz_zip_archive z = {};
@@ -4377,7 +5517,7 @@ struct Studio {
                 }
                 tally(t.root);
                 trees.push_back(std::move(t));
-            }
+            } catch (const std::exception&) {}
             std::lock_guard<std::mutex> l(filesMutex);
             if (filesFor == key) fileTrees = std::move(trees);
             filesBusy = false;
@@ -4544,7 +5684,7 @@ struct Studio {
         ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(0, 0));
         std::string f = filter;
         for (char& c : f) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-        if (!scene || objects.empty()) {
+        if (!scene || (objects.empty() && splatItems.empty())) {
             ImGui::SetCursorPos(ImVec2(10 * scale, 8 * scale));
             ImGui::TextDisabled(scene ? "Loading…" : "No home open");
         }
@@ -4577,7 +5717,12 @@ struct Studio {
             const ImVec2 p = ImGui::GetCursorScreenPos();
             const float w = ImGui::GetContentRegionAvail().x;
             ImDrawList* dl = ImGui::GetWindowDrawList();
-            dl->AddRectFilled(p, ImVec2(p.x + w, p.y + h), col(strong ? 0x202020 : 0x262626));
+            // a colour for each level of nesting (so a folder's insides read apart from its neighbours): its icon, and
+            // a wash of it over the theme's panel behind the row
+            static const uint32_t kFolderTint[4] = {0xe0a83a, 0x3fb8a6, 0x5b8ef0, 0xe0708f};   // amber, teal, blue, rose
+            const uint32_t tint = kFolderTint[depth & 3];
+            dl->AddRectFilled(p, ImVec2(p.x + w, p.y + h), col(mix(kList, tint, strong ? 0.16f : 0.10f)));
+            dl->AddRectFilled(p, ImVec2(p.x + 2 * scale, p.y + h), col(tint, 0.8f));   // its colour down the left edge
             ImGui::SetCursorScreenPos(p);
             if (ImGui::Selectable("##hdr", false, ImGuiSelectableFlags_AllowOverlap, ImVec2(w, h)) && f.empty()) {
                 if (open) collapsed.insert(key); else collapsed.erase(key);
@@ -4592,18 +5737,20 @@ struct Studio {
             if (open) dl->AddTriangleFilled(ImVec2(x - a, cy - a * 0.6f), ImVec2(x + a, cy - a * 0.6f), ImVec2(x, cy + a * 0.8f), col(kDim));
             else dl->AddTriangleFilled(ImVec2(x - a * 0.6f, cy - a), ImVec2(x - a * 0.6f, cy + a), ImVec2(x + a * 0.8f, cy), col(kDim));
             const float ty = p.y + (h - ImGui::GetTextLineHeight()) * 0.5f;
-            {   // folder: a tab and a body, open folders drawn hollow
+            {   // folder: a tab and a body in its colour; open ones a lighter body with the outline in the colour
                 const float fx = x + 11 * scale, fw = 13 * scale, fh = 9 * scale, fy = cy - fh * 0.5f + 1 * scale;
-                const ImU32 fc = col(strong ? 0xd9a441 : 0xb98f45);
+                const ImU32 fc = col(tint, strong ? 1.0f : 0.85f);
                 dl->AddRectFilled(ImVec2(fx, fy - 2 * scale), ImVec2(fx + fw * 0.45f, fy + 1 * scale), fc, 1.5f * scale);
-                if (open) dl->AddRect(ImVec2(fx, fy), ImVec2(fx + fw, fy + fh), fc, 1.5f * scale, 0, 1.3f * scale);
-                else dl->AddRectFilled(ImVec2(fx, fy), ImVec2(fx + fw, fy + fh), fc, 1.5f * scale);
+                if (open) {
+                    dl->AddRectFilled(ImVec2(fx, fy), ImVec2(fx + fw, fy + fh), col(tint, 0.35f), 1.5f * scale);
+                    dl->AddRect(ImVec2(fx, fy), ImVec2(fx + fw, fy + fh), fc, 1.5f * scale, 0, 1.3f * scale);
+                } else dl->AddRectFilled(ImVec2(fx, fy), ImVec2(fx + fw, fy + fh), fc, 1.5f * scale);
             }
             const std::string count = std::to_string(members.size());
             const ImVec2 cs = ImGui::CalcTextSize(count.c_str());
             // Long folder names stop before the count and the eye instead of running under them.
             dl->PushClipRect(p, ImVec2(p.x + w - h - cs.x - 16 * scale, p.y + h), true);
-            dl->AddText(ImVec2(x + 30 * scale, ty), col(strong ? kText : 0xc8c8c8), text.c_str());
+            dl->AddText(ImVec2(x + 30 * scale, ty), col(strong ? kText : mix(kText, kDim, 0.3f)), text.c_str());
             dl->PopClipRect();
             dl->AddText(ImVec2(p.x + w - h - cs.x - 10 * scale, ty), col(kDim), count.c_str());
             bool anyShown = false;
@@ -4662,6 +5809,8 @@ struct Studio {
         // Footprint / Vista  >  the folders of the file, as it's laid out (or by kind: Architecture, Furniture & Props,
         // Plants, Lights & Glow, Terrain & Water, Sky)  >  objects
         const int sources = scene ? static_cast<int>(scene->apkPaths.size()) : 0;
+        int meshSources = 0;                // (splat files have no meshes: no header of their own for them)
+        for (int i = 0; i < sources; ++i) meshSources += i >= static_cast<int>(scene->sources.size()) || scene->sources[i].role != "Splats";
         // The file's own folders: each folder's subfolders, then its objects, in the order the file has them.
         std::function<void(const std::vector<size_t>&, size_t, int, const std::string&)> layoutTree =
             [&](const std::vector<size_t>& members, size_t level, int depth, const std::string& keyPath) {
@@ -4686,10 +5835,13 @@ struct Studio {
             for (size_t i = 0; i < objects.size(); ++i) if (objects[i].source == src && matches(objects[i])) inSource.push_back(i);
             if (inSource.empty()) continue;
             int depth = 0;
-            if (sources > 1) {
-                const std::string title = std::string(src == 0 ? "Footprint · " : "Vista · ") +
-                                          prettyHome(scene->apkPaths[src]);
-                if (!header(1000 + src, title, 0, inSource, true)) continue;
+            if (meshSources > 1) {
+                const bool sky = isSkyPanoramaPath(scene->apkPaths[src]);
+                const std::string title = sky ? "Sky · " + skyPanoramaName(scene->apkPaths[src])
+                                              : std::string(src == 0 ? "Footprint · " : "Vista · ") + prettyHome(scene->apkPaths[src]);
+                // (header keys: sources 0x20000000 +, their kinds 0x10000000 +, apart from the World's 2000s, Files'
+                // 3001 and the hashed folders, however many sources there are)
+                if (!header(0x20000000 + src, title, 0, inSource, true)) continue;
                 depth = 1;
             }
             if (byFileLayout) { layoutTree(inSource, 0, depth, std::to_string(src)); continue; }
@@ -4697,7 +5849,7 @@ struct Studio {
                 std::vector<size_t> members;
                 for (size_t i : inSource) if (objects[i].category == cat) members.push_back(i);
                 if (members.empty()) continue;
-                if (!header(src * 100 + cat, kCategoryNames[cat], depth, members, false)) continue;
+                if (!header(0x10000000 + src * 256 + cat, kCategoryNames[cat], depth, members, false)) continue;
                 // Repeated objects (LightFixtureB, B2, B3...; plantBB10_7_INST, _13_INST(1)...) share a folder.
                 std::map<std::string, std::vector<size_t>> fam;
                 std::vector<std::string> order;
@@ -4715,8 +5867,9 @@ struct Studio {
                 }
             }
         }
+        if (scene && !splatItems.empty()) splatRows(f, h);
         // World: the home's spawns, seats, hotspots and walls (Studio's own format, from Meta's when converted).
-        if (scene && !objects.empty()) {
+        if (scene && (!objects.empty() || !splatItems.empty())) {
             int total = 0;
             for (int k = 0; k < kWorldKinds; ++k) total += worldCount(k);
             const ImVec2 p = ImGui::GetCursorScreenPos();
@@ -4764,6 +5917,11 @@ struct Studio {
                                 wKind = k; wIndex = i; selected = -1;
                                 if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) frameWorld(k, i);
                             }
+                            if (ImGui::BeginPopupContextItem("##wrowmenu")) {
+                                if (!sel) { wKind = k; wIndex = i; selected = splatSel = -1; }
+                                worldItemMenu();
+                                ImGui::EndPopup();
+                            }
                             hdl->PushClipRect(rp, ImVec2(rp.x + w - h - 6 * scale, rp.y + h), true);
                             hdl->AddText(ImVec2(rp.x + 40 * scale, rp.y + (h - ImGui::GetTextLineHeight()) * 0.5f),
                                          col(hid && *hid ? kDim : sel ? 0xffffff : kText), worldName(k, i).c_str());
@@ -4784,7 +5942,7 @@ struct Studio {
                 }
             }
         }
-        if (scene && !objects.empty()) filesSection(h);
+        if (scene && (!objects.empty() || !splatItems.empty())) filesSection(h);
         ImGui::PopStyleVar();
         ImGui::EndChild();
         ImGui::PopStyleVar();
@@ -4863,7 +6021,7 @@ struct Studio {
     // ── The Inspector (right): the selection's and the environment's settings, one tab each ──
     enum class InspectorTab { Selection, World, Environment, Bundle, Headset };
     InspectorTab inspectorTab = InspectorTab::Selection;
-    int lastSelected = -1, lastWorldKind = -1, lastWorldIndex = -1;   // selecting something new shows its tab
+    int lastSelected = -1, lastWorldKind = -1, lastWorldIndex = -1, lastSplatSel = -1;   // selecting something new shows its tab
 
     // Angles read back from a transform come out as -0.0001, shown as "-0": within `half` of zero they're shown as 0.
     static void tidyZero(float* v, float half) { for (int k = 0; k < 3; ++k) if (std::fabs(v[k]) < half) v[k] = 0.0f; }
@@ -4882,48 +6040,65 @@ struct Studio {
         ImGui::SetNextItemWidth(-1);
     }
 
-    // Properties: the tabs down its left edge as icons (Blender's), the chosen tab's panels beside them.
+    // Buttons side by side at their own width, as the Object tab lays out its row; one that doesn't fit on the line
+    // starts the next. A row's first button passes first (it starts a new line).
+    bool rowButton(const char* text, bool first = false) {
+        const ImGuiStyle& st = ImGui::GetStyle();
+        const float w = ImGui::CalcTextSize(text, nullptr, true).x + st.FramePadding.x * 2;
+        if (!first && ImGui::GetItemRectMax().x + st.ItemSpacing.x + w <= ImGui::GetWindowPos().x + ImGui::GetContentRegionMax().x) ImGui::SameLine();
+        return ImGui::Button(text);
+    }
+
+    // Properties: its tabs across the top, each its icon and name (the open one lit, a blue line under it), the
+    // chosen tab's panels under them. Too narrow for every name: the others show only their icon (hover names them).
     void inspector(float height) {
-        if (selected != lastSelected || wKind != lastWorldKind || wIndex != lastWorldIndex) {
-            if (selected >= 0 || wKind >= 0) inspectorTab = InspectorTab::Selection;
-            lastSelected = selected; lastWorldKind = wKind; lastWorldIndex = wIndex;
+        if (selected != lastSelected || wKind != lastWorldKind || wIndex != lastWorldIndex || splatSel != lastSplatSel) {
+            if (selected >= 0 || wKind >= 0 || splatSel >= 0) inspectorTab = InspectorTab::Selection;
+            lastSelected = selected; lastWorldKind = wKind; lastWorldIndex = wIndex; lastSplatSel = splatSel;
         }
-        static const struct { InspectorTab tab; ToolIcon icon; const char* tip; } kTabs[] = {
-            {InspectorTab::Selection, ToolIcon::Object, "Object: the object or world item you selected"},
-            {InspectorTab::World, ToolIcon::Walk, "World: where you can walk, the walkable area and its settings"},
-            {InspectorTab::Environment, ToolIcon::Scene, "Environment: its name, picture, sound, what it's made of, and its headset settings"},
-            {InspectorTab::Bundle, ToolIcon::Bundle, "Bundle: several environments packed into one file, to share or install together"},
-            {InspectorTab::Headset, ToolIcon::Headset, "Headset: send it to the Steam Frame, or install Frame Home there"},
+        static const struct { InspectorTab tab; ToolIcon icon; const char* name; const char* tip; } kTabs[] = {
+            {InspectorTab::Selection, ToolIcon::Object, "Object", "Object: the object or world item you selected"},
+            {InspectorTab::World, ToolIcon::Walk, "World", "World: where you can walk, the walkable area and its settings"},
+            {InspectorTab::Environment, ToolIcon::Scene, "Environment", "Environment: its name, picture, sound, what it's made of, and its headset settings"},
+            {InspectorTab::Bundle, ToolIcon::Bundle, "Bundle", "Bundle: several environments packed into one file, to share or install together"},
+            {InspectorTab::Headset, ToolIcon::Headset, "Headset", "Headset: send it to the Steam Frame, or install Frame Home there"},
         };
         forceInspectorTab = false;
-        const float colW = 34 * scale, side = 26 * scale;
+        const float side = 26 * scale, pad = 8 * scale, gap = 2 * scale, stripH = side + 8 * scale;
         ImGui::PushStyleColor(ImGuiCol_ChildBg, hex(kBar));
-        ImGui::BeginChild("tabs", ImVec2(colW, height), ImGuiChildFlags_None, ImGuiWindowFlags_NoScrollbar);
+        ImGui::BeginChild("tabs", ImVec2(0, stripH), ImGuiChildFlags_None, ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
         ImGui::PopStyleColor();
         ImDrawList* dl = ImGui::GetWindowDrawList();
-        ImGui::SetCursorPos(ImVec2((colW - side) * 0.5f, 6 * scale));
+        // As much as fits: icons and names, else names alone, else icons (the open tab keeps its name)
+        float names = 0;
+        for (const auto& t : kTabs) names += ImGui::CalcTextSize(t.name).x + pad * 2 + gap;
+        const float room = ImGui::GetContentRegionAvail().x - 8 * scale, iconsW = std::size(kTabs) * (side * 0.7f + 4 * scale);
+        const bool named = names <= room, withIcons = names + iconsW <= room;
+        const float lineH = ImGui::GetTextLineHeight();
+        ImGui::SetCursorPos(ImVec2(4 * scale, 4 * scale));
         for (const auto& t : kTabs) {
             ImGui::PushID(static_cast<int>(t.tab));
+            const bool on = inspectorTab == t.tab, label = named || on, icon = withIcons || !label;
+            const float iconW = icon ? side * 0.7f + (label ? 4 * scale : 0) : 0;
+            const float w = label ? pad + iconW + ImGui::CalcTextSize(t.name).x + pad : side;
             const ImVec2 p = ImGui::GetCursorScreenPos();
-            if (ImGui::InvisibleButton("##tab", ImVec2(side, side))) inspectorTab = t.tab;
-            const bool on = inspectorTab == t.tab, hot = ImGui::IsItemHovered();
+            if (ImGui::InvisibleButton("##tab", ImVec2(w, side))) inspectorTab = t.tab;
+            const bool hot = ImGui::IsItemHovered();
             if (on) {
-                dl->AddRectFilled(ImVec2(p.x - 3 * scale, p.y), ImVec2(p.x + side + (colW - side) * 0.5f + 1, p.y + side), col(kPanel), 5 * scale,
-                                  ImDrawFlags_RoundCornersLeft);
-                dl->AddRectFilled(ImVec2(p.x - 3 * scale, p.y + 3 * scale), ImVec2(p.x - 3 * scale + 2.5f * scale, p.y + side - 3 * scale), col(kBlue), 1);   // accent: which tab is open
-            } else if (hot) dl->AddRectFilled(p, ImVec2(p.x + side, p.y + side), col(kWidget), 5 * scale);
-            drawToolIcon(dl, t.icon, ImVec2(p.x + side * 0.5f, p.y + side * 0.5f), side * 0.6f, col(on ? kText : hot ? kText : kDim));
+                dl->AddRectFilled(p, ImVec2(p.x + w, p.y + side), col(kPanel), 5 * scale);
+                dl->AddRectFilled(ImVec2(p.x + 5 * scale, p.y + side - 2.5f * scale), ImVec2(p.x + w - 5 * scale, p.y + side), col(kBlue), 1);   // which tab is open
+            } else if (hot) dl->AddRectFilled(p, ImVec2(p.x + w, p.y + side), col(kWidget), 5 * scale);
+            const uint32_t c = on || hot ? kText : kDim;
+            if (icon) drawToolIcon(dl, t.icon, ImVec2(label ? p.x + pad + side * 0.35f : p.x + side * 0.5f, p.y + side * 0.5f), side * 0.6f, col(c));
+            if (label) dl->AddText(ImVec2(p.x + pad + iconW, p.y + (side - lineH) * 0.5f), col(c), t.name);
             if (hot) ImGui::SetTooltip("%s", t.tip);
             ImGui::PopID();
-            ImGui::SetCursorPosX((colW - side) * 0.5f);
-            ImGui::Dummy(ImVec2(0, 2 * scale));
+            ImGui::SameLine(0, gap);
         }
-        roundAreaBottom(4);
         ImGui::EndChild();
-        ImGui::SameLine(0, 0);
         ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(12 * scale, 8 * scale));
         ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(4 * scale, 3 * scale));
-        ImGui::BeginChild("inspectorBody", ImVec2(0, height), ImGuiChildFlags_AlwaysUseWindowPadding);
+        ImGui::BeginChild("inspectorBody", ImVec2(0, std::max(1.0f, height - stripH - ImGui::GetStyle().ItemSpacing.y)), ImGuiChildFlags_AlwaysUseWindowPadding);
         beginPanels();
         switch (inspectorTab) {
             case InspectorTab::Selection: selectionTab(); break;
@@ -5004,7 +6179,12 @@ struct Studio {
                     fieldLabel("Location"); moved |= ImGui::DragFloat3("##wloc", t, 0.01f, 0, 0, "%.2f m"); track();
                     fieldLabel("Rotation"); tidyZero(r, 0.001f); moved |= ImGui::DragFloat3("##wrot", r, 0.5f, 0, 0, "%.0f\u00b0"); track();
                     if (c.kind == WorldCollider::Mesh) { fieldLabel("Scale"); moved |= ImGui::DragFloat3("##wscl", sc, 0.01f, 0.01f, 1000.0f, "%.2f"); track(); }
-                    if (moved) ImGuizmo::RecomposeMatrixFromComponents(t, r, sc, c.world);
+                    if (moved) {
+                        float was[16];
+                        std::memcpy(was, c.world, 64);
+                        ImGuizmo::RecomposeMatrixFromComponents(t, r, sc, c.world);
+                        if (!finiteMatrix(c.world)) std::memcpy(c.world, was, 64);   // (typed "1e39" or "nan")
+                    }
                     if (c.kind == WorldCollider::Box) {
                         float size[3] = {c.half[0] * 2, c.half[1] * 2, c.half[2] * 2};
                         fieldLabel("Size");
@@ -5039,7 +6219,13 @@ struct Studio {
                 bool moved = false;
                 fieldLabel(g.kind == WorldGravity::Planet ? "Centre" : "Location"); moved |= ImGui::DragFloat3("##gloc", t, 0.01f, 0, 0, "%.2f m"); track();
                 if (g.kind != WorldGravity::Planet) { fieldLabel("Rotation"); tidyZero(r, 0.001f); moved |= ImGui::DragFloat3("##grot", r, 0.5f, 0, 0, "%.0f\u00b0"); track(); }
-                if (moved) { sc[0] = sc[1] = sc[2] = 1; ImGuizmo::RecomposeMatrixFromComponents(t, r, sc, g.world); }
+                if (moved) {
+                    float was[16];
+                    std::memcpy(was, g.world, 64);
+                    sc[0] = sc[1] = sc[2] = 1;
+                    ImGuizmo::RecomposeMatrixFromComponents(t, r, sc, g.world);
+                    if (!finiteMatrix(g.world)) std::memcpy(g.world, was, 64);   // (typed "1e39" or "nan")
+                }
                 if (g.kind == WorldGravity::Planet) { fieldLabel("Pull radius"); ImGui::DragFloat("##grad", &g.radius, 0.1f, 0.5f, 5000.0f, "%.1f m"); track(); }
                 else {
                     float size[3] = {g.half[0] * 2, g.half[1] * 2, g.half[2] * 2};
@@ -5084,22 +6270,26 @@ struct Studio {
             ImGuizmo::DecomposeMatrixToComponents(o.pivot, t, r, s);
             bool changed = false;
             bool done = false;              // a field let go: its surfaces split again if it turned
+            // One undo step per field, taken the first time its value really changes (a click alone leaves the
+            // history, and the unsaved mark, alone).
+            auto pivotField = [&](bool edited) {
+                if (ImGui::IsItemActivated()) { std::memcpy(fieldPivot, o.pivot, 64); fieldPivotPushed = false; }
+                if (edited && !fieldPivotPushed) { pushUndo(static_cast<size_t>(selected), fieldPivot); fieldPivotPushed = true; }
+                changed |= edited;
+                done |= ImGui::IsItemDeactivatedAfterEdit();
+            };
             fieldLabel("Location");
-            changed |= ImGui::DragFloat3("##loc", t, 0.01f, 0, 0, "%.3f m");
-            if (ImGui::IsItemActivated()) pushUndo(selected);
-            done |= ImGui::IsItemDeactivatedAfterEdit();
+            pivotField(ImGui::DragFloat3("##loc", t, 0.01f, 0, 0, "%.3f m"));
             fieldLabel("Rotation");
             tidyZero(r, 0.001f);
-            changed |= ImGui::DragFloat3("##rot", r, 0.5f, 0, 0, "%.1f\u00b0");
-            if (ImGui::IsItemActivated()) pushUndo(selected);
-            done |= ImGui::IsItemDeactivatedAfterEdit();
+            pivotField(ImGui::DragFloat3("##rot", r, 0.5f, 0, 0, "%.1f\u00b0"));
             fieldLabel("Scale");
-            changed |= ImGui::DragFloat3("##scl", s, 0.01f, 0.001f, 1000.0f, "%.3f");
-            if (ImGui::IsItemActivated()) pushUndo(selected);
-            done |= ImGui::IsItemDeactivatedAfterEdit();
+            pivotField(ImGui::DragFloat3("##scl", s, 0.01f, 0.001f, 1000.0f, "%.3f"));
             if (changed) {
+                float was[16];
+                std::memcpy(was, o.pivot, 64);
                 ImGuizmo::RecomposeMatrixFromComponents(t, r, s, o.pivot);
-                apply(o);
+                if (finiteMatrix(o.pivot)) apply(o); else std::memcpy(o.pivot, was, 64);   // (typed "1e39" or "nan")
             }
             if (done) transformDone(static_cast<size_t>(selected));
             // What this object is for the player: walk on it, bump into it, both, or neither. The buttons set it;
@@ -5184,6 +6374,8 @@ struct Studio {
             pushDanger();
             if (ImGui::Button("Delete")) deleteSelected();
             ImGui::PopStyleColor(3);
+        } else if (splatSel >= 0 && static_cast<size_t>(splatSel) < splatItems.size()) {
+            splatPanel();
         } else {
             ImGui::TextDisabled(scene ? "Nothing selected.\nClick an object in the 3D view or the Explorer." : "Open a home to start.");
         }
@@ -5220,6 +6412,26 @@ struct Studio {
                 ImGui::SameLine();
                 ImGui::TextDisabled("a view of it");
             }
+            fieldLabel("Sky");
+            {
+                const std::string sky = skyPanorama();
+                const bool locked = loadState == 1 || saving || (homePaths.size() == 1 && isFenvPath(homePaths[0]));
+                ImGui::BeginDisabled(locked);
+                if (ImGui::Button(sky.empty() ? "Choose Panorama…##envsky" : "Change…##envsky")) chooseSkyPanorama();
+                if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                    ImGui::SetTooltip(locked && !saving && loadState != 1 ? "A saved .fenv keeps its sky: open its original home to change it"
+                                                                         : "A 360° panorama (.hdr, .jpg or .png, twice as wide as it is tall) in place of the home's own sky");
+                if (!sky.empty()) {
+                    ImGui::SameLine();
+                    if (ImGui::Button("Remove##envsky")) setSkyPanorama("");
+                }
+                ImGui::EndDisabled();
+                ImGui::SameLine();
+                if (sky.empty()) ImGui::TextDisabled(homePaths.size() == 1 && isFenvPath(homePaths[0]) ? "as saved in it" : "the home's own");
+                else ImGui::TextDisabled("%s", skyPanoramaName(sky).c_str());
+            }
+            fieldLabel("Made with");
+            ImGui::TextDisabled("%s", envMadeWith.empty() ? "not saved yet (Frame Studio " FRAME_VERSION ")" : envMadeWith.c_str());
             ImGui::Spacing();
             ImGui::TextWrapped("%s", homeName.c_str());
             for (size_t i = 0; i < scene->sources.size(); ++i) {
@@ -5239,6 +6451,7 @@ struct Studio {
             const bool clay = scene->animate != nullptr;
             fieldLabel("Objects");
             ImGui::Text("%zu shown, %zu hidden, %zu deleted", live, hidden, deleted);
+            if (!splatItems.empty()) { fieldLabel("Splats"); ImGui::Text("%s in %zu objects", withCommas(splatTotal()).c_str(), splatItems.size()); }
             fieldLabel("Shaders");
             ImGui::Text(clay ? "built-in unlit (Clay)" : "%zu of the home's own", scene->programs.size());
             fieldLabel("Lighting");
@@ -5254,7 +6467,7 @@ struct Studio {
             ImGui::SameLine();
             ImGui::TextDisabled(dirty ? "unsaved changes" : "saved");
         } else {
-            if (ImGui::Button("Open Home\u2026", ImVec2(-1, 0))) openDialog();
+            if (ImGui::Button("Open Home\u2026")) openDialog();
             ImGui::TextDisabled("Or drop an .apk on the window.");
         }
 
@@ -5263,7 +6476,7 @@ struct Studio {
             section("WORLD SETTINGS");
             {
                 std::lock_guard<std::mutex> l(statusMutex);
-                if (tunedReady) { tunedReady = false; if (tunedResult != worldSettings) { worldSettings = tunedResult; dirty = true; updateTitle(); } }
+                if (tunedReady) { tunedReady = false; if (tuneGen == loadGen && tunedResult != worldSettings) { worldSettings = tunedResult; dirty = true; updateTitle(); } }
             }
             const WorldSettings was = worldSettings;
             ImGui::PushTextWrapPos(0);
@@ -5327,7 +6540,7 @@ struct Studio {
             ImGui::EndDisabled();
             {
                 std::lock_guard<std::mutex> l(statusMutex);
-                const std::string t = !tuneStatus.empty() ? tuneStatus : worldSettings.tuned;
+                const std::string t = !tuneStatus.empty() && tuneGen == loadGen ? tuneStatus : worldSettings.tuned;   // (another home's measuring isn't this one's)
                 if (!t.empty()) {
                     ImGui::PushTextWrapPos(0);
                     ImGui::TextDisabled("%s", t.c_str());
@@ -5366,7 +6579,7 @@ struct Studio {
         ImGui::Spacing();
         ImGui::BeginDisabled(!scene || sending);
         pushPrimary();
-        if (ImGui::Button(sending ? "Sending\u2026" : "Send to Frame", ImVec2(-1, ImGui::GetFrameHeight() * 1.4f))) sendToFrame();
+        if (ImGui::Button(sending ? "Sending\u2026###send" : "Send to Frame###send")) sendToFrame();
         ImGui::PopStyleColor(3);
         ImGui::EndDisabled();
         ImGui::PushTextWrapPos(0);
@@ -5393,8 +6606,8 @@ struct Studio {
     }
     static fs::path pcRoot() {
 #ifdef _WIN32
-        const char* l = std::getenv("LOCALAPPDATA");
-        return fs::u8path(l ? l : "") / L"Frame Home";
+        const wchar_t* l = _wgetenv(L"LOCALAPPDATA");   // (wide: the ANSI one isn't UTF-8, and u8path throws on a name like "José")
+        return fs::path(l ? l : L"") / L"Frame Home";
 #else
         const char* h = std::getenv("HOME");
         return fs::u8path(h ? h : "") / "frame-home";
@@ -5425,11 +6638,10 @@ struct Studio {
         const bool installed = pcInstalled();
         ImGui::BeginDisabled(pcBusy);
         if (!installed) pushPrimary();
-        if (ImGui::Button(pcBusy ? "Working\u2026###pcinst" : installed ? "Update Frame Home on This PC###pcinst" : "Install Frame Home on This PC###pcinst",
-                          ImVec2(-1, ImGui::GetFrameHeight() * (installed ? 1.0f : 1.4f))))
+        if (rowButton(pcBusy ? "Working\u2026###pcinst" : installed ? "Update Frame Home on This PC###pcinst" : "Install Frame Home on This PC###pcinst", true))
             pcInstall(false);
         if (!installed) ImGui::PopStyleColor(3);
-        if (installed && ImGui::Button("Remove from This PC", ImVec2(-1, 0))) pcInstall(true);
+        if (installed && rowButton("Remove from This PC")) pcInstall(true);
         ImGui::EndDisabled();
         std::string st;
         { std::lock_guard<std::mutex> l(statusMutex); st = pcStatus; }
@@ -5965,7 +7177,7 @@ struct Studio {
                                   io.MousePos.x >= viewPos.x && io.MousePos.x <= viewPos.x + viewSize.x;
         const bool hovered = overView && !overTimeline;
         dl->AddRectFilled(viewPos, end, col(kViewBg));
-        if (rendered && viewTex) dl->AddImage((ImTextureID)viewTex, viewPos, end);   // (a pointer on 64-bit Vulkan, an integer on 32-bit: as ImGui's backend casts it)
+        if (rendered && viewTex) { dl->AddImage((ImTextureID)viewTex, viewPos, end); viewDrawn = true; }   // (a pointer on 64-bit Vulkan, an integer on 32-bit: as ImGui's backend casts it)
 
         const float ty = std::tan(kFovY * 0.5f), tx = ty * std::max(1.0f, viewSize.x) / std::max(1.0f, viewSize.y);
         float pose[16], view[16], proj[16], viewProj[16];
@@ -5993,7 +7205,7 @@ struct Studio {
             const bool changed = ImGuizmo::Manipulate(view, proj, op, localSpace ? ImGuizmo::LOCAL : ImGuizmo::WORLD, worldM, nullptr, snap ? snapValues : nullptr);
             const bool using_ = ImGuizmo::IsUsing();
             if (using_ && !gizmoWasUsing) { pushWorldUndo(); dragBase = scene->world; }   // one undo step per drag, taken before it moves
-            if (changed) setWorldMatrix(wKind, wIndex, worldM);
+            if (changed && finiteMatrix(worldM)) setWorldMatrix(wKind, wIndex, worldM);
             if (!using_ && gizmoWasUsing && wKind == kCollider) {   // let go: overlapping placed surfaces become one (same undo step)
                 const int was = static_cast<int>(scene->world.colliders.size());
                 wIndex = combineTouching(wIndex);
@@ -6016,13 +7228,16 @@ struct Studio {
                                          tool == Tool::Rotate ? 15.0f : tool == Tool::Scale ? 0.1f : 0.25f};
             ImGuizmo::Enable(gizmoAllowed || ImGuizmo::IsUsing());
             gizmoShown = true;
-            if (ImGuizmo::Manipulate(view, proj, op, localSpace ? ImGuizmo::LOCAL : ImGuizmo::WORLD, o.pivot, nullptr, snap ? snapValues : nullptr))
-                apply(o);
+            if (ImGuizmo::Manipulate(view, proj, op, localSpace ? ImGuizmo::LOCAL : ImGuizmo::WORLD, o.pivot, nullptr, snap ? snapValues : nullptr)) {
+                if (finiteMatrix(o.pivot)) apply(o); else std::memcpy(o.pivot, before, 64);
+            }
             const bool using_ = ImGuizmo::IsUsing();
             if (using_ && !gizmoWasUsing) pushUndo(selected, before);     // one undo step per drag
             if (!using_ && gizmoWasUsing) transformDone(static_cast<size_t>(selected));
             gizmoWasUsing = using_;
             overGizmo = ImGuizmo::IsOver() || using_;
+        } else if (scene && splatSel >= 0 && splatShown(static_cast<size_t>(splatSel)) && tool != Tool::DrawFloor) {
+            splatGizmo(dl, view, proj, gizmoAllowed, gizmoShown, overGizmo);
         }
         if (!gizmoShown && gizmoWasUsing) {   // the selection went away mid-drag: end the drag, don't carry it over
             ImGuizmo::Enable(false);
@@ -6037,6 +7252,7 @@ struct Studio {
             renderer.setSelection(show ? static_cast<int>(objects[selected].mesh) : -1);
         }
         if (scene) drawWorld(dl, viewProj);
+        if (scene && splatSel >= 0) drawSplatBox(dl, static_cast<size_t>(splatSel));
         const bool navGizmo = scene && drawAxes(dl, view);   // the navigation gizmo took the mouse: don't also orbit the view
         if (scene && isolating) {   // say why everything else vanished, and how to get it back
             const char* msg = "Showing only the selection  \u00b7  I or Esc shows everything";
@@ -6097,14 +7313,32 @@ struct Studio {
         if (rArmed && ImGui::IsMouseReleased(ImGuiMouseButton_Right)) {
             rArmed = false;
             if (rMoved < 5 * scale) {
-                const int hit = pick(io.MousePos.x, io.MousePos.y);
-                if (hit >= 0) { selected = menuObject = hit; wKind = wIndex = -1; ImGui::OpenPopup("##objmenu"); }
+                int wk = -1, wi = -1;
+                float wh[3];
+                if (scene && worldUnder(io.MousePos.x, io.MousePos.y, viewProj, wk, wi, wh)) {   // a world item's marker or shape
+                    wKind = wk; wIndex = wi; selected = splatSel = -1;
+                    ImGui::OpenPopup("##worldmenu");
+                } else {
+                    const int hit = pick(io.MousePos.x, io.MousePos.y);
+                    if (hit >= 0) { selected = menuObject = hit; wKind = wIndex = -1; ImGui::OpenPopup("##objmenu"); }
+                    else if (scene) ImGui::OpenPopup("##viewmenu");                                  // nothing there: paste
+                }
             }
         }
         objMenuOpen = false;
         if (ImGui::BeginPopup("##objmenu")) {
             objMenuOpen = true;
             if (menuObject >= 0 && menuObject < static_cast<int>(objects.size())) objectMenu(static_cast<size_t>(menuObject));
+            ImGui::EndPopup();
+        }
+        if (ImGui::BeginPopup("##worldmenu")) {
+            objMenuOpen = true;
+            worldItemMenu();
+            ImGui::EndPopup();
+        }
+        if (ImGui::BeginPopup("##viewmenu")) {
+            objMenuOpen = true;
+            clipItems();
             ImGui::EndPopup();
         }
 
@@ -6131,15 +7365,16 @@ struct Studio {
             float ex[3];
             const WorldPoint* seat = wKind == kSeat ? worldPoint(kSeat, wIndex) : nullptr;
             if (seat) seatExitWorld(*seat, ex);
-            float hit[3];
             if (seat && screenOf(ex, hs) && std::hypot(hs.x - io.MousePos.x, hs.y - io.MousePos.y) < 12 * scale) {
                 itemDrag = kDragExit; dragIndex = wIndex; dragY = ex[1];
             } else {
                 int k, i;
                 float grab[3];
+                // Only what's already selected moves: a first click selects (below), so picking something can't
+                // shove it, or a big mesh behind it, by a few pixels.
                 if (worldUnder(io.MousePos.x, io.MousePos.y, viewProj, k, i, grab)) {   // (the click below selects; this arms a drag)
                     float m[16];
-                    if (worldMatrix(k, i, m)) {                         // the point grabbed stays under the mouse
+                    if (k == wKind && i == wIndex && worldMatrix(k, i, m)) {   // the point grabbed stays under the mouse
                         itemDrag = kDragWorld; dragKindW = k; dragIndex = i; dragY = grab[1];
                         dragGrab[0] = m[12] - grab[0]; dragGrab[1] = m[14] - grab[2];
                     }
@@ -6147,7 +7382,7 @@ struct Studio {
                     long tri = -1;
                     float on[3];
                     const int o = pick(io.MousePos.x, io.MousePos.y);
-                    if (o >= 0 && pickOn(o, io.MousePos.x, io.MousePos.y, on, &tri)) {
+                    if (o >= 0 && o == selected && wKind < 0 && pickOn(o, io.MousePos.x, io.MousePos.y, on, &tri)) {
                         itemDrag = kDragObject; dragIndex = o; dragY = on[1];
                         dragGrab[0] = objects[o].pivot[12] - on[0]; dragGrab[1] = objects[o].pivot[14] - on[2];
                     }
@@ -6155,7 +7390,7 @@ struct Studio {
             }
         }
         if (itemDrag != kDragNone && ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
-            if (!dragMoved && std::hypot(io.MousePos.x - dragFrom.x, io.MousePos.y - dragFrom.y) > 5 * scale) {
+            if (!dragMoved && std::hypot(io.MousePos.x - dragFrom.x, io.MousePos.y - dragFrom.y) > 8 * scale) {
                 dragMoved = true;
                 clickArmed = false;                                    // a drag, not a click
                 if (itemDrag == kDragObject) { pushUndo(dragIndex); selected = dragIndex; wKind = wIndex = -1; }
@@ -6212,9 +7447,9 @@ struct Studio {
         if (clickArmed && ImGui::IsMouseReleased(ImGuiMouseButton_Left)) {
             clickArmed = false;
             const float dx = io.MousePos.x - clickPos.x, dy = io.MousePos.y - clickPos.y;
-            if (dx * dx + dy * dy < 25 * scale * scale) {
+            if (dx * dx + dy * dy < 64 * scale * scale) {   // (as far as an item drag waits before it moves)
                 const auto p0 = std::chrono::steady_clock::now();
-                if (!pickWorld(io.MousePos.x, io.MousePos.y, viewProj)) { wKind = wIndex = -1; selected = pick(io.MousePos.x, io.MousePos.y); }
+                if (!pickWorld(io.MousePos.x, io.MousePos.y, viewProj)) { wKind = wIndex = -1; pickSelect(io.MousePos.x, io.MousePos.y); }
                 const double pms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - p0).count();
                 if (pms > 3.0) std::fprintf(stderr, "[studio] pick took %.1f ms\n", pms);
             }
@@ -6426,6 +7661,11 @@ struct Studio {
             if (ImGui::MenuItem("Menu Search", "F3")) openSearch();
             ImGui::Separator();
             if (ImGui::MenuItem("Check for Updates…")) { showUpdate = true; updates.check(); }
+            ImGui::Separator();
+            if (ImGui::MenuItem("Join the Discord")) platform::openPath(kDiscordUrl);
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Help, bug reports, feature requests and what people have made\n%s", kDiscordUrl);
+            ImGui::Separator();
+            ImGui::TextDisabled("Frame Studio %s", FRAME_VERSION);
             ImGui::EndMenu();
         }
         // The workspace tabs: the active one raised like Blender's
@@ -6443,6 +7683,7 @@ struct Studio {
             ImDrawList* dl = ImGui::GetWindowDrawList();
             const ImVec2 a = ImGui::GetItemRectMin(), b = ImGui::GetItemRectMax();
             if (on || hot) dl->AddRectFilled(a, b, col(on ? kPanel : kHeader), 4 * scale);
+            if (on) dl->AddRectFilled(ImVec2(a.x + 5 * scale, b.y - 2.5f * scale), ImVec2(b.x - 5 * scale, b.y), col(kBlue), 1);   // the one open
             dl->AddText(ImVec2(a.x + (bw - ts.x) * 0.5f, a.y + (bh - ts.y) * 0.5f), col(on ? 0xffffff : kDim), kWorkspaceName[w]);
             ImGui::SameLine(0, 2 * scale);
         }
@@ -6537,7 +7778,9 @@ struct Studio {
         if (ImGui::BeginMenu("Import")) {
             if (ImGui::MenuItem("Vista\u2026", nullptr, false, scene != nullptr && homePaths.size() == 1)) addVistaDialog();
             if (ImGui::IsItemHovered()) ImGui::SetTooltip("The world outside a footprint: its lighting, sky and scenery");
-            if (ImGui::MenuItem("Models (.glb .gltf .fbx .obj)\u2026", nullptr, false, scene != nullptr && !uploading)) importModelDialog();
+            if (ImGui::MenuItem("Models (.glb .gltf .fbx .obj .stl .ply)\u2026", nullptr, false, scene != nullptr && !uploading)) importModelDialog();
+            if (ImGui::MenuItem("Gaussian Splats (.ply .splat .spz)\u2026", nullptr, false, scene != nullptr && !uploading)) importModelDialog(true);
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("A 3D capture of a real place or thing (Polycam, Luma, Scaniverse, Postshot, SuperSplat)");
             ImGui::EndMenu();
         }
         if (ImGui::BeginMenu("Bundle")) { bundleMenuItems(); ImGui::EndMenu(); }
@@ -6565,6 +7808,8 @@ struct Studio {
         if (!ImGui::BeginMenu("Edit")) return;
         if (ImGui::MenuItem("Undo", "Ctrl+Z", false, !undo.empty())) step(undo, redo);
         if (ImGui::MenuItem("Redo", "Ctrl+Shift+Z", false, !redo.empty())) step(redo, undo);
+        ImGui::Separator();
+        clipItems();
         ImGui::Separator();
         if (ImGui::MenuItem("Menu Search\u2026", "F3")) openSearch();
         ImGui::Separator();
@@ -6644,8 +7889,8 @@ struct Studio {
     }
 
     void selectMenu() {
-        if (ImGui::MenuItem("None", "Alt+A", false, selected >= 0 || wKind >= 0)) { selected = -1; wKind = wIndex = -1; }
-        if (ImGui::MenuItem("Hide Selected", "H", false, selected >= 0)) toggleHidden(selected);
+        if (ImGui::MenuItem("None", "Alt+A", false, selected >= 0 || wKind >= 0 || splatSel >= 0)) { selected = splatSel = -1; wKind = wIndex = -1; }
+        if (ImGui::MenuItem("Hide Selected", "H", false, selected >= 0 || splatSel >= 0)) { if (selected >= 0) toggleHidden(selected); else toggleSplatHidden(splatSel); }
         if (ImGui::MenuItem("Reveal Hidden", "Alt+H", false, scene != nullptr)) unhideAll();
     }
 
@@ -6666,7 +7911,8 @@ struct Studio {
             ImGui::EndMenu();
         }
         ImGui::Separator();
-        if (ImGui::MenuItem("Models (.glb .gltf .fbx .obj)\u2026", nullptr, false, on && !uploading)) importModelDialog();
+        if (ImGui::MenuItem("Models (.glb .gltf .fbx .obj .stl .ply)\u2026", nullptr, false, on && !uploading)) importModelDialog();
+        if (ImGui::MenuItem("Gaussian Splats (.ply .splat .spz)\u2026", nullptr, false, on && !uploading)) importModelDialog(true);
         if (ImGui::MenuItem("Vista\u2026", nullptr, false, on && homePaths.size() == 1)) addVistaDialog();
     }
 
@@ -7310,15 +8556,17 @@ struct Studio {
             ImGui::TextDisabled("%s", what);
             ImGui::SameLine(0, 16 * scale);
         };
+        ImGui::TextDisabled("Frame Studio %s", FRAME_VERSION);   // which build this is, bottom left
+        ImGui::SameLine(0, 20 * scale);
         if (scene && tool == Tool::DrawFloor) { mouseHint(0, "Draw floor (Shift: erase)"); mouseHint(2, "Rotate View"); mouseHint(1, "Fly"); }
-        else if (scene) { mouseHint(0, "Select"); mouseHint(2, "Rotate View"); mouseHint(1, "Context Menu / Fly"); }
-        else ImGui::TextDisabled("Frame Studio");
+        else if (scene) { mouseHint(0, "Select (drag a selected item to move it)"); mouseHint(2, "Rotate View"); mouseHint(1, "Context Menu / Fly"); }
         std::string right;
         {
             std::string saveMsg;
             { std::lock_guard<std::mutex> l(statusMutex); saveMsg = saveStatus; }
             if (!saveMsg.empty()) right += saveMsg + "  |  ";
         }
+        if (!clipNote.empty() && std::chrono::steady_clock::now() - clipNoteAt < std::chrono::seconds(4)) right += clipNote + "  |  ";   // copy / paste
         if (scene) {
             size_t count = 0;
             for (const Object& o : objects) count += !o.deleted;
@@ -7337,6 +8585,8 @@ struct Studio {
     // The window, each frame: the top bar, the areas in their dockspace (or the 3D Viewport alone, maximized), the
     // status bar, then the floating windows and popups.
     void ui() {
+        freeRetiredThumbs();                        // (last frame, which may have drawn them, has been sent)
+        if (selected >= 0 || wKind >= 0 || (splatSel >= 0 && static_cast<size_t>(splatSel) >= splatItems.size())) splatSel = -1;
         shortcuts();
         topBar();
         ImGuiIO& io = ImGui::GetIO();
@@ -7426,6 +8676,7 @@ struct Studio {
     void startInstall(bool uninstall) {
         if (installing) return;
         if (saving) { setInstallStatus("Wait for the environment being saved to finish, then install."); return; }
+        if (sending) { setInstallStatus("Wait for the send to the headset to finish, then install."); return; }   // (it's copying the same file)
         saveHost();
         std::vector<std::string> envs;
         std::string openFenv;
@@ -7480,7 +8731,8 @@ struct Studio {
                     rc = run(ssh + L"\"stat -c %s frame-home/envs/" + name + L" 2>/dev/null || echo 0\"", L"", out);
                     std::error_code ec;
                     const unsigned long long local = fs::file_size(f, ec);
-                    if (rc == 0 && std::strtoull(lastLine(out).c_str(), nullptr, 10) == local) continue;   // already there
+                    // already there (by size; the open home was just saved, and an edit can keep its size: always sent)
+                    if (rc == 0 && envs[i] != openFenv && std::strtoull(lastLine(out).c_str(), nullptr, 10) == local) continue;
                     char msg[256];
                     std::snprintf(msg, sizeof msg, "Copying %s (%zu of %zu, %.0f MB)\u2026", narrow(f.filename().wstring()).c_str(), i + 1, envs.size(), local / 1048576.0);
                     setInstallStatus(msg);
@@ -7545,9 +8797,9 @@ struct Studio {
         ImGui::Spacing();
         ImGui::Separator();
         pushPrimary();
-        if (ImGui::Button(installing ? "Installing\u2026" : "Install Frame Home", ImVec2(-1, ImGui::GetFrameHeight() * 1.4f))) startInstall(false);
+        if (rowButton(installing ? "Installing\u2026###install" : "Install Frame Home###install", true)) startInstall(false);
         ImGui::PopStyleColor(3);
-        if (ImGui::Button("Restore SteamVR's Environment", ImVec2(-1, 0))) startInstall(true);
+        if (rowButton("Restore SteamVR's Environment")) startInstall(true);
         ImGui::EndDisabled();
         ImGui::Spacing();
         ImGui::TextWrapped("%s", getInstallStatus().c_str());
@@ -7577,19 +8829,27 @@ struct Studio {
 
     void setBundleStatus(const std::string& s) { std::lock_guard<std::mutex> l(statusMutex); bundleStatus = s; }
 
-    // Thumbnails are GPU pictures: freed together, once the frames that drew them are done.
+    // Thumbnails are GPU pictures: freed together, once the frames that drew them are done. Not here: the frame
+    // being built may already have drawn them (the row's ✕, the self-test after the UI), so its draw list still
+    // names them. They're freed at the start of the next frame's UI, once that frame has been sent.
+    struct RetiredThumb { VkDescriptorSet set; VkImageView view; };
+    std::vector<RetiredThumb> retiredThumbs;
     void releaseBundleThumbs(std::vector<BundleMember>& members) {
-        bool any = false;
-        for (const auto& m : members) any |= m.thumbView != VK_NULL_HANDLE;
-        if (!any) return;
-        vkDeviceWaitIdle(renderer.device());
         for (auto& m : members) {
-            if (m.thumb) ImGui_ImplVulkan_RemoveTexture(m.thumb);
-            if (m.thumbView) renderer.releasePicture(m.thumbView);
+            if (m.thumb || m.thumbView) retiredThumbs.push_back({m.thumb, m.thumbView});
             m.thumb = VK_NULL_HANDLE;
             m.thumbView = VK_NULL_HANDLE;
             m.thumbAspect = 0;
         }
+    }
+    void freeRetiredThumbs() {
+        if (retiredThumbs.empty()) return;
+        vkDeviceWaitIdle(renderer.device());
+        for (const RetiredThumb& t : retiredThumbs) {
+            if (t.set) ImGui_ImplVulkan_RemoveTexture(t.set);
+            if (t.view) renderer.releasePicture(t.view);
+        }
+        retiredThumbs.clear();
     }
 
     // Its picture, read from the .fenv (or from inside the bundle) the first time the row is drawn, shrunk to 160 px.
@@ -7600,9 +8860,13 @@ struct Studio {
         const bool ok = m.member.empty() ? fenvReadManifest(m.path, fm, &png) : fenvBundleReadEnvironment(m.path, m.member, fm, &png);
         if (!ok || png.empty()) return;
         int w = 0, h = 0, c = 0;
+        // (someone else's file: a picture of absurd size is no thumbnail, rather than gigabytes decoded on the UI thread)
+        if (png.size() > 0x7fffffff || !stbi_info_from_memory(png.data(), static_cast<int>(png.size()), &w, &h, &c) || w <= 0 || h <= 0 ||
+            static_cast<uint64_t>(w) * static_cast<uint64_t>(h) > (uint64_t(1) << 26))
+            return;
         unsigned char* px = stbi_load_from_memory(png.data(), static_cast<int>(png.size()), &w, &h, &c, 4);
         if (!px) return;
-        const int tw = std::min(160, w), th = std::max(1, h * tw / std::max(1, w));
+        const int tw = std::min(160, w), th = static_cast<int>(std::max<int64_t>(1, static_cast<int64_t>(h) * tw / std::max(1, w)));
         std::vector<u8> scaled(static_cast<size_t>(tw) * th * 4);
         for (int y = 0; y < th; ++y)
             for (int x = 0; x < tw; ++x) {   // box filter over the source pixels each covers
@@ -7701,7 +8965,12 @@ struct Studio {
     }
 
     // The open environment as a .fenv: the file it was opened from or last saved to.
-    std::string openEnvFile() const { return openHomeIsFenv() ? homePaths[0] : envFile; }
+    std::string openEnvFile() const { return openHomeIsFenv() && !inBundleScratch(homePaths[0]) ? homePaths[0] : envFile; }
+    // A file in the scratch folder bundle members are unpacked into (not the user's: it's emptied when another opens).
+    bool inBundleScratch(const std::string& path) const {
+        const std::string rel = fs::path(widen(path)).lexically_normal().lexically_relative(bundleScratch().lexically_normal()).generic_u8string();
+        return !rel.empty() && rel != "." && rel.rfind("..", 0) != 0;
+    }
 
     void removeFromBundle(size_t i) {
         std::vector<BundleMember> gone(bundleMembers.begin() + static_cast<std::ptrdiff_t>(i), bundleMembers.begin() + static_cast<std::ptrdiff_t>(i) + 1);
@@ -7740,8 +9009,7 @@ struct Studio {
 
     void saveBundleDialog() {
         if (bundleBusy || bundleMembers.empty()) return;
-        std::string name = shownBundleName();
-        for (char& c : name) if (c == '+' || c == '/' || c == '\\' || c == ':') c = '-';
+        const std::string name = suggestedFileName(shownBundleName());
         const std::string path = platform::saveFile("Save the bundle", name + ".fbundle", {{"Environment bundle", {"*.fbundle"}}}, "fbundle");
         if (!path.empty()) saveBundle(path);
     }
@@ -7750,6 +9018,14 @@ struct Studio {
     // being replaced may be the one they're in).
     void saveBundle(const std::string& out) {
         if (bundleBusy || bundleMembers.empty()) return;
+        for (const auto& m : bundleMembers) {
+            std::error_code ec;
+            if (m.member.empty() && fs::equivalent(fs::path(widen(m.path)), fs::path(widen(out)), ec)) {
+                platform::message("Frame Studio", "The bundle can't be saved over " + narrow(fs::path(widen(out)).filename().wstring()) +
+                                  ": that's one of the environments in it. Choose another name.", platform::Icon::Warning);
+                return;
+            }
+        }
         if (bundler.joinable()) bundler.join();
         bundleBusy = true;
         const std::vector<BundleMember> members = bundleMembers;
@@ -7913,13 +9189,12 @@ struct Studio {
         ImGui::Spacing();
         const std::string here = openEnvFile();
         ImGui::BeginDisabled(here.empty());
-        if (ImGui::Button("Add the Open Environment", ImVec2(-1, 0))) addToBundle({here});
+        if (rowButton("Add the Open Environment", true)) addToBundle({here});
         ImGui::EndDisabled();
         if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
             ImGui::SetTooltip("%s", here.empty() ? "Save it first (Ctrl+S): a bundle holds saved environments"
                                                  : dirty ? "As it was last saved: save first (Ctrl+S) to include your latest changes" : here.c_str());
-        const float half = (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x) * 0.5f;
-        if (ImGui::Button("My Environments \u25be", ImVec2(half, 0))) ImGui::OpenPopup("##mine");
+        if (rowButton("My Environments \u25be")) ImGui::OpenPopup("##mine");
         if (ImGui::BeginPopup("##mine")) {
             const std::vector<std::string> mine = libraryEnvs();
             if (mine.empty()) ImGui::TextDisabled("None yet: Save (Ctrl+S) puts what you make here");
@@ -7930,26 +9205,25 @@ struct Studio {
             }
             ImGui::EndPopup();
         }
-        ImGui::SameLine();
-        if (ImGui::Button("Add .fenv\u2026", ImVec2(-1, 0))) addToBundleDialog();
+        if (rowButton("Add .fenv\u2026")) addToBundleDialog();
 
         ImGui::Spacing();
         ImGui::Separator();
         ImGui::BeginDisabled(bundleMembers.empty());
         pushPrimary();
-        if (ImGui::Button(bundleFile.empty() ? "Save Bundle\u2026" : "Save Bundle", ImVec2(-1, ImGui::GetFrameHeight() * 1.4f))) {
+        if (rowButton(bundleFile.empty() ? "Save Bundle\u2026###savebundle" : "Save Bundle###savebundle", true)) {
             if (bundleFile.empty()) saveBundleDialog(); else saveBundle(bundleFile);
         }
         ImGui::PopStyleColor(3);
-        if (ImGui::Button("Save Bundle As\u2026", ImVec2(-1, 0))) saveBundleDialog();
+        if (rowButton("Save Bundle As\u2026")) saveBundleDialog();
         ImGui::EndDisabled();
         const bool saved = !bundleFile.empty() && !bundleDirty;
         ImGui::BeginDisabled(!saved);
-        if (ImGui::Button("Install on Steam Frame\u2026", ImVec2(-1, 0))) installBundle();
+        if (rowButton("Install on Steam Frame\u2026", true)) installBundle();
         if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
             ImGui::SetTooltip("%s", saved ? "Adds it to the Headset tab's install list: Frame Home unpacks it there into its environments"
                                           : "Save the bundle first");
-        if (ImGui::Button("Unpack into My Environments", ImVec2(-1, 0))) unpackBundle();
+        if (rowButton("Unpack into My Environments")) unpackBundle();
         ImGui::EndDisabled();
         ImGui::EndDisabled();
         std::string st;
@@ -8102,6 +9376,14 @@ struct SelfTest {
         a.testing = true;
         log("Frame Studio self-test");
         for (const auto& h : paths) log("home: %s", h.c_str());
+        // A .fenv saves back into itself (Save Edits, Ctrl+S): the test works on a copy in its scratch library, so
+        // the edits it makes never land in yours (and the next run starts from the same file).
+        for (std::string& h : paths)
+            if (isFenvPath(h)) {
+                const fs::path copy = libraryDir() / fs::path(widen(h)).filename();
+                fs::create_directories(copy.parent_path(), ec);
+                if (fs::copy_file(fs::path(widen(h)), copy, fs::copy_options::overwrite_existing, ec)) { h = narrow(copy.wstring()); log("  (testing a copy: %s)", h.c_str()); }
+            }
         build();
     }
 
@@ -8232,6 +9514,7 @@ struct SelfTest {
         float m[16];
         if (a.wKind >= 0) { if (!a.worldMatrix(a.wKind, a.wIndex, m)) return false; }
         else if (a.selected >= 0) std::memcpy(m, a.objects[a.selected].pivot, 64);
+        else if (a.splatSel >= 0) std::memcpy(m, a.splatItems[a.splatSel].pivot, 64);
         else return false;
         const float o[3] = {m[12], m[13], m[14]};
         if (!a.screenOf(o, c)) return false;
@@ -8270,6 +9553,7 @@ struct SelfTest {
                 return 0;
             }
             if (a.wKind >= 0) { float m[16]; a.worldMatrix(a.wKind, a.wIndex, m); std::memcpy(before, m, 64); }
+            else if (a.splatSel >= 0) std::memcpy(before, a.splatItems[a.splatSel].pivot, 64);
             else std::memcpy(before, a.objects[a.selected].pivot, 64);
             drag(probeHit, ImVec2(probeHit.x + delta.x, probeHit.y + delta.y));
             return 4;
@@ -8279,6 +9563,7 @@ struct SelfTest {
     float* current(float* m) {
         if (a.wKind >= 0) { if (!a.worldMatrix(a.wKind, a.wIndex, m)) std::memcpy(m, before, 64); }
         else if (a.selected >= 0) std::memcpy(m, a.objects[a.selected].pivot, 64);
+        else if (a.splatSel >= 0) std::memcpy(m, a.splatItems[a.splatSel].pivot, 64);
         return m;
     }
 
@@ -8381,6 +9666,9 @@ struct SelfTest {
                 best = std::fabs(d - 2.0f);
                 obj = static_cast<int>(i);
             }
+            // Nothing edited yet: the home is as it was opened (a saved walkable area is shown as saved, not re-baked into it)
+            check(!a.dirty && !a.worldEdited, "opening it and looking round changes nothing in it",
+                  std::string(a.dirty || a.worldEdited ? "edited" : "not edited") + (a.walkSaved() ? " (it has a saved walkable area)" : ""));
             check(obj >= 0, "found an object to edit", obj >= 0 ? a.objects[obj].label : "");
             if (obj < 0) { stage = stages.size() - 2; return 0; }
             a.selected = obj; a.wKind = a.wIndex = -1;
@@ -8435,18 +9723,45 @@ struct SelfTest {
         stages.push_back([this] { check(a.tool == Tool::Rotate, "R picks Rotate"); key(ImGuiKey_S); queue.push_back(In{}); return 1; });
         stages.push_back([this] { check(a.tool == Tool::Scale, "S picks Scale"); key(ImGuiKey_G); queue.push_back(In{}); return 1; });
         stages.push_back([this] { check(a.tool == Tool::Move, "G picks Move"); return 1; });
-        // Clicking the object in the viewport selects it (and empty space doesn't keep the gizmo stuck)
+        // Clicking an object in the viewport selects the one in front there. Clicked where an object is what a click
+        // hits: no world item's marker or shape on it (a click on a seat or a spawn selects that, as it should): the
+        // edited object's centre when that is such a spot, else the nearest one to it.
         stages.push_back([this] {
-            a.selected = -1;
+            a.selected = -1; a.wKind = a.wIndex = -1;
+            clickAt = ImVec2(-1, -1); clickNote.clear(); clickWant = -1;
             float mn[3], mx[3];
             a.worldBounds(a.objects[obj], mn, mx);
+            const float ty = std::tan(kFovY * 0.5f), tx = ty * std::max(1.0f, a.viewSize.x) / std::max(1.0f, a.viewSize.y);
+            float pose[16], view[16], proj[16], vp[16];
+            a.cam.pose(pose); invert(pose, view); glProjection(tx, ty, proj); mul(proj, view, vp);
+            auto onIt = [&](ImVec2 p) {
+                if (p.x < a.viewPos.x + 40 || p.y < a.viewPos.y + 40 || p.x > a.viewPos.x + a.viewSize.x - 40 || p.y > a.viewPos.y + a.viewSize.y - 40) return false;
+                int k, i;
+                float h[3], ts;
+                return a.pick(p.x, p.y) >= 0 && !a.worldUnder(p.x, p.y, vp, k, i, h) && a.pickSplat(p.x, p.y, ts) < 0;
+            };
             const float c[3] = {(mn[0] + mx[0]) / 2, (mn[1] + mx[1]) / 2, (mn[2] + mx[2]) / 2};
-            ImVec2 sp;
-            if (a.screenOf(c, sp)) { moveTo(sp); moveTo(sp); press(true); queue.push_back(In{}); press(false); queue.push_back(In{}); }
+            ImVec2 mid(a.viewPos.x + a.viewSize.x / 2, a.viewPos.y + a.viewSize.y / 2);
+            const bool midOn = a.screenOf(c, mid);
+            if (midOn && onIt(mid)) clickAt = mid;
+            else {
+                float best = 1e30f;
+                for (int gy = 1; gy < 24; ++gy)
+                    for (int gx = 1; gx < 24; ++gx) {
+                        const ImVec2 p(a.viewPos.x + a.viewSize.x * gx / 24, a.viewPos.y + a.viewSize.y * gy / 24);
+                        const float d = std::hypot(p.x - mid.x, p.y - mid.y);
+                        if (d < best && onIt(p)) { best = d; clickAt = p; }
+                    }
+                int k, i;
+                float h[3];
+                clickNote = midOn && a.worldUnder(mid.x, mid.y, vp, k, i, h) ? " (beside a world item at its centre)" : " (its centre isn't on it)";
+            }
+            if (clickAt.x >= 0) { clickWant = a.pick(clickAt.x, clickAt.y); click(clickAt); }
             return 3;
         });
         stages.push_back([this] {
-            check(a.selected >= 0, "clicking in the viewport selects an object", a.selected >= 0 ? a.objects[a.selected].label : "nothing");
+            check(clickAt.x >= 0 && a.selected >= 0 && a.selected == clickWant, "clicking in the viewport selects an object",
+                  clickAt.x < 0 ? std::string("no object on screen to click") : (a.selected >= 0 ? a.objects[a.selected].label : std::string("nothing")) + clickNote);
             a.selected = obj;
             return 2;
         });
@@ -8587,6 +9902,8 @@ struct SelfTest {
             WorldRuntime rt;
             rt.build(hw);
             float bestF = 0, bestW = 0, fc[3] = {}, wc[3] = {}, wn[3] = {};
+            struct Flat { float area; float p[9]; };
+            std::vector<Flat> flats;
             for (const WorldCollider& c : hw.colliders) {
                 const std::vector<float> wp = worldMeshPositions(c);
                 for (size_t t = 0; t + 2 < c.indices.size(); t += 3) {
@@ -8597,13 +9914,34 @@ struct SelfTest {
                     if (L < 1e-9f) continue;
                     const bool fl = n[1] / L > 0.9f;                       // flat enough to stand on
                     if (!fl && std::fabs(n[1]) / L > 0.2f) continue;      // else a near-vertical one to walk into
-                    float& best = fl ? bestF : bestW;
+                    if (fl) { Flat f{L * 0.5f, {}}; std::copy_n(p0, 3, f.p); std::copy_n(p1, 3, f.p + 3); std::copy_n(p2, 3, f.p + 6); flats.push_back(f); continue; }
+                    float& best = bestW;
                     if (L * 0.5f <= best) continue;
                     best = L * 0.5f;
-                    float* cc = fl ? fc : wc;
+                    float* cc = wc;
                     for (int k = 0; k < 3; ++k) cc[k] = (p0[k] + p1[k] + p2[k]) / 3;
                     if (!fl) for (int k = 0; k < 3; ++k) wn[k] = n[k] / L;
                 }
+            }
+            // the largest flat face that is the top there: nothing of the object lies on it within a step (a rug, a
+            // second floor layer a few cm up: you'd stand on that instead)
+            std::sort(flats.begin(), flats.end(), [](const Flat& x, const Flat& y) { return x.area > y.area; });
+            auto heightOn = [](const float* t, float x, float z, float& hy) {
+                const float d = (t[5] - t[8]) * (t[0] - t[6]) + (t[6] - t[3]) * (t[2] - t[8]);
+                if (std::fabs(d) < 1e-12f) return false;
+                const float l1 = ((t[5] - t[8]) * (x - t[6]) + (t[6] - t[3]) * (z - t[8])) / d, l2 = ((t[8] - t[2]) * (x - t[6]) + (t[0] - t[6]) * (z - t[8])) / d;
+                if (l1 < -1e-4f || l2 < -1e-4f || 1 - l1 - l2 < -1e-4f) return false;
+                hy = l1 * t[1] + l2 * t[4] + (1 - l1 - l2) * t[7];
+                return true;
+            };
+            for (size_t i = 0; i < flats.size() && i < 200 && bestF == 0; ++i) {
+                const float* t = flats[i].p;
+                const float m[3] = {(t[0] + t[3] + t[6]) / 3, (t[1] + t[4] + t[7]) / 3, (t[2] + t[5] + t[8]) / 3};
+                bool covered = false;
+                for (const Flat& o : flats) { float hy; if (&o != &flats[i] && heightOn(o.p, m[0], m[2], hy) && hy > m[1] + 0.005f && hy < m[1] + 0.15f) { covered = true; break; } }
+                if (covered) continue;
+                bestF = flats[i].area;
+                std::copy_n(m, 3, fc);
             }
             float h = 0;
             check(bestF > 0 && rt.floorAt(fc[0], fc[2], fc[1] + 0.05f, 0.1f, 0.2f, h) && std::fabs(h - fc[1]) < 0.02f, "Frame Home stands on its flat part", f3(fc));
@@ -8684,6 +10022,16 @@ struct SelfTest {
                 const float d = dist3(mn, mx);
                 int cx, cz;
                 if (d <= 0.4f || std::fabs(d - 1.5f) >= best || !a.walkShown->cellOf((mn[0] + mx[0]) * 0.5f, (mn[2] + mx[2]) * 0.5f, cx, cz)) continue;
+                // furniture-like: its top, at the middle, has the room to stand over it (else its flat faces are
+                // under itself or under something else, and never stood on)
+                bool room = false;
+                for (const WalkSpan* s = a.walkShown->begin(cx, cz); s != a.walkShown->end(cx, cz); ++s) {
+                    if (std::fabs(s->hi - mx[1]) > 0.1f) continue;
+                    room = true;
+                    for (const WalkSpan* u = s + 1; u != a.walkShown->end(cx, cz); ++u) if (u->lo < s->hi + a.walkEdit.headroom) room = false;
+                    break;
+                }
+                if (!room) continue;
                 std::vector<u32> fl, wl;
                 a.classifyObject(o, fl, wl);
                 if (fl.size() < 4) continue;
@@ -8736,7 +10084,12 @@ struct SelfTest {
         stages.push_back([this] {
             collidersBefore = a.scene->world.colliders.size();
             spawnsBefore = a.scene->world.spawns.size();
-            check(!a.walkSaved() && a.walkShown && a.walkShown->any(), "before any edit, the viewport previews the area Frame Home would bake",
+            // A home can come with its area already saved (Auto-generated before; a baked .fenv always carries one):
+            // then that is what the viewport shows, else Frame Home's own bake of the home.
+            walkSavedAtStart = a.walkSaved();
+            walkGridAtStart = a.scene->world.walkGrid;
+            check(a.walkShown && a.walkShown->any() && (walkSavedAtStart ? encodeWalkGrid(*a.walkShown) == a.scene->world.walkGrid : true),
+                  walkSavedAtStart ? "before Auto-generate, the viewport shows the area saved with the home" : "before Auto-generate, the viewport previews the area Frame Home would bake",
                   a.walkShown ? std::to_string(static_cast<int>(a.walkReport.walkArea)) + " m2" : "none");
             a.selected = -1; a.wKind = a.wIndex = -1;
             a.frameAll();
@@ -8796,14 +10149,26 @@ struct SelfTest {
             if (!a.walkShown || !Studio::walkMiddle(*a.walkShown, m)) { check(false, "a surface box placed on the floor blocks there", "no middle"); return 1; }
             std::copy_n(m, 3, wallAt);
             const bool before = a.walkShown->walkable(m[0], m[2], m[1]);
+            // the floor round it, 0.9 m away (clear of the box and the body's radius): what was walkable stays so
+            float ring[8][2];
+            bool ringWas[8];
+            int ringN = 0;
+            for (int k = 0; k < 8; ++k) {
+                ring[k][0] = m[0] + 0.9f * std::cos(k * 0.785398f); ring[k][1] = m[2] + 0.9f * std::sin(k * 0.785398f);
+                ringN += ringWas[k] = a.walkShown->walkable(ring[k][0], ring[k][1], m[1]);
+            }
             WorldCollider c;
             c.name = "selftest surface"; c.kind = WorldCollider::Box; c.role = WorldCollider::Solid;
             c.half[0] = c.half[2] = 0.3f; c.half[1] = 0.6f;            // 1.2 m high: its sides are too steep and too tall to step up
             translation(c.world, m[0], m[1] + 0.6f, m[2]);
             a.scene->world.colliders.push_back(c);
             a.rebakeWalk();
-            const bool after = a.walkShown->walkable(m[0], m[2], m[1]), beside = a.walkShown->walkable(m[0] + 0.9f, m[2], m[1]) || a.walkShown->walkable(m[0] - 0.9f, m[2], m[1]);
-            check(before && !after && beside, "a 1.2 m surface box blocks where it stands (only there)", f3(m));
+            const bool after = a.walkShown->walkable(m[0], m[2], m[1]);
+            int ringKept = 0;
+            for (int k = 0; k < 8; ++k) ringKept += ringWas[k] && a.walkShown->walkable(ring[k][0], ring[k][1], m[1]);
+            const bool beside = ringN > 0 && ringKept == ringN;
+            check(before && !after && beside, "a 1.2 m surface box blocks where it stands (only there)",
+                  f3(m) + ", " + std::to_string(ringKept) + " of " + std::to_string(ringN) + " spots round it still walkable");
             a.scene->world.colliders.pop_back();
             a.rebakeWalk();
             check(a.walkShown->walkable(m[0], m[2], m[1]) && a.scene->world.walkGrid == firstGrid, "...and taking it away gives the same area back");
@@ -8829,12 +10194,15 @@ struct SelfTest {
             return 3;
         });
         stages.push_back([this] {
-            check(!a.walkSaved() && a.scene->world.colliders.size() == collidersBefore && a.scene->world.spawns.size() == spawnsBefore,
-                  "one Ctrl+Z removes the saved area (and its spawn)", std::to_string(a.scene->world.colliders.size()) + " surfaces, " + std::to_string(collidersBefore) + " before");
+            check(a.walkSaved() == walkSavedAtStart && a.scene->world.walkGrid == walkGridAtStart && a.scene->world.colliders.size() == collidersBefore &&
+                      a.scene->world.spawns.size() == spawnsBefore,
+                  walkSavedAtStart ? "one Ctrl+Z puts back the area saved before (and takes its spawn away)" : "one Ctrl+Z removes the saved area (and its spawn)", std::to_string(a.scene->world.colliders.size()) + " surfaces, " + std::to_string(collidersBefore) + " before");
             return 15;
         });
         stages.push_back([this] {
-            check(a.walkShown && !a.walkSaved(), "...and the viewport goes back to the preview");
+            if (a.walkPending || a.walkJob) return -1;   // (the area is baked again in the background, 250 ms after the change)
+            check(a.walkShown && (walkSavedAtStart ? a.walkSaved() && encodeWalkGrid(*a.walkShown) == walkGridAtStart : !a.walkSaved()),
+                  walkSavedAtStart ? "...and the viewport goes back to it" : "...and the viewport goes back to the preview");
             return 1;
         });
 
@@ -8908,6 +10276,20 @@ struct SelfTest {
             const size_t n0 = cs.size();
             float m[3] = {0, 0, 0};
             if (a.walkShown) Studio::walkMiddle(*a.walkShown, m);
+            {   // clear of the surfaces placed before (they'd join in): above them all if any is near
+                bool nearby = false;
+                float top = m[1];
+                for (const WorldCollider& o : cs) {
+                    if (!o.placed) continue;
+                    const std::vector<float> t = colliderTriangles(o);
+                    if (t.empty()) continue;
+                    float lo[3] = {1e30f, 1e30f, 1e30f}, hi[3] = {-1e30f, -1e30f, -1e30f};
+                    for (size_t k = 0; k + 2 < t.size(); k += 3) for (int j = 0; j < 3; ++j) { lo[j] = std::min(lo[j], t[k + j]); hi[j] = std::max(hi[j], t[k + j]); }
+                    top = std::max(top, hi[1]);
+                    nearby |= lo[0] < m[0] + 4 && hi[0] > m[0] - 4 && lo[2] < m[2] + 4 && hi[2] > m[2] - 4 && lo[1] < m[1] + 3.5f && hi[1] > m[1] - 1;
+                }
+                if (nearby) m[1] = top + 5;
+            }
             auto wall = [&](float x, float z, float hx, float hz) {
                 WorldCollider c;
                 c.name = "selftest wall"; c.kind = WorldCollider::Box; c.role = WorldCollider::Solid; c.placed = true;
@@ -9027,11 +10409,16 @@ struct SelfTest {
         // through a drawn floor takes that away too
         stages.push_back([this] {
             a.rebakeWalk();
-            if (!a.walkShown || a.scene->world.spawns.empty()) { check(false, "World > Add > Invisible Wall", "no walkable area or spawn"); return 1; }
-            const WorldPoint& sp = a.scene->world.spawns[0];
-            float h = 0;
-            if (!a.walkShown->walkable(sp.pos[0], sp.pos[2], sp.pos[1] + 0.05f, &h)) { check(false, "World > Add > Invisible Wall", "the spawn isn't walkable"); return 1; }
-            invisibleWallAt[0] = sp.pos[0]; invisibleWallAt[1] = h; invisibleWallAt[2] = sp.pos[2];
+            if (!a.walkShown) { check(false, "World > Add > Invisible Wall", "no walkable area"); return 1; }
+            // on walkable floor: the first spawn that's on it (the test's own spawn was dragged anywhere), else the
+            // middle of the area
+            float h = 0, at[3];
+            bool found = false;
+            for (const WorldPoint& sp : a.scene->world.spawns)
+                if (a.walkShown->walkable(sp.pos[0], sp.pos[2], sp.pos[1] + 0.05f, &h)) { std::copy_n(sp.pos, 3, at); found = true; break; }
+            if (!found && Studio::walkMiddle(*a.walkShown, at) && a.walkShown->walkable(at[0], at[2], at[1] + 0.05f, &h)) found = true;
+            if (!found) { check(false, "World > Add > Invisible Wall", "no walkable floor at a spawn or the area's middle"); return 1; }
+            invisibleWallAt[0] = at[0]; invisibleWallAt[1] = h; invisibleWallAt[2] = at[2];
             const size_t before = a.scene->world.colliders.size();
             a.cam.pivot[0] = invisibleWallAt[0]; a.cam.pivot[1] = invisibleWallAt[1] + 1.0f; a.cam.pivot[2] = invisibleWallAt[2];
             a.addInvisibleWall();
@@ -9075,6 +10462,116 @@ struct SelfTest {
             check(cs.size() == before, "...and the one through the drawn floor");
             a.rebakeWalk();
             return 1;
+        });
+        // ── Copy and paste: a seat cut and pasted back, Ctrl+Z / Ctrl+Y; text on the clipboard that isn't Studio's is
+        // ignored, another Studio's world items paste; an object copied, pasted beside itself, drawn, one undo step
+        stages.push_back([this] {
+            a.selected = a.splatSel = -1; a.wKind = a.wIndex = -1;
+            pSeats = a.scene->world.seats.size();
+            a.addWorld(kSeat);
+            const WorldPoint& st = a.scene->world.seats.back();
+            float ex[3];
+            a.seatExitWorld(st, ex);
+            const float fx = -std::sin(st.yaw), fz = -std::cos(st.yaw);
+            check((ex[0] - st.pos[0]) * fx + (ex[2] - st.pos[2]) * fz > 0.4f, "a new seat's stand-up spot is in front of it (the way its arrow points)");
+            std::copy_n(st.pos, 3, seatAt);
+            seatYaw = st.yaw;
+            pUndo = a.undo.size();
+            key(ImGuiKey_X, true); queue.push_back(In{});
+            return 2;
+        });
+        stages.push_back([this] {
+            check(a.scene->world.seats.size() == pSeats && a.testClipboard.rfind(Studio::kClipHeader, 0) == 0 && a.undo.size() == pUndo + 1,
+                  "Ctrl+X cuts the selected seat (onto the clipboard, one undo step)", std::to_string(a.scene->world.seats.size()) + " seats");
+            key(ImGuiKey_V, true); queue.push_back(In{});
+            return 2;
+        });
+        stages.push_back([this] {
+            const bool one = a.scene->world.seats.size() == pSeats + 1;
+            const WorldPoint* st = one ? &a.scene->world.seats.back() : nullptr;
+            check(st && dist3(st->pos, seatAt) < 1e-3f && std::fabs(st->yaw - seatYaw) < 1e-5f && a.wKind == kSeat && a.wIndex == static_cast<int>(pSeats) && a.undo.size() == pUndo + 2,
+                  "Ctrl+V pastes it back where it was cut from, facing the same way, selected", st ? f3(st->pos) + " " + st->name : "no seat");
+            key(ImGuiKey_Z, true); queue.push_back(In{});
+            return 2;
+        });
+        stages.push_back([this] {
+            check(a.scene->world.seats.size() == pSeats, "Ctrl+Z takes the pasted seat away");
+            key(ImGuiKey_Y, true); queue.push_back(In{});
+            return 2;
+        });
+        stages.push_back([this] {
+            check(a.scene->world.seats.size() == pSeats + 1, "Ctrl+Y brings it back");
+            const size_t n = a.scene->world.seats.size(), u = a.undo.size();
+            a.testClipboard = "some text copied in another program {\"format\":\"fenv-world\"}";
+            key(ImGuiKey_V, true); queue.push_back(In{});
+            pUndo = u; pSeats2 = n;
+            return 2;
+        });
+        stages.push_back([this] {
+            check(a.scene->world.seats.size() == pSeats2 && a.undo.size() == pUndo, "text on the clipboard that isn't Frame Studio's pastes nothing", a.clipNote);
+            // another Frame Studio's copy of a seat (its own token): the text form alone
+            Studio::Clip c;
+            WorldPoint p; p.name = "Other window's seat"; p.pos[0] = seatAt[0] + 1; p.pos[1] = seatAt[1]; p.pos[2] = seatAt[2]; p.yaw = 1.0f;
+            c.world.seats.push_back(p);
+            std::copy_n(p.pos, 3, c.centre); c.base = p.pos[1]; c.width = 0.6f; c.what = p.name; c.token = 12345;
+            a.testClipboard = a.clipToText(c);
+            a.cam.pivot[0] = seatAt[0] + 4; a.cam.pivot[2] = seatAt[2];
+            key(ImGuiKey_V, true); queue.push_back(In{});
+            return 2;
+        });
+        stages.push_back([this] {
+            const WorldPoint* st = a.scene->world.seats.size() == pSeats2 + 1 ? &a.scene->world.seats.back() : nullptr;
+            check(st && std::fabs(st->pos[0] - (seatAt[0] + 4)) < 1e-3f && std::fabs(st->yaw - 1.0f) < 1e-5f && st->name.find("Other window's seat") == 0,
+                  "another Frame Studio's copied seat pastes from the clipboard's text, where the view looks", st ? f3(st->pos) + " " + st->name : "none");
+            for (int k = 0; k < 4; ++k) a.step(a.undo, a.redo);   // (that paste, the paste back, the cut, the seat added above)
+            check(a.scene->world.seats.size() == pSeats, "...and undoing puts the seats back as they were", std::to_string(a.scene->world.seats.size()));
+            // an object: copied, the view on it, pasted (beside it). An animated one isn't copied (it says so): the
+            // edited object when it can be, else a still, solid one.
+            pObj = a.objectCopyable(a.objects[obj]) ? obj : -1;
+            if (pObj < 0) {
+                a.wKind = a.wIndex = -1; a.selected = obj;
+                const bool refused = !a.copySelection(false) && a.clipNote.find("can't be copied") != std::string::npos;
+                check(refused, "an animated object isn't copied (the status bar says so)", a.clipNote);
+                for (size_t i = 0; i < a.objects.size() && pObj < 0; ++i)
+                    if (a.objectCopyable(a.objects[i]) && a.canBeSurface(a.objects[i]) && !a.objects[i].hidden) pObj = static_cast<int>(i);
+            }
+            if (pObj < 0) { check(false, "found an object that can be copied"); stage += 3; return 1; }
+            a.wKind = a.wIndex = -1; a.selected = pObj;
+            a.frameSelected();
+            pObjects = a.objects.size(); pMeshes = a.renderer.meshCount(); pUndo = a.undo.size();
+            mul(a.objects[pObj].pivot, a.objects[pObj].offset, pWorld);
+            key(ImGuiKey_C, true); queue.push_back(In{});
+            key(ImGuiKey_V, true); queue.push_back(In{});
+            return 3;
+        });
+        stages.push_back([this] {
+            const bool one = a.objects.size() == pObjects + 1 && a.selected == static_cast<int>(pObjects);
+            float w[16] = {};
+            if (one) mul(a.objects.back().pivot, a.objects.back().offset, w);
+            const float dx = w[12] - pWorld[12], dz = w[14] - pWorld[14];
+            check(one && a.renderer.meshCount() == pMeshes + 1 && a.renderer.meshVisible(a.objects.back().mesh) && std::hypot(dx, dz) > 0.2f &&
+                  std::fabs(w[13] - pWorld[13]) < 1e-4f && a.objects.back().name.find(" copy") != std::string::npos && a.undo.size() == pUndo + 1,
+                  "Ctrl+C, Ctrl+V on an object: a copy beside it, drawn, selected, one undo step",
+                  one ? a.objects.back().label + " moved " + std::to_string(std::hypot(dx, dz)) + " m" : std::to_string(a.objects.size()) + " objects");
+            screenshot("07b_pasted_object");
+            key(ImGuiKey_Z, true); queue.push_back(In{});
+            return 3;
+        });
+        stages.push_back([this] {
+            const bool gone = a.objects.size() == pObjects + 1 && a.objects.back().deleted && !a.renderer.meshVisible(a.objects.back().mesh);
+            check(gone && a.undo.size() == pUndo, "Ctrl+Z takes the pasted object away",
+                  std::string(a.objects.back().deleted ? "deleted" : "not deleted") + (a.renderer.meshVisible(a.objects.back().mesh) ? ", drawn" : ", not drawn") +
+                  ", undo steps " + std::to_string(a.undo.size()) + " (" + std::to_string(pUndo) + " before the paste)");
+            a.selected = pObj;
+            key(ImGuiKey_D, true); queue.push_back(In{});
+            return 3;
+        });
+        stages.push_back([this] {
+            check(a.objects.size() == pObjects + 2 && a.selected == static_cast<int>(pObjects + 1) && !a.objects.back().deleted, "Ctrl+D duplicates the selected object");
+            a.step(a.undo, a.redo);
+            check(a.objects.back().deleted, "...one Ctrl+Z takes that away too");
+            a.selected = obj;
+            return 2;
         });
         // ── A background sound: added, undone, saved with the edits, back on reopening, packed in a .fenv
         stages.push_back([this] {
@@ -9169,6 +10666,8 @@ struct SelfTest {
                   "a saved environment (.fenv) carries it as Frame Home reads it", ok ? e.sound.file : err);
             std::error_code ec;
             fs::remove(soundFenv, ec);
+            fenvRelease(narrow(cache.wstring()));   // (this process's hold on the folders: Windows won't remove them held)
+            fenvRelease(narrow((dataDir() / L"selftest" / L"fenv-cache-save").wstring()));
             fs::remove_all(cache, ec);
             fs::remove_all(dataDir() / L"selftest" / L"fenv-cache-save", ec);
             fs::remove(soundWav, ec);
@@ -9214,11 +10713,13 @@ struct SelfTest {
             { std::lock_guard<std::mutex> l(a.statusMutex); st = a.bundleStatus; }
             check(st.rfind("Unpacked into My Environments (1 ", 0) == 0 && a.libraryEnvs().size() == libraryBefore, "Unpack puts it in My Environments (the same file isn't copied twice)", st);
             a.bundleDirty = false;
-            a.newBundle();
+            a.newBundle();   // (after this frame's UI drew the members' pictures: freeing them now would crash its draw)
+            check(!a.retiredThumbs.empty(), "New Bundle keeps the pictures this frame drew until it has been drawn");
             std::error_code ec;
             fs::remove(bundleFile, ec);
             return 2;
         });
+        stages.push_back([this] { check(a.retiredThumbs.empty(), "...and frees them after"); return 1; });
         // ── Edit > Settings: this PC's options, and the headset's read over ssh (nothing is written there)
         stages.push_back([this] { a.showSettings = true; a.headsetSettings(false); return 5; });
         stages.push_back([this] {
@@ -9230,7 +10731,350 @@ struct SelfTest {
             return 10;
         });
         stages.push_back([this] { screenshot("08_settings"); a.showSettings = false; return 2; });
+        // ── Gaussian splats: a capture opened, drawn, picked, moved, undone, saved into a .fenv and opened from it
         stages.push_back([this] {
+            if (a.saving) return -1;
+            // The home saved earlier has no splats: its scene stays the version older Frame Homes read
+            check(sceneVersionOf(a.envFile) == kSceneBakeVersionNoSplats, "an environment without splats is saved as before (scene version 14)",
+                  std::to_string(sceneVersionOf(a.envFile)));
+            // a sphere of 2000 splats, 0.4 m across, 2.5 m in front of where you start: a 3DGS .ply in its training axes
+            splatPly = dir / L"selftest splats.ply";
+            std::ofstream f(splatPly, std::ios::binary);
+            f << "ply\nformat binary_little_endian 1.0\nelement vertex 2000\n";
+            for (const char* n : {"x", "y", "z", "f_dc_0", "f_dc_1", "f_dc_2", "opacity", "scale_0", "scale_1", "scale_2", "rot_0", "rot_1", "rot_2", "rot_3"})
+                f << "property float " << n << "\n";
+            f << "end_header\n";
+            for (int i = 0; i < 2000; ++i) {
+                const float y = 1 - 2 * (i + 0.5f) / 2000, r = std::sqrt(1 - y * y), ph = i * 2.39996323f;
+                const float v[14] = {0.4f * r * std::cos(ph), -(1.5f + 0.4f * y), 2.5f - 0.4f * r * std::sin(ph), 1.2f * std::cos(ph), 1.2f * y, -1.0f, 2.5f,
+                                     std::log(0.03f), std::log(0.03f), std::log(0.03f), 1, 0, 0, 0};
+                f.write(reinterpret_cast<const char*>(v), sizeof v);
+            }
+            f.close();
+            a.dirty = false;                                       // (nothing of the home is kept: no "save first?")
+            a.open({narrow(splatPly.wstring())}, false);
+            return 2;
+        });
+        stages.push_back([this] {
+            if (a.loadState != 0 || a.isLoading() || !a.scene) return -1;
+            check(a.splatItems.size() == 1 && a.splatItems[0].count == 2000 && a.objects.empty(), "a Gaussian splat capture (3DGS .ply) opens as a splat object",
+                  std::to_string(a.splatItems.size()) + " objects, " + std::to_string(a.splatItems.empty() ? 0 : a.splatItems[0].count) + " splats");
+            if (a.splatItems.empty()) { stage = stages.size() - 2; return 0; }
+            return 5;
+        });
+        stages.push_back([this] {
+            check(a.renderer.splatsDrawn() == 2000, "its splats are drawn", std::to_string(a.renderer.splatsDrawn()));
+            screenshot("10_splats");
+            a.selected = a.splatSel = -1;
+            const float c[3] = {0, 1.5f, -2.5f};
+            ImVec2 sp;
+            if (a.screenOf(c, sp)) click(sp);
+            return 3;
+        });
+        stages.push_back([this] {
+            check(a.splatSel == 0 && a.inspectorTab == Studio::InspectorTab::Selection, "clicking the splats selects them", a.splatSel == 0 ? a.scene->splats[0].name : "nothing");
+            a.splatSel = 0;
+            return 2;
+        });
+        gizmoDrag("the splats move with the gizmo", Tool::Move, 0, ImVec2(80 * a.scale, 0));
+        stages.push_back([this] {
+            float m[16];
+            current(m);
+            const float* w = a.scene->splats[0].worldFromModel;
+            check(std::fabs(m[12] - before[12]) > 0.02f && std::fabs(w[12] - (m[12] - before[12])) < 1e-3f && std::fabs(w[13]) < 1e-3f,
+                  "the splats move with the gizmo (the drawn ones with it)", f3(&before[12]) + " -> " + f3(&m[12]));
+            screenshot("10b_splats_selected");
+            key(ImGuiKey_Z, true);
+            queue.push_back(In{});
+            return 3;
+        });
+        stages.push_back([this] {
+            const float* w = a.scene->splats[0].worldFromModel;
+            check(std::memcmp(a.splatItems[0].pivot, a.splatItems[0].pivot0, 64) == 0 && std::fabs(w[12]) < 1e-4f, "Ctrl+Z puts them back", f3(&w[12]));
+            a.pushSplatUndo(0);                                     // a metre to the right, and saved so
+            a.splatItems[0].pivot[12] += 1.0f;
+            a.applySplat(0);
+            splatFenv = dir / L"selftest-splats.fenv";
+            std::error_code ec;
+            fs::remove(splatFenv, ec);
+            check(a.saveEnvironment(narrow(splatFenv.wstring()), false), "an environment with splats saves");
+            return 2;
+        });
+        stages.push_back([this] {
+            if (a.saving) return -1;
+            FenvManifest m;
+            const bool ok = fenvReadManifest(narrow(splatFenv.wstring()), m);
+            const bool needs = std::find(m.needs.begin(), m.needs.end(), "splats") != m.needs.end();
+            check(ok && m.splats.size() == 1 && m.splats[0].count == 2000 && m.splats[0].file.rfind("splats/", 0) == 0 && std::fabs(m.splats[0].xform[12] - 1.0f) < 1e-4f && needs,
+                  "...with its splats in the .fenv (an .spz each, where they were moved to, \"requires\": splats)", ok && !m.splats.empty() ? m.splats[0].file : "");
+            check(sceneVersionOf(narrow(splatFenv.wstring())) == kSceneBakeVersion, "...and its scene says so to Frame Homes that can't draw them (version 15)",
+                  std::to_string(sceneVersionOf(narrow(splatFenv.wstring()))));
+            a.dirty = false;
+            a.open({narrow(splatFenv.wstring())}, false);
+            return 2;
+        });
+        stages.push_back([this] {
+            if (a.loadState != 0 || a.isLoading() || !a.scene) return -1;
+            const bool one = a.splatItems.size() == 1 && a.scene->splats.size() == 1;
+            check(one && a.splatItems[0].count == 2000 && std::fabs(a.scene->splats[0].worldFromModel[12] - 1.0f) < 1e-4f,
+                  "opening the .fenv brings the splats back where they were saved", one ? f3(&a.scene->splats[0].worldFromModel[12]) : "none");
+            screenshot("11_splats_fenv");
+            std::error_code ec;
+            fs::remove(splatPly, ec);
+            a.dirty = false;
+            return 2;
+        });
+        stages.push_back([this] {   // a splat object copied and pasted where the view looks (its splats shared), one undo step
+            if (a.splatItems.empty()) return 1;
+            const std::string clipWas = a.testClipboard;
+            clipKeep = a.clipboard;
+            a.selected = -1; a.wKind = a.wIndex = -1; a.splatSel = 0;
+            const bool copied = a.copySelection(false);
+            a.cam.pivot[0] = 4; a.cam.pivot[2] = -2.5f;
+            const bool pasted = a.pasteClipboard();
+            const bool two = a.splatItems.size() == 2 && a.scene->splats.size() == 2 && a.renderer.splatObjectCount() == 2;
+            float mn[3] = {}, mx[3] = {};
+            if (two) a.splatWorldBounds(1, mn, mx);
+            check(copied && pasted && two && a.splatSel == 1 && a.scene->splats[1].splats == a.scene->splats[0].splats && a.scene->splats[1].name != a.scene->splats[0].name &&
+                  std::fabs((mn[0] + mx[0]) * 0.5f - 4) < 0.01f,
+                  "a splat object copies and pastes where the view looks (its splats shared, its own name)", two ? a.scene->splats[1].name : std::to_string(a.splatItems.size()) + " objects");
+            a.step(a.undo, a.redo);
+            check(two && a.splatItems[1].deleted && a.scene->splats[1].hidden, "...and Ctrl+Z takes it away");
+            a.testClipboard = clipWas;                              // (the object copied earlier, for the paste test at the end)
+            a.clipboard = clipKeep;
+            a.dirty = false;
+            return 2;
+        });
+        // ── A PLY mesh's vertex colours, and a panorama as the sky: shown, saved into a .fenv, opened from it
+        stages.push_back([this] {
+            colourPly = dir / L"selftest colours.ply";       // a 1 m square 2.5 m ahead, red / green / blue / white corners
+            {
+                std::ofstream f(colourPly, std::ios::binary);
+                f << "ply\nformat ascii 1.0\nelement vertex 4\nproperty float x\nproperty float y\nproperty float z\n"
+                     "property uchar red\nproperty uchar green\nproperty uchar blue\nelement face 1\nproperty list uchar int vertex_indices\nend_header\n"
+                     "-0.5 1.0 -2.5 255 0 0\n0.5 1.0 -2.5 0 255 0\n0.5 2.0 -2.5 0 0 255\n-0.5 2.0 -2.5 255 255 255\n4 0 1 2 3\n";
+            }
+            // a 256 x 128 Radiance .hdr: blue above the horizon, brown below, a bright (over-white) red band ahead
+            skyPng = dir / L"selftest sky.hdr";
+            {
+                std::vector<float> px(256 * 128 * 3);
+                for (int y = 0; y < 128; ++y)
+                    for (int x = 0; x < 256; ++x) {
+                        const bool ahead = x >= 112 && x < 144 && y >= 56 && y < 72;
+                        const float c[3] = {ahead ? 4.0f : y < 64 ? 0.06f : 0.16f, ahead ? 0.01f : y < 64 ? 0.26f : 0.08f, ahead ? 0.01f : y < 64 ? 0.72f : 0.03f};
+                        std::memcpy(&px[(y * 256 + x) * 3], c, sizeof c);
+                    }
+                std::string hdr = "#?RADIANCE\nFORMAT=32-bit_rle_rgbe\n\n-Y 128 +X 256\n";   // flat RGBE pixels (no run-length)
+                for (size_t i = 0; i < px.size(); i += 3) {
+                    const float m = std::max({px[i], px[i + 1], px[i + 2]});
+                    int e = 0;
+                    const float f = std::frexp(m, &e) * 256.0f / m;
+                    for (int k = 0; k < 3; ++k) hdr += static_cast<char>(static_cast<u8>(px[i + k] * f));
+                    hdr += static_cast<char>(static_cast<u8>(e + 128));
+                }
+                std::ofstream(skyPng, std::ios::binary) << hdr;
+            }
+            a.dirty = false;
+            a.open({narrow(colourPly.wstring())}, false);
+            return 2;
+        });
+        stages.push_back([this] {
+            if (a.loadState != 0 || a.isLoading() || !a.scene) return -1;
+            const bool one = a.scene->meshes.size() == 1;
+            const MeshData* md = one ? &a.scene->meshes[0] : nullptr;
+            check(md && md->colors.size() == md->positions.size() / 3 * 4 && md->shaderPath == "builtin/clay_vcolor.surface/0/shader" && a.objects.size() == 1,
+                  "a PLY mesh keeps its vertex colours and draws with them", md ? md->shaderPath + ", " + std::to_string(md->colors.size() / 4) + " colours" : "no mesh");
+            std::string why;
+            const std::string copy = a.copySkyPanorama(skyPng, why);
+            check(isSkyPanoramaPath(copy), "a 2:1 panorama is taken as the sky", copy.empty() ? why : copy);
+            std::string bad;
+            check(a.copySkyPanorama(colourPly, bad).empty() && !bad.empty(), "...and a file that isn't a picture is refused", bad);
+            if (copy.empty()) { stage = stages.size() - 2; return 0; }
+            skyCopy = fs::u8path(copy);
+            a.setSkyPanorama(copy);
+            return 2;
+        });
+        stages.push_back([this] {
+            if (a.loadState != 0 || a.isLoading() || !a.scene || a.uploading) return -1;
+            size_t sky = 0;
+            for (const MeshData& md : a.scene->meshes) sky += md.isSkybox && md.texW >= 64 && md.texW == md.texH;
+            check(sky == 6 && !a.skyPanorama().empty() && a.renderer.meshCount() == 7, "the panorama becomes the six faces of a sky cube, drawn with the model",
+                  std::to_string(sky) + " sky faces, " + std::to_string(a.renderer.meshCount()) + " drawn");
+            a.cam.playerView();
+            a.showInspectorTab(Studio::InspectorTab::Environment);
+            return 5;
+        });
+        stages.push_back([this] {
+            screenshot("12_ply_colours_sky");
+            skyFenv = dir / L"selftest-sky.fenv";
+            std::error_code ec;
+            fs::remove(skyFenv, ec);
+            {   // the picture's middle is ahead (its over-white red clipped to full red), the sky's blue above
+                const u8 *ahead = nullptr, *up = nullptr;
+                for (const MeshData& md : a.scene->meshes) {
+                    const u8* mid = md.texRGBA.size() >= static_cast<size_t>(md.texW) * md.texH * 4 && md.texW > 1
+                                        ? &md.texRGBA[(static_cast<size_t>(md.texH / 2) * md.texW + md.texW / 2) * 4] : nullptr;
+                    if (md.name == "Sky ahead") ahead = mid;
+                    if (md.name == "Sky up") up = mid;
+                }
+                char got[96] = "no pictures";
+                if (ahead && up) std::snprintf(got, sizeof got, "ahead %u,%u,%u  up %u,%u,%u", ahead[0], ahead[1], ahead[2], up[0], up[1], up[2]);
+                check(ahead && up && ahead[0] == 255 && ahead[1] < 40 && up[2] > 200 && up[0] < 100, "...facing the right way, its .hdr light shown at its own exposure", got);
+            }
+            check(a.saveEnvironment(narrow(skyFenv.wstring()), false), "an environment with a coloured PLY and a panorama sky saves");
+            return 2;
+        });
+        stages.push_back([this] {
+            if (a.saving) return -1;
+            check(sceneVersionOf(narrow(skyFenv.wstring())) == kSceneBakeVersionNoSplats, "...as a scene older Frame Homes read (no new requirement)",
+                  std::to_string(sceneVersionOf(narrow(skyFenv.wstring()))));
+            a.dirty = false;
+            a.open({narrow(skyFenv.wstring())}, false);
+            return 2;
+        });
+        stages.push_back([this] {
+            if (a.loadState != 0 || a.isLoading() || !a.scene || a.uploading) return -1;
+            size_t sky = 0, coloured = 0;
+            for (const MeshData& md : a.scene->meshes) { sky += md.isSkybox; coloured += md.shaderPath == "builtin/clay_vcolor.surface/0/shader" && !md.colors.empty(); }
+            check(sky == 6 && coloured == 1, "opening the .fenv brings back the sky and the coloured mesh (as Frame Home reads it)",
+                  std::to_string(sky) + " sky faces, " + std::to_string(coloured) + " coloured");
+            return 10;
+        });
+        stages.push_back([this] {
+            if (a.loadState != 0 || a.uploading || a.texLoading || a.objects.empty()) return -1;
+            screenshot("13_sky_fenv");
+            std::error_code ec;
+            fs::remove(colourPly, ec);
+            fs::remove(skyPng, ec);
+            fs::remove(skyFenv, ec);
+            fs::remove(skyCopy, ec);
+            a.dirty = false;
+            return 2;
+        });
+        // ── A folder deeper than 260 characters (Windows' old limit): a model imported from it, saved there, opened
+        stages.push_back([this] {
+            longRoot = dir / L"long path";
+            fs::path deep = longRoot;
+            for (int i = 0; i < 12; ++i) deep /= L"a folder name 24 letters " + std::to_wstring(i);
+            longPly = deep / L"selftest long path.ply";
+            longFenv = deep / L"selftest long path.fenv";
+            std::error_code ec;
+            fs::remove_all(longRoot, ec);
+            fs::create_directories(deep, ec);
+            if (!fs::is_directory(deep, ec)) {   // (Windows with long paths turned off: LongPathsEnabled)
+                log("SKIP the %zu-character folder: this system can't make it (%s)", longPly.wstring().size(), ec.message().c_str());
+                stage += 3;
+                return 1;
+            }
+            std::ofstream(longPly, std::ios::binary)
+                << "ply\nformat ascii 1.0\nelement vertex 4\nproperty float x\nproperty float y\nproperty float z\n"
+                   "property uchar red\nproperty uchar green\nproperty uchar blue\nelement face 1\nproperty list uchar int vertex_indices\nend_header\n"
+                   "-0.5 1.0 -2.5 255 0 0\n0.5 1.0 -2.5 0 255 0\n0.5 2.0 -2.5 0 0 255\n-0.5 2.0 -2.5 255 255 255\n4 0 1 2 3\n";
+            a.dirty = false;
+            a.open({narrow(longPly.wstring())}, false);
+            return 2;
+        });
+        stages.push_back([this] {
+            if (a.loadState != 0 || a.isLoading() || !a.scene) return -1;
+            check(a.scene->meshes.size() == 1 && a.objects.size() == 1, "a model in a folder over 260 characters deep imports",
+                  std::to_string(longPly.wstring().size()) + " characters, " + std::to_string(a.scene->meshes.size()) + " meshes");
+            check(a.saveEnvironment(narrow(longFenv.wstring()), false), "...saves as an environment there");
+            return 2;
+        });
+        stages.push_back([this] {
+            if (a.saving) return -1;
+            std::error_code ec;
+            const auto size = fs::file_size(longFenv, ec);
+            check(!ec && size > 0, "...the .fenv is written", ec ? ec.message() : std::to_string(size) + " bytes");
+            a.dirty = false;
+            a.open({narrow(longFenv.wstring())}, false);
+            return 2;
+        });
+        stages.push_back([this] {
+            if (a.loadState != 0 || a.isLoading() || !a.scene || a.uploading) return -1;
+            size_t coloured = 0;
+            for (const MeshData& md : a.scene->meshes) coloured += !md.colors.empty();
+            check(coloured == 1 && a.objects.size() == 1, "...and opens again from there", std::to_string(coloured) + " coloured meshes");
+            a.dirty = false;
+            return 2;
+        });
+        // ── Copy and paste between homes, and saved: the first home's object pasted into a model; an object and a seat
+        // copied and pasted, saved into a .fenv, opened from it where they were put
+        stages.push_back([this] {
+            pastePly = dir / L"selftest paste.ply";
+            pasteFenv = dir / L"selftest-paste.fenv";
+            std::error_code ec;
+            fs::remove(pasteFenv, ec);
+            std::ofstream(pastePly, std::ios::binary)
+                << "ply\nformat ascii 1.0\nelement vertex 4\nproperty float x\nproperty float y\nproperty float z\n"
+                   "property uchar red\nproperty uchar green\nproperty uchar blue\nelement face 1\nproperty list uchar int vertex_indices\nend_header\n"
+                   "-0.5 1.0 -2.5 255 0 0\n0.5 1.0 -2.5 0 255 0\n0.5 2.0 -2.5 0 0 255\n-0.5 2.0 -2.5 255 255 255\n4 0 1 2 3\n";
+            a.dirty = false;
+            a.open({narrow(pastePly.wstring())}, false);
+            return 2;
+        });
+        stages.push_back([this] {
+            if (a.loadState != 0 || a.isLoading() || !a.scene || a.uploading) return -1;
+            const size_t n = a.objects.size();
+            a.selected = a.splatSel = -1; a.wKind = a.wIndex = -1;
+            a.cam.pivot[0] = -3; a.cam.pivot[1] = 1.5f; a.cam.pivot[2] = -2.5f;
+            const bool pasted = !a.clipboard.meshes.empty() && a.pasteClipboard();   // (the first home's object, copied there)
+            check(pasted && a.objects.size() == n + 1 && a.renderer.meshCount() == n + 1 && a.renderer.meshVisible(a.objects.back().mesh),
+                  "an object copied in one home pastes into another (its shader comes with it), drawn", a.clipNote);
+            if (pasted) a.step(a.undo, a.redo);
+            // the model's quad: copied, pasted 3 m to the right
+            a.selected = 0;
+            a.copySelection(false);
+            a.cam.pivot[0] = 3;
+            const size_t before = a.objects.size();
+            check(a.pasteClipboard() && a.objects.size() == before + 1, "an object pastes where the view looks");
+            float mn[3], mx[3];
+            a.worldBounds(a.objects.back(), mn, mx);
+            for (int k = 0; k < 3; ++k) pasteAt[k] = (mn[k] + mx[k]) * 0.5f;
+            check(std::fabs(pasteAt[0] - 3) < 1e-3f && std::fabs(pasteAt[2] + 2.5f) < 1e-3f, "...its middle there", f3(pasteAt));
+            // a seat: added, copied, pasted 2 m away
+            a.cam.pivot[0] = 0; a.cam.pivot[2] = 0;
+            a.addWorld(kSeat);
+            a.copySelection(false);
+            a.cam.pivot[0] = -2;
+            check(a.pasteClipboard() && a.scene->world.seats.size() == 2, "a seat copies and pastes");
+            if (!a.scene->world.seats.empty()) std::copy_n(a.scene->world.seats.back().pos, 3, seatAt);
+            check(a.saveEnvironment(narrow(pasteFenv.wstring()), false), "an environment with pasted things saves");
+            return 2;
+        });
+        stages.push_back([this] {
+            if (a.saving) return -1;
+            a.dirty = false;
+            a.open({narrow(pasteFenv.wstring())}, false);
+            return 2;
+        });
+        stages.push_back([this] {
+            if (a.loadState != 0 || a.isLoading() || !a.scene || a.uploading) return -1;
+            size_t kept = 0;
+            bool there = false;
+            for (const Object& o : a.objects) {
+                if (o.deleted) continue;
+                ++kept;
+                float mn[3], mx[3];
+                a.worldBounds(o, mn, mx);
+                const float c[3] = {(mn[0] + mx[0]) * 0.5f, (mn[1] + mx[1]) * 0.5f, (mn[2] + mx[2]) * 0.5f};
+                there |= dist3(c, pasteAt) < 1e-3f;
+            }
+            check(kept == 2 && there, "reopened, the pasted object is there, where it was put (the undone paste stays gone)", std::to_string(kept) + " objects");
+            const auto& ss = a.scene->world.seats;
+            check(ss.size() == 2 && dist3(ss.back().pos, seatAt) < 1e-3f, "...and the pasted seat", std::to_string(ss.size()) + " seats");
+            screenshot("12_pasted_reopened");
+            a.cam.pivot[0] = 2; a.cam.pivot[2] = 1;
+            check(a.pasteClipboard() && ss.size() == 3, "the clipboard still pastes into the environment opened since", std::to_string(ss.size()) + " seats");
+            a.dirty = false;
+            std::error_code ec;
+            fs::remove(pastePly, ec);
+            fs::remove(pasteFenv, ec);
+            return 2;
+        });
+        stages.push_back([this] {
+            std::error_code ec;
+            if (!longRoot.empty()) fs::remove_all(longRoot, ec);
             check(idConflictFrames == 0, "no ImGui ID conflicts anywhere during the test", idConflictWhere);
             log("done: %d passed, %d failed", passes, fails);
             finish();
@@ -9242,9 +11086,38 @@ struct SelfTest {
     std::vector<SavedFile> saved;
 
     fs::path soundWav, soundSaved, soundFenv;
+    fs::path splatPly, splatFenv;                      // the splat test's files
+    size_t pSeats = 0, pSeats2 = 0, pUndo = 0, pObjects = 0, pMeshes = 0;   // the copy-and-paste test's counts before
+    float pWorld[16] = {}, seatAt[3] = {}, seatYaw = 0, pasteAt[3] = {};
+    int pObj = -1;                                     // ...its object
+    fs::path pastePly, pasteFenv;
+    Studio::Clip clipKeep;
+    fs::path longRoot, longPly, longFenv;              // the long-path test's (longRoot: what it made)
+    fs::path colourPly, skyPng, skyFenv, skyCopy;             // the vertex-colour and panorama-sky test's files
+    // The version a .fenv's baked scene is written as (0: none, or unreadable), from its extracted copy.
+    u32 sceneVersionOf(const std::string& fenv) {
+        FenvManifest m;
+        std::vector<std::string> sources, models;
+        std::string edits, err;
+        const fs::path cache = dataDir() / L"selftest" / L"fenv-cache-version";
+        u32 head[2] = {0, 0};
+        if (fenvExtract(fenv, narrow(cache.wstring()), m, sources, models, edits, err) && !m.scene.empty()) {
+            std::ifstream in(fs::u8path(m.scene), std::ios::binary);
+            in.read(reinterpret_cast<char*>(head), sizeof head);
+        }
+        std::error_code ec;
+        fenvRelease(narrow(cache.wstring()));
+        fs::remove_all(cache, ec);
+        return head[1];
+    }
     fs::path imageFenv;
     fs::path bundleFile;
     int drawObj = -1;                                  // the Draw Floor test's object
+    ImVec2 clickAt{-1, -1};                            // the viewport click test's spot
+    std::string clickNote;
+    int clickWant = -1;                                // ...the object in front there
+    bool walkSavedAtStart = false;                     // the Auto-generate test: the area saved with the home before it
+    std::string walkGridAtStart;
     ImGuiID outlinerDockWas = 0;                       // the area-dragging test: where the Outliner was
     float invisibleWallAt[3] = {};                     // the invisible-wall test's spot (on the spawn's floor)
     size_t libraryBefore = 0;                          // My Environments' count before the bundle is unpacked into it
@@ -9301,7 +11174,18 @@ void frameRender(Studio& app, ImDrawData* draw) {
     b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     b.image = app.renderer.colorImage();
     b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, app.renderer.viewCount};
-    if (app.rendered) {
+    bool sampled = app.rendered || app.viewDrawn;   // (drawn by the UI, then not rendered: the home closed meanwhile)
+    app.viewDrawn = false;
+    if (sampled && !app.viewHasFrame) {
+        // The UI drew an image that was never rendered: the viewport was resized this frame (a new image, UNDEFINED)
+        // and the home closed before the 3D view was drawn into it. Nothing to show and no layout to change from:
+        // its draws are dropped (the viewport's background shows) rather than sampling an image in no known layout.
+        for (ImDrawList* l : draw->CmdLists)
+            for (ImDrawCmd& c : l->CmdBuffer)
+                if (c.GetTexID() == (ImTextureID)app.viewTex) c.ElemCount = 0;
+        sampled = false;
+    }
+    if (sampled) {
         b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
         b.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
         b.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
@@ -9319,7 +11203,7 @@ void frameRender(Studio& app, ImDrawData* draw) {
     vkCmdBeginRenderPass(fd->CommandBuffer, &rp, VK_SUBPASS_CONTENTS_INLINE);
     ImGui_ImplVulkan_RenderDrawData(draw, fd->CommandBuffer);
     vkCmdEndRenderPass(fd->CommandBuffer);
-    if (app.rendered) {
+    if (sampled) {
         b.oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
         b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
         b.srcAccessMask = 0;
@@ -9376,6 +11260,7 @@ bool allowClose() {
 void filesDropped(const std::vector<std::string>& files) {
     if (!g_app || files.empty()) return;
     if (files.size() == 1 && isSoundFile(files[0]) && g_app->scene) g_app->addSoundFile(files[0]);
+    else if (g_app->scene && std::all_of(files.begin(), files.end(), [](const std::string& f) { return isSplatPath(f); })) g_app->importFiles(files);   // splats join the home
     else g_app->open(files);
 }
 
@@ -9482,6 +11367,86 @@ void loadFonts(float scale, float density) {
     if (!g_fontBold && bold) { g_fontBold = addFont(bold, 14.0f * scale); g_fontTitle = addFont(bold, 28.0f * scale); }
 }
 
+// Diagnostics: FS_FRAMELOG=<file> writes one line per frame (where its time went); FS_BENCH=1 also drives the open
+// home by itself (orbit, Inspector tabs, selecting, a gizmo drag, undo) and closes Studio when done. For measuring
+// frame times without a person at the mouse; nothing of what it does is saved.
+struct FrameBench {
+    FILE* log = nullptr;
+    bool driving = false;
+    int phase = -1, frame = 0, phaseFrame = 0, gizmoObj = -1;
+    std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+    FrameBench() {
+        if (const char* f = std::getenv("FS_FRAMELOG")) log = std::fopen(f, "w");
+        driving = std::getenv("FS_BENCH") != nullptr;
+        if (log) std::fprintf(log, "frame phase t_ms interval_ms wait_ms pump_ms load_ms view3d_ms ui_ms present_ms work_ms gpu3d_ms slack_ms vphase_ms lead_ms\n");
+    }
+    ~FrameBench() { if (log) std::fclose(log); }
+    const char* phaseName() const {
+        static const char* const names[] = {"orbit", "tab-world", "tab-environment", "tab-bundle", "tab-headset", "tab-selection", "select", "gizmo", "undo", "done"};
+        return phase < 0 ? "load" : names[std::min(phase, 9)];
+    }
+    double ms() const { return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count(); }
+    void next() { ++phase; phaseFrame = 0; std::fprintf(stderr, "[bench] %s at %.0f ms\n", phaseName(), ms()); std::fflush(stderr); }
+
+    // Before the frame's UI: moves the camera / selection / tabs and queues keys, as a person would.
+    void drive(Studio& a, FramePacer& pacer) {
+        if (!driving) return;
+        pacer.noteInput();   // keep the frame rate up, as when someone is using it
+        ++phaseFrame;
+        ImGuiIO& io = ImGui::GetIO();
+        if (phase < 0) { if (a.scene && !a.isLoading() && phaseFrame > 30) next(); return; }
+        a.cam.yaw += 0.01f;   // a slow orbit throughout: the 3D view changes every frame
+        auto done = [&](int frames) { if (phaseFrame >= frames) next(); };
+        switch (phase) {
+            case 0: done(600); break;
+            case 1: case 2: case 3: case 4: case 5:
+                if (phaseFrame == 1) a.showInspectorTab(phase == 1 ? Studio::InspectorTab::World : phase == 2 ? Studio::InspectorTab::Environment
+                                                        : phase == 3 ? Studio::InspectorTab::Bundle : phase == 4 ? Studio::InspectorTab::Headset : Studio::InspectorTab::Selection);
+                done(150);
+                break;
+            case 6: {   // select objects one after another (the highlight and the Inspector rebuild for each)
+                const int n = static_cast<int>(a.objects.size());
+                if (n && phaseFrame % 3 == 0) { a.selected = (phaseFrame / 3) % n; a.wKind = a.wIndex = -1; }
+                done(600);
+                break;
+            }
+            case 7: {   // drag the biggest object with the gizmo, as Move would
+                if (phaseFrame == 1) {
+                    size_t best = 0;
+                    for (size_t i = 0; i < a.objects.size(); ++i) if (a.objects[i].triangles > a.objects[best].triangles && !a.objects[i].deleted) best = i;
+                    gizmoObj = a.objects.empty() ? -1 : static_cast<int>(best);
+                    if (gizmoObj >= 0) { a.selected = gizmoObj; a.pushUndo(static_cast<size_t>(gizmoObj)); }
+                }
+                if (gizmoObj >= 0) { Object& o = a.objects[static_cast<size_t>(gizmoObj)]; o.pivot[12] += 0.002f; a.apply(o); }
+                done(400);
+                break;
+            }
+            case 8:   // Ctrl+Z, pressed every 20 frames
+                if (phaseFrame % 20 == 1) { io.AddKeyEvent(ImGuiMod_Ctrl, true); io.AddKeyEvent(ImGuiKey_Z, true); }
+                if (phaseFrame % 20 == 3) { io.AddKeyEvent(ImGuiKey_Z, false); io.AddKeyEvent(ImGuiMod_Ctrl, false); }
+                done(200);
+                break;
+            default:
+                if (phaseFrame == 1) { a.dirty = false; if (a.window.requestClose) a.window.requestClose(); }
+                break;
+        }
+    }
+
+    // slack: how long before the refresh it was meant for the frame was presented (locked pacing); vphase: when, after
+    // the last refresh, it was presented.
+    void record(Studio& a, const FramePacer& pacer, std::chrono::steady_clock::time_point presented, double interval, double wait, double pump,
+                double load, double view, double ui, double present, double work) {
+        if (!log) return;
+        auto msBetween = [](std::chrono::steady_clock::time_point x, std::chrono::steady_clock::time_point y) { return std::chrono::duration<double, std::milli>(y - x).count(); };
+        const double slack = pacer.targetVblank() == std::chrono::steady_clock::time_point() ? -99 : msBetween(presented, pacer.targetVblank());
+        std::chrono::steady_clock::time_point last;
+        double period = 0, phase = -1;
+        if (pacer.vblank(last, period)) phase = std::fmod(std::fmod(msBetween(last, presented), period) + period, period);
+        std::fprintf(log, "%d %s %.1f %.3f %.3f %.3f %.3f %.3f %.3f %.3f %.3f %.3f %.3f %.3f %.3f\n", frame++, phaseName(), ms(), interval, wait, pump, load, view,
+                     ui, present, work, a.renderer.lastGpuMs(), slack, phase, std::clamp(pacer.frameCostMs() + FramePacer::kSpareMs, 1.5, period > 0 ? period - 0.5 : 99.0));
+    }
+};
+
 int fail(const std::string& what) {
     platform::message("Frame Studio", what, platform::Icon::Error);
     return 1;
@@ -9534,10 +11499,12 @@ int runStudio(StudioWindow& window, const std::vector<std::string>& args) {
     g_wd.ClearValue.color = {{0.11f, 0.11f, 0.11f, 1}};
     ImGui_ImplVulkanH_CreateOrResizeWindow(r.instance(), r.physicalDevice(), r.device(), &g_wd, r.queueFamily(), nullptr, pixelW, pixelH, 3);
 
-    VkDescriptorPoolSize ps = {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 64};
+    // The UI's pictures: the font, the 3D view and each bundle row's thumbnail. Room for far more than a bundle lists:
+    // with the pool full the 3D view's own picture (made again on every resize) couldn't be made, and it went blank.
+    VkDescriptorPoolSize ps = {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1024};
     VkDescriptorPoolCreateInfo dpci = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     dpci.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
-    dpci.maxSets = 64;
+    dpci.maxSets = 1024;
     dpci.poolSizeCount = 1;
     dpci.pPoolSizes = &ps;
     VkDescriptorPool uiPool = VK_NULL_HANDLE;
@@ -9593,19 +11560,29 @@ int runStudio(StudioWindow& window, const std::vector<std::string>& args) {
         app->open(args);
     }
 
-    window.startHangWatchdog();
-    FramePacer pacer([&window] { return window.focused(); }, [&window](double seconds) { window.waitForInput(seconds); });
+    if (!g_selfTestRun) window.startHangWatchdog();   // (a self-test has nobody to answer it, and a slow step isn't a hang)
+    const bool benchFocus = std::getenv("FS_BENCH") != nullptr;   // (FS_BENCH: paced as if in use, whichever window has focus)
+    FramePacer pacer([&window, benchFocus] { return benchFocus || window.focused(); }, [&window](double seconds) { window.waitForInput(seconds); });
     pacer.setDisplayFps(window.displayFps());
     if (const char* fps = std::getenv("FS_FPS")) pacer.setFpsOverride(std::atof(fps));
     g_pacer = &pacer;
     std::fprintf(stderr, "[studio] display %.0f Hz\n", pacer.displayFps());
     const bool logFrameRate = std::getenv("FS_STATS") != nullptr;
 
+    FrameBench bench;                // FS_FRAMELOG / FS_BENCH (diagnostics)
+    double benchWait = 0, benchPump = 0;
+    auto benchLast = std::chrono::steady_clock::now();
     bool waitingForGpu = false;      // the last pass found the GPU still busy: this one is the same frame, already paced
+    auto frameStart = std::chrono::steady_clock::now();   // (after the pacer's wait: what the frame costs is from here)
     for (;;) {
-        if (!waitingForGpu) pacer.waitForNextFrame(app->viewChangesByItself() || g_test != nullptr);
+        const auto w0 = std::chrono::steady_clock::now();
+        if (!waitingForGpu) pacer.waitForNextFrame(app->viewChangesByItself() || g_test != nullptr || bench.driving);
+        const auto w1 = std::chrono::steady_clock::now();
+        if (!waitingForGpu) frameStart = w1;
         waitingForGpu = false;
         if (!window.pumpEvents()) break;
+        benchWait += std::chrono::duration<double, std::milli>(w1 - w0).count();
+        benchPump += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - w1).count();
         if (window.minimized()) { std::this_thread::sleep_for(std::chrono::milliseconds(10)); continue; }
         if (g_resizeW && g_resizeH) {
             ImGui_ImplVulkan_SetMinImageCount(3);
@@ -9631,18 +11608,21 @@ int runStudio(StudioWindow& window, const std::vector<std::string>& args) {
         const auto f0 = clk::now();
         app->finishLoad();
         app->updateWalk();
+        app->sizeViewport();
         const auto f1 = clk::now();
-        app->renderViewport();
-        const auto f2 = clk::now();
 
         ImGui_ImplVulkan_NewFrame();
         window.newImGuiFrame();
         if (g_test) g_test->inject(ImGui::GetIO());
+        bench.drive(*app, pacer);
         ImGui::NewFrame();
         ImGuizmo::BeginFrame();
         app->ui();
         if (g_test) g_test->afterUi();
         ImGui::Render();
+        const auto f2 = clk::now();
+        // The 3D view after the UI: what the mouse did this frame (orbit, a gizmo drag) is in this frame's picture.
+        app->renderViewport(false);
         const auto f3 = clk::now();
         ImDrawData* draw = ImGui::GetDrawData();
         if (draw->DisplaySize.x > 0 && draw->DisplaySize.y > 0) {
@@ -9655,11 +11635,15 @@ int runStudio(StudioWindow& window, const std::vector<std::string>& args) {
             if (!hung) { hung = true; std::this_thread::sleep_for(std::chrono::seconds(std::atoi(hang))); }
         }
         auto ms = [](clk::time_point a, clk::time_point b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
+        pacer.noteFrameCost(ms(frameStart, f4) + (app->rendered ? app->renderer.lastGpuMs() : 0.0));   // (how early the next frame starts)
+        bench.record(*app, pacer, f4, ms(benchLast, f4), benchWait, benchPump, ms(f0, f1), ms(f2, f3), ms(f1, f2), ms(f3, f4), ms(f0, f4));
+        benchLast = f4;
+        benchWait = benchPump = 0;
         if (logFrameRate) {   // FS_STATS=1: the frame rate and where a frame's CPU time goes, every 5 s
             static int framesCounted = 0;
             static double viewMsSum = 0, uiMsSum = 0, presentMsSum = 0, gpuMsSum = 0;
             static clk::time_point windowStart = f0;
-            ++framesCounted; gpuMsSum += app->renderer.lastGpuMs(); viewMsSum += ms(f1, f2); uiMsSum += ms(f2, f3); presentMsSum += ms(f3, f4);
+            ++framesCounted; gpuMsSum += app->renderer.lastGpuMs(); viewMsSum += ms(f2, f3); uiMsSum += ms(f1, f2); presentMsSum += ms(f3, f4);
             if (const double secs = ms(windowStart, f4) / 1000; secs >= 5) {
                 std::fprintf(stderr, "[studio] %.1f fps (display %.0f Hz), 3D view %ux%u: 3D %.2f ms (GPU %.2f ms), UI %.2f ms, present %.2f ms a frame\n",
                              framesCounted / secs, pacer.displayFps(), app->viewW, app->viewH, viewMsSum / framesCounted, gpuMsSum / framesCounted,
@@ -9670,13 +11654,18 @@ int runStudio(StudioWindow& window, const std::vector<std::string>& args) {
         }
         if (ms(f0, f4) > 40.0)
             std::fprintf(stderr, "[studio] slow frame %.1f ms: load step %.1f, 3D %.1f, UI %.1f, present %.1f\n",
-                         ms(f0, f4), ms(f0, f1), ms(f1, f2), ms(f2, f3), ms(f3, f4));
+                         ms(f0, f4), ms(f0, f1), ms(f2, f3), ms(f1, f2), ms(f3, f4));
     }
 
     g_pacer = nullptr;
     vkDeviceWaitIdle(r.device());
     window.stopHangWatchdog();
     if (app->saver.joinable()) app->saver.join();
+    if (app->saveFailed) {   // the Save asked for on the way out didn't make it: say so (the window's already gone)
+        std::string why;
+        { std::lock_guard<std::mutex> l(app->statusMutex); why = app->saveStatus; }
+        platform::message("Frame Studio", "Your changes couldn't be saved.\n" + why, platform::Icon::Warning);
+    }
     if (app->restartAfterClose && !platform::launch(updater::updatedProgram()))   // Help > updates: Restart Now
         platform::message("Frame Studio", "The updated Frame Studio didn't start. Open it again from its folder.", platform::Icon::Warning);
     if (app->loadState == 1 || app->loadAbandoned) {   // a home still being read: nothing to lose, and waiting for it is what stalls
@@ -9736,6 +11725,7 @@ LRESULT WINAPI wndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             return 0;
         case WM_GETMINMAXINFO:
             reinterpret_cast<MINMAXINFO*>(lParam)->ptMinTrackSize = {900, 560};
+            if (std::getenv("FS_WINDOW")) reinterpret_cast<MINMAXINFO*>(lParam)->ptMaxTrackSize = {8192, 8192};
             return 0;
         case WM_DROPFILES: {
             HDROP drop = reinterpret_cast<HDROP>(wParam);
@@ -9767,14 +11757,18 @@ public:
     explicit Win32Window(HINSTANCE inst) : inst_(inst) {
         ImGui_ImplWin32_EnableDpiAwareness();
         scale_ = ImGui_ImplWin32_GetDpiScaleForMonitor(MonitorFromPoint(POINT{0, 0}, MONITOR_DEFAULTTOPRIMARY));
-        wc_ = {sizeof wc_, CS_CLASSDC, wndProc, 0, 0, inst, LoadIconW(nullptr, MAKEINTRESOURCEW(32512) /* IDI_APPLICATION */),
-               LoadCursorW(nullptr, MAKEINTRESOURCEW(32512) /* IDC_ARROW */), nullptr, nullptr, L"FrameStudio", nullptr};
+        // The app icon (studio.rc's icon 1, art/icon/frame-studio.ico): big for Alt+Tab and the taskbar, small for the title bar.
+        HICON iconBig = static_cast<HICON>(LoadImageW(inst, MAKEINTRESOURCEW(1), IMAGE_ICON, GetSystemMetrics(SM_CXICON), GetSystemMetrics(SM_CYICON), 0));
+        HICON iconSmall = static_cast<HICON>(LoadImageW(inst, MAKEINTRESOURCEW(1), IMAGE_ICON, GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), 0));
+        wc_ = {sizeof wc_, CS_CLASSDC, wndProc, 0, 0, inst, iconBig ? iconBig : LoadIconW(nullptr, MAKEINTRESOURCEW(32512) /* IDI_APPLICATION */),
+               LoadCursorW(nullptr, MAKEINTRESOURCEW(32512) /* IDC_ARROW */), nullptr, nullptr, L"FrameStudio", iconSmall};
         RegisterClassExW(&wc_);
         // 1600 x 960, but never bigger than the screen's free area (so the taskbar can't cover the status bar), centred on it.
         RECT work = {0, 0, static_cast<LONG>(1600 * scale_), static_cast<LONG>(960 * scale_)};
         SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0);
-        const int winW = std::min(static_cast<int>(1600 * scale_), static_cast<int>(work.right - work.left));
-        const int winH = std::min(static_cast<int>(960 * scale_), static_cast<int>(work.bottom - work.top));
+        int winW = std::min(static_cast<int>(1600 * scale_), static_cast<int>(work.right - work.left));
+        int winH = std::min(static_cast<int>(960 * scale_), static_cast<int>(work.bottom - work.top));
+        if (const char* size = std::getenv("FS_WINDOW")) std::sscanf(size, "%dx%d", &winW, &winH);   // diagnostics: this size, even past the screen
         hwnd_ = CreateWindowW(wc_.lpszClassName, L"Frame Studio", WS_OVERLAPPEDWINDOW,
                               work.left + (work.right - work.left - winW) / 2, work.top + (work.bottom - work.top - winH) / 2,
                               winW, winH, nullptr, nullptr, inst, nullptr);
@@ -9924,6 +11918,18 @@ public:
         if (!window_) return;
         glfwSetWindowPos(window_, wx + (ww - winW) / 2, wy + (wh - winH) / 2);
         glfwSetWindowSizeLimits(window_, 900, 560, GLFW_DONT_CARE, GLFW_DONT_CARE);
+#ifndef __APPLE__
+        {   // the window's icon: frame-studio.png beside the program (macOS takes the bundle's .icns instead)
+            std::ifstream in(exeDir() / "frame-studio.png", std::ios::binary);
+            const std::vector<unsigned char> bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+            int w = 0, h = 0, c = 0;
+            if (unsigned char* px = bytes.empty() ? nullptr : stbi_load_from_memory(bytes.data(), static_cast<int>(bytes.size()), &w, &h, &c, 4)) {
+                const GLFWimage icon{w, h, px};
+                glfwSetWindowIcon(window_, 1, &icon);
+                stbi_image_free(px);
+            }
+        }
+#endif
         // Ours first: ImGui's backend (initImGui) chains to them. Every input counts for the frame pacer.
         glfwSetKeyCallback(window_, [](GLFWwindow*, int, int, int, int) { noteInput(); });
         glfwSetCharCallback(window_, [](GLFWwindow*, unsigned) { noteInput(); });

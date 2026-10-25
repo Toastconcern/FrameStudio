@@ -10,7 +10,8 @@
 //   right stick forward aims a teleport arc from the right hand, drawn by Frame Home itself (guide(), guide_geom.h)
 //     with a marker where you'll land. The arc stops at the first thing it meets: a floor you can stand on (or a
 //     seat) is the landing; a wall, a ceiling or the side of furniture means nowhere — unless it's low, then you land
-//     at its foot. Let go to go there: instantly behind a quick fade to black (a blink), or as a 0.25 s
+//     at its foot. Let go to go there: instantly behind a quick fade to black (a blink: SteamVR's fade, or in system
+//     mode Frame Home's own through the layer, setOwnFade / blinkLevel), or as a 0.25 s
 //     eased dash along the ground (slide). Landing near a teleport hotspot snaps onto it. Teleport off: the stick
 //     forward does nothing. In gravity homes a slide is an instant blink (the walker re-orients you on landing).
 //   seats show a faint marker near you; pointing a hand at one lights it up (with a short pointer line), and pulling
@@ -212,6 +213,30 @@ public:
     // Frame Home draws the guide itself: the SteamVR ring overlay only stands in when it can't (fallback = true).
     void setRingFallback(bool on) { ringOn_ = on; if (!on && ring_ && vr::VROverlay()) vr::VROverlay()->HideOverlay(ring_); }
     bool sliding() const { return slideT_ >= 0; }
+    // This frame's smooth turn (rad/s, + = left; 0 for a snap, which is a jump, not motion to carry on). The layer turns
+    // a frame it shows again by it (env_share.h Motion).
+    float turnRate() const { return turnRate_; }
+    // System mode: SteamVR's fade is the scene app's, so a blink fades Frame Home's own picture instead (main.cpp
+    // multiplies blinkLevel() into the brightness the layer draws with).
+    void setOwnFade(bool on) { ownFade_ = on; }
+    // A blink's brightness now: 1 open, down to 0 over kBlinkOut, black as you land, back up over kBlinkIn.
+    float blinkLevel() const {
+        if (blinkT_ >= 0) return std::clamp(blinkT_ / kBlinkOut, 0.0f, 1.0f);
+        return blinkInT_ > 0 ? 1 - blinkInT_ / kBlinkIn : 1.0f;
+    }
+    // How far ahead of the eyes the view meets something (m, 1..8; 8 when nothing does, 4 in a home with nothing to
+    // walk on): the layer's guess at depth when it carries a frame on for walking (env_share.h Motion).
+    float viewDepth(const float headT[16]) const {
+        if (!runtime_.hasFloor()) return 4.0f;
+        float R[16], o[3], f[3];
+        rig(R);
+        apply(R, &headT[12], o);
+        const float hz[3] = {-headT[8] * 8, -headT[9] * 8, -headT[10] * 8};   // the head's -Z, 8 m of it
+        dir(R, hz, f);
+        float t, n[3];
+        if (runtime_.trace(o, f, t, n) == WorldRuntime::None) return 8.0f;
+        return std::clamp(t * 8, 1.0f, 8.0f);
+    }
 
     // worldFromTracking (column-major).
     void rig(float m[16]) const {
@@ -228,6 +253,8 @@ public:
     // Once per frame, with the head's tracking-space pose (column-major, as from OpenVR).
     void update(float dt, const float headT[16]) {
         dt = std::min(dt, 0.05f);
+        turnRate_ = 0;
+        if (blinkInT_ > 0) blinkInT_ = std::max(0.0f, blinkInT_ - dt);
         checkEyeHeight(dt, headT[13]);
         guide_.seats.clear();
         guide_.pointer = false;
@@ -277,13 +304,17 @@ public:
             float lx = 0, ly = 0;
             if (walk) grav::shapeStick(l.x, l.y, lx, ly);
             if (gravityMode_) { updateGravity(dt, headT, lx, ly, r); return; }
-            // Walking and teleport both off: the stick still stands you up from a seat (else only stepping away would)
-            if (seated_ >= 0 && walk_ == 0 && teleport_ == 0 && l.bActive) {
-                float sx = 0, sy = 0;
-                grav::shapeStick(l.x, l.y, sx, sy);
-                if ((sx != 0 || sy != 0) && slideT_ < 0 && blinkT_ < 0) { leaveSeat(headT, head, R); rig(R); apply(R, &headT[12], head); }
+            // Seated, the stick stands you up (walking and teleport both off too: else only stepping away would). Only
+            // once it has come back to centre since you sat, and pushed well past the deadzone: a stick still held
+            // from walking there, or a worn one drifting, would jump you straight back out of the seat.
+            if (seated_ >= 0) {
+                const float m = l.bActive ? std::hypot(l.x, l.y) : 0.0f;
+                if (m < 0.2f) standArmed_ = true;
+                if (standArmed_ && m > 0.6f && (walk || (walk_ == 0 && teleport_ == 0 && l.bActive)) && slideT_ < 0 && blinkT_ < 0) {
+                    leaveSeat(headT, head, R); rig(R); apply(R, &headT[12], head);
+                }
+                lx = ly = 0;   // (the push that stood you up doesn't also walk you this frame)
             }
-            if ((lx != 0 || ly != 0) && seated_ >= 0) { leaveSeat(headT, head, R); rig(R); apply(R, &headT[12], head); }
             // The velocity eases toward the stick's (grav::approach); a jump or a seat stops it dead.
             grav::V want;
             if (lx != 0 || ly != 0) {
@@ -307,7 +338,7 @@ public:
                 float f;
                 if (!runtime_.hasFloor() || runtime_.floorAt(x, z, floorY_, 0.45f, 1.2f, f)) {   // never walk off an edge
                     rigX_ += x - head[0]; rigZ_ += z - head[2];
-                    vel_[0] = (x - head[0]) / dt; vel_[1] = (z - head[2]) / dt;   // what a wall left of it: no pent-up push
+                    if (dt > 0) { vel_[0] = (x - head[0]) / dt; vel_[1] = (z - head[2]) / dt; }   // what a wall left of it: no pent-up push (a 0 s frame: NaN)
                     head[0] = x; head[2] = z;
                 } else {
                     vel_[0] = vel_[1] = 0;
@@ -485,8 +516,10 @@ private:
         }
     }
 
-    // Sits in seat i: the head over the seat, still facing the way you were, eyes kSeatedEye over its surface (whatever
-    // your real height: you may be standing in the room).
+    // Sits in seat i: the head over the seat, turned to face the seat's way (its yaw, as Frame Studio's arrow shows it:
+    // 0 faces -Z), eyes kSeatedEye over its surface (whatever your real height: you may be standing in the room).
+    // The turn is the rig's, about the head (as a snap turn), so the way your head points in the room ends up along the
+    // seat's front and the head stays over the seat.
     static constexpr float kSeatedEye = 0.78f;
     static constexpr float kArcSpeed = 10.0f;    // the teleport arc's launch speed (m/s)
     static constexpr float kHeadClear = 0.15f;   // the eyes never come closer than this to anything solid (m)
@@ -495,9 +528,30 @@ private:
         rigX_ += st.pos[0] - head[0];
         rigZ_ += st.pos[2] - head[2];
         head[0] = st.pos[0]; head[2] = st.pos[2];
-        (void)R;
+        {   // the head's forward on the floor (looking straight down or up: the top of the head points the way you face)
+            float f[3];
+            const float hz[3] = {-headT[8], -headT[9], -headT[10]};
+            dir(R, hz, f);
+            if (std::hypot(f[0], f[2]) < 0.2f) {
+                float u[3];
+                const float hy[3] = {headT[4], headT[5], headT[6]};
+                dir(R, hy, u);
+                const float sg = f[1] < 0 ? 1.0f : -1.0f;
+                f[0] = u[0] * sg; f[2] = u[2] * sg;
+            }
+            if (std::hypot(f[0], f[2]) > 1e-4f) {
+                float a = st.yaw - std::atan2(-f[0], -f[2]);
+                a = std::remainder(a, 6.2831853f);
+                const float c = std::cos(a), s = std::sin(a);
+                const float ox = rigX_ - head[0], oz = rigZ_ - head[2];
+                rigX_ = head[0] + c * ox + s * oz;
+                rigZ_ = head[2] - s * ox + c * oz;
+                rigYaw_ = std::remainder(rigYaw_ + a, 6.2831853f);
+            }
+        }
         seatRigY_ = st.pos[1] + kSeatedEye - headT[13];
         seated_ = i;
+        standArmed_ = false;                                      // the stick must come back to centre before it stands you up
         std::fprintf(stderr, "frame-home: sitting in %s\n", st.name.c_str());
     }
 
@@ -597,17 +651,26 @@ private:
     // held slightly off-centre shouldn't spin you).
     static constexpr float kTurnRate = 2.0944f;              // 120 degrees/s
     float turnBy(float dt, float rx, float ry) {
-        if (turn_ == 1) return aiming_ || std::fabs(ry) > 0.7f ? 0.0f : -dead(rx) * kTurnRate * dt;
+        if (turn_ == 1) { turnRate_ = aiming_ || std::fabs(ry) > 0.7f ? 0.0f : -dead(rx) * kTurnRate; return turnRate_ * dt; }
         if (!turnArmed_ && std::fabs(rx) < 0.3f) turnArmed_ = true;
         if (turnArmed_ && std::fabs(rx) > 0.75f && std::fabs(ry) < 0.6f) { turnArmed_ = false; return rx > 0 ? -snap_ : snap_; }
         return 0;
     }
 
     // Instant teleports blink: fade to black, jump, fade back. In system mode Frame Home isn't the scene app and
-    // the compositor may ignore the fade; then the blink is just a 80 ms wait.
-    static constexpr float kBlinkOut = 0.08f, kSlide = 0.25f;
-    bool blinkOut() const { if (!ok_ || !vr::VRCompositor()) return false; vr::VRCompositor()->FadeToColor(kBlinkOut, 0, 0, 0, 1); return true; }
-    void blinkIn() const { if (ok_ && vr::VRCompositor()) vr::VRCompositor()->FadeToColor(0.12f, 0, 0, 0, 0); }
+    // the compositor ignores its fade (the blink was an unfaded 80 ms freeze, then the jump): there the fade is
+    // Frame Home's own (setOwnFade), blinkLevel() darkening the picture the layer draws.
+    static constexpr float kBlinkOut = 0.08f, kBlinkIn = 0.12f, kSlide = 0.25f;
+    bool blinkOut() const {
+        if (ownFade_) return true;
+        if (!ok_ || !vr::VRCompositor()) return false;
+        vr::VRCompositor()->FadeToColor(kBlinkOut, 0, 0, 0, 1);
+        return true;
+    }
+    void blinkIn() {
+        if (ownFade_) { blinkInT_ = kBlinkIn; return; }
+        if (ok_ && vr::VRCompositor()) vr::VRCompositor()->FadeToColor(kBlinkIn, 0, 0, 0, 0);
+    }
     static float ease(float t) { return t * t * (3 - 2 * t); }
 
     // Off to jump_ (and into seat jumpSeat_ when >= 0): a 0.25 s dash (slide), or a blink — instant behind a fade.
@@ -662,6 +725,7 @@ private:
     float fallV_ = 0, fallen_ = 0, fallLimit_ = 30;
     int respawns_ = 0;
     int seated_ = -1;
+    bool standArmed_ = false;                                     // seated: the left stick has been back at centre
     float seatRigY_ = 0;
     bool ownInput_ = false;
     bool menuAim_ = false;
@@ -697,6 +761,9 @@ private:
     float jump_[3] = {0, 0, 0}, jumpN_[3] = {0, 1, 0};
     int jumpSeat_ = -1;
     float blinkT_ = -1, slideT_ = -1, slideDX_ = 0, slideDZ_ = 0, slideY0_ = 0;
+    float blinkInT_ = 0;                                 // own fade: a blink's fade back in still to go (s)
+    bool ownFade_ = false;
+    float turnRate_ = 0;                                 // this frame's smooth turn (rad/s)
     bool test_ = false, testAimOk_ = false, testLeftOk_ = false, testTrig_[2] = {false, false};
     float testIn_[4] = {}, testAim_[12] = {}, testLeft_[12] = {};
 
@@ -820,7 +887,10 @@ private:
             const WorldCollider* shape = nullptr;
             const WorldRuntime::Hit h = runtime_.trace(p, seg, t, n, &shape);
             const int si = seatOnSegment(p, seg, ts);
-            if (si >= 0 && (h == WorldRuntime::None || ts <= t)) {
+            // only an arc coming down onto the top of a seat takes it: one passing a raised stool on its way up, or
+            // through its side on the way to the floor beside it, flies on
+            if (si >= 0 && seg[1] < 0 && p[1] + seg[1] * ts > world_.seats[si].pos[1] + kSeatLift &&
+                (h == WorldRuntime::None || ts <= t)) {
                 const float q[3] = {p[0] + seg[0] * ts, p[1] + seg[1] * ts, p[2] + seg[2] * ts};
                 keep(q);
                 seat_ = si;
@@ -831,7 +901,9 @@ private:
             if (h != WorldRuntime::None) {
                 const float q[3] = {p[0] + seg[0] * t, p[1] + seg[1] * t, p[2] + seg[2] * t};
                 keep(q);
-                if (h == WorldRuntime::Block && (seat_ = seatOf(q, shape)) >= 0) {   // the chair's back or arm: the chair
+                // the chair's own back or arm (its collider centred on the seat): the chair. Not a desk or table beside it:
+                // aiming at one of those lands by it.
+                if (h == WorldRuntime::Block && shape && (seat_ = seatNear(&shape->world[12])) >= 0) {
                     seatTarget(seat_, target_);
                     valid_ = true;
                 } else if (runtime_.landingFor(h, q, n, target_)) {

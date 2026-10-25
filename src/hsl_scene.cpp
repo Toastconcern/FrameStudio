@@ -30,11 +30,13 @@
 
 namespace {
 
-// Reads a whole zip entry; empty on failure.
+// Reads a whole zip entry; empty on failure. Its declared size is the file's word (only the outer APK is validated):
+// past 1 GB, or more than this memory holds, it's taken as damaged rather than allocated.
 std::vector<u8> extract(mz_zip_archive& z, int index) {
     mz_zip_archive_file_stat st;
-    if (!mz_zip_reader_file_stat(&z, static_cast<mz_uint>(index), &st)) return {};
-    std::vector<u8> out(static_cast<size_t>(st.m_uncomp_size));   // unpacked straight into place
+    if (!mz_zip_reader_file_stat(&z, static_cast<mz_uint>(index), &st) || st.m_uncomp_size > (uint64_t(1) << 30)) return {};
+    std::vector<u8> out;
+    try { out.resize(static_cast<size_t>(st.m_uncomp_size)); } catch (const std::exception&) { return {}; }   // unpacked straight into place
     if (!mz_zip_reader_extract_to_mem(&z, static_cast<mz_uint>(index), out.data(), out.size(), 0)) return {};
     return out;
 }
@@ -48,7 +50,8 @@ std::string surfaceName(const std::string& path) {
 
 // Scans assets/scene.zip: every RENDSHAD forward pass (shader programs) and the merged lightprobe
 // ambient (lightprobes_merged.lprb, field2 = global SH; L00 / 3.5449 = ambient radiance).
-void scanSceneZip(const std::string& apkPath, HslScene& scene) {
+// only: just these programs (asset paths without "content/"), nothing else (borrowing from another APK).
+void scanSceneZip(const std::string& apkPath, HslScene& scene, const std::set<std::string>* only = nullptr) {
     const std::shared_ptr<const std::vector<u8>> sceneZip = scenezip::get(apkPath);   // the loader's copy
     if (!sceneZip || sceneZip->empty()) return;
 
@@ -61,6 +64,7 @@ void scanSceneZip(const std::string& apkPath, HslScene& scene) {
         std::string base = name.substr(name.find_last_of('/') + 1);
 
         // Any "<name>.surface/<hash>/shader*" entry: older homes keep theirs under meta/clay_shaders/0.0.1/, not /shaders/.
+        if (only && !only->count(name.rfind("content/", 0) == 0 ? name.substr(8) : name)) continue;
         if (name.find(".surface/") != std::string::npos && base.rfind("shader", 0) == 0) {
             std::vector<u8> data = extract(z, static_cast<int>(i));
             std::vector<SpirvBlob> blobs;
@@ -91,6 +95,45 @@ void scanSceneZip(const std::string& apkPath, HslScene& scene) {
         }
     }
     mz_zip_reader_end(&z);
+}
+
+// A vista is cooked against the footprint it ships with: horizon_shared_shaders programs the footprint carries are
+// left out of the vista (Horror's garden ground / fence / rocks: unlittiledlightmaprgmasked, unpacked*, ...), and the
+// headset has them because both load together. Opened alone (or with another room), those meshes had no program: take
+// the exact same asset (same path = same cooked program) from a footprint APK beside it (Downloads; envs/ on the Quest).
+void borrowMissingPrograms(HslScene& scene) {
+    std::set<std::string> missing;
+    for (const MeshData& md : scene.meshes)
+        if (!md.shaderPath.empty() && !md.overlayKind && !findProgram(scene, md.shaderPath)) missing.insert(md.shaderPath);
+    if (missing.empty()) return;
+    std::set<std::string> dirs;
+    for (const std::string& p : scene.apkPaths) {
+        const size_t s = p.find_last_of("/\\");
+        dirs.insert(s == std::string::npos ? std::string(".") : p.substr(0, s));
+    }
+    std::vector<std::string> candidates;
+    for (const std::string& d : dirs) {
+        std::error_code ec;
+        for (const auto& e : std::filesystem::directory_iterator(std::filesystem::u8path(d), ec)) {
+            std::string f = e.path().filename().u8string();
+            for (char& c : f) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            if (f.size() < 4 || f.compare(f.size() - 4, 4, ".apk") != 0 || f.find("footprint") == std::string::npos) continue;
+            const std::string full = e.path().u8string();
+            if (std::find(scene.apkPaths.begin(), scene.apkPaths.end(), full) == scene.apkPaths.end()) candidates.push_back(full);
+        }
+    }
+    std::sort(candidates.begin(), candidates.end());
+    for (const std::string& apk : candidates) {
+        const size_t before = scene.programs.size();
+        scanSceneZip(apk, scene, &missing);
+        if (scene.programs.size() == before) continue;
+        for (auto it = missing.begin(); it != missing.end();) it = scene.programs.count(*it) ? missing.erase(it) : std::next(it);
+        std::fprintf(stderr, "[scene] %zu shader program(s) the vista leaves to its footprint taken from %s\n",
+                     scene.programs.size() - before, apk.c_str());
+        if (missing.empty()) break;
+    }
+    for (const std::string& m : missing)
+        std::fprintf(stderr, "[scene] shader program %s: not in this home or a footprint beside it\n", m.c_str());
 }
 
 // AndroidManifest.xml (binary XML): the <manifest> element's package and versionName attributes.
@@ -154,6 +197,9 @@ constexpr const char* kClayProgram = "builtin/clay.surface/0/shader";
 constexpr const char* kClayCutoutProgram = "builtin/clay_cutout.surface/0/shader";
 constexpr const char* kClaySkinnedProgram = "builtin/clay_skinned.surface/0/shader";             // skinned on the GPU
 constexpr const char* kClaySkinnedCutoutProgram = "builtin/clay_skinned_cutout.surface/0/shader";
+// Imported models with their own vertex colours (PLY scans, glTF COLOR_0): the same programs, times those colours.
+constexpr const char* kClayVColorProgram = "builtin/clay_vcolor.surface/0/shader";
+constexpr const char* kClayVColorCutoutProgram = "builtin/clay_vcolor_cutout.surface/0/shader";
 
 // The home's looping ambience: an Ogg Vorbis entry of scene.zip (Clay homes ship _BACKGROUND_LOOP.ogg).
 static std::vector<u8> findAmbientOgg(const std::string& apkPath, std::string& source, std::string& name) {
@@ -258,6 +304,25 @@ static void addClayPrograms(HslScene& scene) {
     p.frag.assign(std::begin(kClayFragSpirv), std::end(kClayFragSpirv));
     scene.programs[p.path] = p;
 }
+// (only when a model uses them: a scene without vertex colours bakes exactly as before)
+static void addVColorPrograms(HslScene& scene) {
+    ShaderProgramSrc p;
+    p.path = kClayVColorProgram;
+    p.vert.assign(std::begin(kClayVColorVertSpirv), std::end(kClayVColorVertSpirv));
+    p.frag.assign(std::begin(kClayFragSpirv), std::end(kClayFragSpirv));
+    scene.programs[p.path] = p;
+    p.path = kClayVColorCutoutProgram;
+    p.frag.assign(std::begin(kClayFragCutoutSpirv), std::end(kClayFragCutoutSpirv));
+    scene.programs[p.path] = p;
+}
+// Vertex colours a model's file means to be seen: PLY's (scans) and glTF's COLOR_0 (the spec multiplies it in).
+// FBX / OBJ colour layers are often painting masks or bake data, so those stay as before.
+static bool showsVertexColours(const std::string& path, const MeshData& md) {
+    if (md.colors.size() < static_cast<size_t>(md.nVerts) * 4 || md.colors.empty()) return false;
+    std::string ext = path.substr(path.find_last_of('.') == std::string::npos ? path.size() : path.find_last_of('.'));
+    for (char& c : ext) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return ext == ".ply" || ext == ".gltf" || ext == ".glb";
+}
 
 // A .fenv: its baked scene when it has one (instant), else its homes and models through the normal loaders.
 static bool loadFenv(const std::string& path, HslScene& scene, std::string& error) {
@@ -275,8 +340,19 @@ static bool loadFenv(const std::string& path, HslScene& scene, std::string& erro
     } else {
         std::vector<std::string> all = sources;
         all.insert(all.end(), models.begin(), models.end());
-        if (all.empty()) { error = "empty environment: " + path; return false; }
-        if (!loadHslScene(all, scene, error)) return false;
+        if (all.empty() && m.splats.empty()) { error = "empty environment: " + path; return false; }
+        if (!all.empty() && !loadHslScene(all, scene, error)) return false;
+    }
+    // Its splat objects (each its own .spz member), placed as saved. One that can't be read is left out (and said so).
+    for (const FenvSplats& sp : m.splats) {
+        SplatCloud c;
+        std::string e;
+        if (!loadSplats(sp.file, c, e)) { std::fprintf(stderr, "[scene] splats %s left out: %s\n", sp.name.c_str(), e.c_str()); continue; }
+        HslSplatObject o;
+        o.name = sp.name;
+        std::memcpy(o.worldFromModel, sp.xform, sizeof o.worldFromModel);
+        o.splats = std::make_shared<const std::vector<Splat>>(std::move(c.splats));
+        scene.splats.push_back(std::move(o));
     }
     scene.fenvPath = path;
     scene.fenvEdits = edits;
@@ -286,7 +362,8 @@ static bool loadFenv(const std::string& path, HslScene& scene, std::string& erro
         HomeWorld w;
         if (worldFromJson(wj, w)) scene.world = std::move(w);
     }
-    std::fprintf(stderr, "[scene] environment %s (%s): %zu meshes\n", m.name.c_str(), m.scene.empty() ? "from its homes" : "baked", scene.meshes.size());
+    std::fprintf(stderr, "[scene] environment %s (%s): %zu meshes, %zu splat objects\n", m.name.c_str(), m.scene.empty() ? "from its homes" : "baked",
+                 scene.meshes.size(), scene.splats.size());
     return true;
 }
 
@@ -311,13 +388,22 @@ bool loadHslScene(const std::vector<std::string>& apkPaths, HslScene& scene, std
     std::vector<std::unique_ptr<GltfLoader>> gltfs(apkPaths.size());    // the oldest custom homes (_world_model.gltf.ovrscene)
     std::vector<char> ok(apkPaths.size(), 0);
     std::vector<std::vector<MeshData>> models(apkPaths.size());           // imported Blender / Unity models
+    std::vector<SplatCloud> clouds(apkPaths.size());                      // Gaussian splat captures
     std::vector<std::string> modelErrors(apkPaths.size());
     scene.sourceFiles.resize(apkPaths.size());
     std::vector<std::thread> threads;
     for (size_t i = 0; i < apkPaths.size(); ++i) {
         loaders[i] = std::make_unique<SceneLoader>();
         loaders[i]->verbose = std::getenv("FH_VERBOSE") != nullptr;
+        // (an exception leaving a thread ends the whole process: a damaged file's bad_alloc or length_error, or a
+        // parser's throw, fails this load instead)
         threads.emplace_back([&, i] {
+          try {
+            [&] {
+            if (isSplatPath(apkPaths[i])) {                              // (before models: a 3DGS capture is a .ply too)
+                if (loadSplats(apkPaths[i], clouds[i], modelErrors[i])) ok[i] = 5;
+                return;
+            }
             if (isModelPath(apkPaths[i])) {
                 if (importModel(apkPaths[i], models[i], scene.sourceFiles[i], modelErrors[i])) ok[i] = 4;
                 return;
@@ -329,6 +415,14 @@ bool loadHslScene(const std::vector<std::string>& apkPaths, HslScene& scene, std
             gltfs[i] = std::make_unique<GltfLoader>();                // not .opa: a Clay .ovrscene home (glTF in scene.zip: SideQuest custom homes)?
             if (gltfs[i]->load(apkPaths[i])) ok[i] = 3;
             else gltfs[i].reset();
+            }();
+          } catch (const std::exception& e) {
+            ok[i] = 0;
+            modelErrors[i] = "couldn't load " + apkPaths[i] + " (damaged? " + e.what() + ")";
+          } catch (...) {
+            ok[i] = 0;
+            modelErrors[i] = "couldn't load " + apkPaths[i] + " (damaged?)";
+          }
         });
     }
     for (auto& t : threads) t.join();
@@ -340,20 +434,20 @@ bool loadHslScene(const std::vector<std::string>& apkPaths, HslScene& scene, std
     for (size_t i = 0; i < apkPaths.size(); ++i) {
         HslSourceInfo info;
         readManifest(apkPaths[i], info.package, info.version);
-        info.format = ok[i] == 1 ? "HSL" : ok[i] == 2 ? "Clay (.opa)" : ok[i] == 3 ? "Clay (.ovrscene)" : "Model";
-        if (ok[i] == 4) {
+        info.format = ok[i] == 1 ? "HSL" : ok[i] == 2 ? "Clay (.opa)" : ok[i] == 3 ? "Clay (.ovrscene)" : ok[i] == 5 ? "Splats (" + clouds[i].format + ")" : "Model";
+        if (ok[i] == 4 || ok[i] == 5) {
             const std::string file = apkPaths[i].substr(apkPaths[i].find_last_of("/\\") + 1);
             info.package = file;
             std::string ext = file.substr(file.find_last_of('.') + 1);
             for (char& c : ext) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
-            info.format = "Model (" + ext + ")";
+            if (ok[i] == 4) info.format = isSkyPanoramaPath(apkPaths[i]) ? "Panorama sky (" + ext + ")" : "Model (" + ext + ")";
         }
         // Split homes (Haven-era) ship com.meta.shell.env.footprint.<room> + ...vista.<world>; "prod.vista" is
         // Cascadia, a whole home. Without a package, the file name decides.
         std::string n = info.package.empty() ? apkPaths[i].substr(apkPaths[i].find_last_of("/\\") + 1) : info.package;
         for (char& c : n) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
         const bool named = !info.package.empty();
-        info.role = ok[i] == 4 ? "Model" : ok[i] != 1 ? "Home"
+        info.role = ok[i] == 4 ? "Model" : ok[i] == 5 ? "Splats" : ok[i] != 1 ? "Home"
                   : n.find(named ? ".footprint." : "footprint") != std::string::npos ? "Footprint"
                   : n.find(named ? ".vista." : "vista") != std::string::npos ? "Vista" : "Home";
         scene.sources.push_back(info);
@@ -367,11 +461,28 @@ bool loadHslScene(const std::vector<std::string>& apkPaths, HslScene& scene, std
             if (j != i) loaders[i]->applyLightmapOverrides(loaders[i]->meshes, loaders[j].get());
     }
     size_t lightmapped = 0;
+    // Models and splats beside a Clay / glTF home: it still animates (its meshes come first; splats have none).
+    const long extras = static_cast<long>(std::count(ok.begin(), ok.end(), 4) + std::count(ok.begin(), ok.end(), 5));
     for (size_t i = 0; i < loaders.size(); ++i) {
+        if (ok[i] == 5) {                                               // splats: an object of their own, as the file has them
+            HslSplatObject o;
+            const std::string file = apkPaths[i].substr(apkPaths[i].find_last_of("/\\") + 1);
+            o.name = file.substr(0, file.find_last_of('.'));
+            o.source = static_cast<int>(i);
+            o.splats = std::make_shared<const std::vector<Splat>>(std::move(clouds[i].splats));
+            std::fprintf(stderr, "[scene] splats %s: %zu (%s)\n", apkPaths[i].c_str(), o.splats->size(), clouds[i].format.c_str());
+            scene.splats.push_back(std::move(o));
+            continue;
+        }
         if (ok[i] == 4) {                                               // imported model: the built-in unlit programs
             addClayPrograms(scene);
             for (MeshData& md : models[i]) {
-                md.shaderPath = md.alphaTest ? kClayCutoutProgram : kClayProgram;
+                if (showsVertexColours(apkPaths[i], md)) {
+                    addVColorPrograms(scene);
+                    md.shaderPath = md.alphaTest ? kClayVColorCutoutProgram : kClayVColorProgram;
+                } else {
+                    md.shaderPath = md.alphaTest ? kClayCutoutProgram : kClayProgram;
+                }
                 scene.meshes.push_back(std::move(md));
                 scene.meshSource.push_back(static_cast<int>(i));
             }
@@ -381,7 +492,7 @@ bool loadHslScene(const std::vector<std::string>& apkPaths, HslScene& scene, std
         if (clays[i] || gltfs[i]) {                                     // Clay / glTF home: built-in programs
             addClayPrograms(scene);
             // The home animates here (below: the first home, the rest only models): its skinned meshes skin on the GPU.
-            if (clays[i] && clays[i]->hasAnimation() && i == 0 && std::count(ok.begin(), ok.end(), 4) + 1 == static_cast<long>(apkPaths.size()))
+            if (clays[i] && clays[i]->hasAnimation() && i == 0 && extras + 1 == static_cast<long>(apkPaths.size()))
                 clays[i]->prepareGpuSkin();
             // Base textures: one shared, still-compressed source per owner. The loader lets meshes cut from the same
             // part BORROW the owner's texture (texShareSrc) and empties their own copy — unresolved, those uploaded
@@ -454,7 +565,7 @@ bool loadHslScene(const std::vector<std::string>& apkPaths, HslScene& scene, std
             // The loader keeps evaluating the animation (anim_bake.h: as a .fenv's does); it works on the scene's copy of its
             // meshes (a single Clay / glTF home: the scene's meshes ARE that loader's meshes, same order).
             // Models may follow the home: they sit after its meshes, which the animator indexes from 0.
-            if (i == 0 && std::count(ok.begin(), ok.end(), 4) + 1 == static_cast<long>(apkPaths.size())) {
+            if (i == 0 && extras + 1 == static_cast<long>(apkPaths.size())) {
                 if (clays[i] && clays[i]->hasAnimation()) {
                     std::shared_ptr<OpaLoader> L(std::move(clays[i]));
                     scene.animDuration = L->animDuration();
@@ -496,6 +607,15 @@ bool loadHslScene(const std::vector<std::string>& apkPaths, HslScene& scene, std
         }
         scanSceneZip(apkPaths[i], scene);
     }
+    {   // A panorama sky chosen in Studio (model_import.h) takes the place of the home's own sky: that one draws nothing.
+        // (emptied, not removed: every mesh keeps its index, which Studio's edits go by)
+        auto fromModel = [&](size_t m) { return m < scene.meshSource.size() && scene.meshSource[m] >= 0 && ok[scene.meshSource[m]] == 4; };
+        bool chosenSky = false;
+        for (size_t m = 0; m < scene.meshes.size(); ++m) chosenSky |= scene.meshes[m].isSkybox && fromModel(m);
+        for (size_t m = 0; chosenSky && m < scene.meshes.size(); ++m)
+            if (scene.meshes[m].isSkybox && !fromModel(m)) { scene.meshes[m].indices.clear(); scene.meshes[m].nIdx = 0; }
+    }
+    borrowMissingPrograms(scene);
     // The ambience is the vista's (the world outside you hear: Calming's, Central's), the footprint's only without one
     // (Haven's footprint carries a stand-in bed of its own, Central's).
     for (auto p = apkPaths.rbegin(); p != apkPaths.rend(); ++p)
@@ -510,9 +630,34 @@ bool loadHslScene(const std::vector<std::string>& apkPaths, HslScene& scene, std
                  apkPaths.size(), scene.meshes.size(), lightmapped, scene.programs.size(),
                  scene.hasEnvAmbient ? "from env" : "synthesized", scene.ambientRGB[0], scene.ambientRGB[1], scene.ambientRGB[2],
                  std::chrono::duration<double>(t1 - t0).count(), std::chrono::duration<double>(t2 - t1).count(), scene.anims.size());
-    if (scene.meshes.empty()) { error = "home has no meshes"; return false; }
+    if (scene.meshes.empty() && scene.splats.empty()) { error = "home has no meshes"; return false; }
     simplifyWorldMeshes(scene.world);
     return true;
+}
+
+void addSplatMembers(const std::vector<HslSplatObject>& objects, FenvManifest& m, std::vector<FenvMember>& members) {
+    std::set<std::string> taken;
+    for (const HslSplatObject& o : objects) {
+        if (!o.splats || o.splats->empty()) continue;
+        // its member from its name: what any file system and zip tool takes, and a name of its own
+        std::string base;
+        for (char c : o.name) base += std::isalnum(static_cast<unsigned char>(c)) || c == '-' || c == '_' ? c : '_';
+        if (base.empty()) base = "splats";
+        std::string file = "splats/" + base + ".spz";
+        for (int k = 2; !taken.insert(file).second; ++k) file = "splats/" + base + "-" + std::to_string(k) + ".spz";
+        FenvSplats e;
+        e.file = file;
+        e.name = o.name;
+        e.count = o.splats->size();
+        std::memcpy(e.xform, o.worldFromModel, sizeof e.xform);
+        m.splats.push_back(e);
+        FenvMember f;
+        f.name = file;
+        f.bytes = writeSpz(*o.splats);
+        f.store = true;                                                  // gzip already
+        members.push_back(std::move(f));
+    }
+    if (!m.splats.empty() && std::find(m.needs.begin(), m.needs.end(), "splats") == m.needs.end()) m.needs.push_back("splats");
 }
 
 std::vector<WorldCollider> geometryColliders(const HslScene& scene) {
@@ -763,8 +908,8 @@ std::shared_ptr<const WalkGrid> bakeWalkGrid(const HslScene& scene, const HomeWo
 // the home was read from (path, size, time) and its world layer, so any change bakes afresh. Under
 // %LOCALAPPDATA%\FrameStudio\cache\walk or ~/.cache/frame-home/walk; the 300 most recent are kept.
 static std::filesystem::path walkCacheDir() {
-#ifdef _WIN32
-    if (const char* l = std::getenv("LOCALAPPDATA")) return std::filesystem::u8path(std::string(l) + "\\FrameStudio\\cache\\walk");
+#ifdef _WIN32   // (wide: the narrow getenv is the ANSI code page, which u8path throws on)
+    if (const wchar_t* l = _wgetenv(L"LOCALAPPDATA")) return std::filesystem::path(l) / L"FrameStudio" / L"cache" / L"walk";
 #endif
     if (const char* x = std::getenv("XDG_CACHE_HOME")) return std::filesystem::u8path(std::string(x) + "/frame-home/walk");
     const char* h = std::getenv("HOME");

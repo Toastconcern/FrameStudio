@@ -232,7 +232,11 @@ private:
     mutable std::vector<uint32_t> stamp_;
     mutable uint32_t gen_ = 0;
 
-    static int cell(float v) { return static_cast<int>(std::floor(v / kCell)); }
+    // (clamped, NaN as 0: a damaged file's 1e30 or NaN vertex must not overflow the ints the cell loops count in)
+    static int cell(float v) {
+        const float c = std::floor(v / kCell);
+        return c > -1e6f && c < 1e6f ? static_cast<int>(c) : c >= 1e6f ? 1000000 : c <= -1e6f ? -1000000 : 0;
+    }
     static int64_t key(int x, int y, int z) { return (static_cast<int64_t>(x & 0x1FFFFF) << 42) | (static_cast<int64_t>(y & 0x1FFFFF) << 21) | (z & 0x1FFFFF); }
     // n: the surface's normal on the side being approached. Facing up (for this up) to stand on it: the underside
     // of a ceiling or a beam is never floor.
@@ -381,7 +385,7 @@ public:
             }
             origin_ = origin_ + d;
             hw = hw + d;
-            walkV_ = d * (1 / dt);                                  // what a wall left of it: no pent-up push
+            if (dt > 0) walkV_ = d * (1 / dt);                      // what a wall left of it: no pent-up push (a 0 s frame: NaN)
         }
         // Stand on the ground, or fall. The ground is looked for from knee height (a step), not from the head: a
         // head inside a cabinet or under a beam would otherwise find that and pop you up onto it.

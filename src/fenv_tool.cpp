@@ -92,17 +92,36 @@ int pack(const std::string& out, const std::vector<std::string>& inputs, std::st
         b.packing = g_packing;
         members.push_back(std::move(b));
     }
+    // Member names taken so far: two inputs of the same file name (a footprint and a vista both pulled as base.apk,
+    // two models called chair) each get their own, "2-base.apk", rather than one overwriting the other.
+    std::set<std::string> taken;
+    const auto unique = [&](const std::string& folder, const std::string& name) {
+        std::string n = folder + name;
+        for (int k = 2; !taken.insert(n).second; ++k) n = folder + std::to_string(k) + "-" + name;
+        return n;
+    };
     for (size_t i = 0; i < inputs.size(); ++i) {
         const HslSourceInfo info = i < scene.sources.size() ? scene.sources[i] : HslSourceInfo{};
+        if (info.role == "Splats") continue;   // below, as splat members
         if (info.role == "Model") {
             if (baked) continue;         // its meshes are in scene.bin
-            const fs::path base = fs::u8path(inputs[i]).parent_path();
-            const std::string dir = "models/" + stem(inputs[i]) + "/";
+            const std::string dir = unique("models/", stem(inputs[i])) + "/";
             const std::vector<std::string>& files = i < scene.sourceFiles.size() ? scene.sourceFiles[i] : std::vector<std::string>{inputs[i]};
+            // Kept as laid out on disk, from the folder all its files share (a texture in ../textures stays where the
+            // model's own path to it points); files with nothing in common (another drive) go by their name alone.
+            fs::path base = fs::u8path(inputs[i]).parent_path();
+            for (const std::string& f : files) {
+                const fs::path p = fs::u8path(f).parent_path();
+                for (;;) {
+                    const std::string r = p.lexically_relative(base).u8string();   // ("" for another drive)
+                    if (base.empty() || base == base.root_path() || (!r.empty() && r.rfind("..", 0) != 0)) break;
+                    base = base.parent_path();
+                }
+            }
             for (const std::string& f : files) {
                 std::error_code ec;
-                fs::path rel = fs::relative(fs::u8path(f), base, ec);
-                if (ec || rel.empty() || rel.u8string().find("..") == 0) rel = fs::u8path(f).filename();
+                fs::path rel = fs::u8path(f).lexically_relative(base);
+                if (rel.empty() || rel.u8string().rfind("..", 0) == 0 || rel.is_absolute()) rel = fs::u8path(f).filename();
                 FenvMember mm;
                 mm.name = dir + rel.generic_u8string();
                 mm.file = f;
@@ -112,7 +131,7 @@ int pack(const std::string& out, const std::vector<std::string>& inputs, std::st
             continue;
         }
         FenvSource src;
-        src.file = "apks/" + fs::u8path(inputs[i]).filename().u8string();
+        src.file = unique("apks/", fs::u8path(inputs[i]).filename().u8string());
         src.role = info.role; src.format = info.format; src.package = info.package; src.version = info.version;
         m.sources.push_back(src);
         if (!baked || keepApks) {
@@ -123,12 +142,13 @@ int pack(const std::string& out, const std::vector<std::string>& inputs, std::st
             members.push_back(a);
         }
     }
+    addSplatMembers(scene.splats, m, members);
     if (!editsFile.empty()) { m.edits = "edits.json"; FenvMember e; e.name = m.edits; e.file = editsFile; members.push_back(e); }
     if (!thumbFile.empty()) { m.thumbnail = "thumb.png"; FenvMember t; t.name = m.thumbnail; t.file = thumbFile; t.store = true; members.push_back(t); }
     if (!fenvWrite(out, m, members, err)) { std::fprintf(stderr, "fenv-tool: %s\n", err.c_str()); return 1; }
     std::error_code ec;
     const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-    std::printf("%s: \"%s\", %zu meshes, %s, %.0f MB, %.1f s\n", out.c_str(), m.name.c_str(), scene.meshes.size(),
+    std::printf("%s: \"%s\", %zu meshes, %zu splat objects, %s, %.0f MB, %.1f s\n", out.c_str(), m.name.c_str(), scene.meshes.size(), scene.splats.size(),
                 baked ? "baked" : ("from its homes (" + err + ")").c_str(), fs::file_size(fs::u8path(out), ec) / 1048576.0, s);
     return 0;
 }
@@ -179,6 +199,16 @@ int info(const std::string& path) {
     std::printf("%s\n  name: %s\n  %s\n", path.c_str(), m.name.c_str(), m.scene.empty() ? "loads from its homes" : "baked scene");
     for (const FenvSource& s : m.sources) std::printf("  %-9s %-17s %s %s\n", s.role.c_str(), s.format.c_str(), s.package.c_str(), s.version.c_str());
     for (const std::string& f : m.models) std::printf("  model     %s\n", f.c_str());
+    for (const FenvSplats& sp : m.splats)
+        std::printf("  splats    %-17s %llu splats, %s, at %.2f %.2f %.2f\n", sp.name.c_str(), static_cast<unsigned long long>(sp.count), sp.file.c_str(),
+                    sp.xform[12], sp.xform[13], sp.xform[14]);
+    if (!m.needs.empty()) {
+        std::string needs;
+        for (const std::string& r : m.needs) needs += (needs.empty() ? "" : ", ") + r;
+        const std::string missing = fenvMissingFeatures(m);
+        std::printf("  requires: %s%s\n", needs.c_str(), missing.empty() ? "" : (" (this build lacks " + missing + ")").c_str());
+    }
+    std::printf("  made with: %s\n", fenvMadeWith(m).c_str());
     std::printf("  edits: %s, thumbnail: %s\n", m.edits.empty() ? "no" : "yes", thumb.empty() ? "no" : "yes");
     std::printf("  settings: %s%s\n", m.settings.describe().c_str(), m.settings.tuned.empty() ? "" : (" (" + m.settings.tuned + ")").c_str());
     return 0;
@@ -213,7 +243,8 @@ int upgrade(const std::string& path) {
     if (!bakeScene(scene, blob, err, optimized ? &opt : nullptr)) { std::fprintf(stderr, "fenv-tool: %s: %s\n", path.c_str(), err.c_str()); return 1; }
     std::vector<FenvMember> members;
     const std::string world = m.world;
-    if (fromHomes) { m.scene = "scene.bin"; m.world.clear(); m.models.clear(); }
+    // (rebuilt from its homes: what a newer Studio added to the manifest may name members that aren't kept)
+    if (fromHomes) { m.scene = "scene.bin"; m.world.clear(); m.models.clear(); m.unknown.clear(); m.version = 1; }
     FenvMember b;
     b.name = m.scene;
     b.bytes = std::move(blob);
@@ -450,9 +481,12 @@ int main(int argc, char** argv) {
     }
     if (argc >= 4 && !std::strcmp(argv[1], "unbundle")) return unbundle(argv[2], argv[3]);
     if (argc >= 3 && !std::strcmp(argv[1], "upgrade")) {
-        for (int i = 2; i < argc; ++i) if (!std::strcmp(argv[i], "--no-optimize")) g_optimize = false;
+        for (int i = 2; i < argc; ++i) {
+            if (!std::strcmp(argv[i], "--no-optimize")) g_optimize = false;
+            else if (!std::strcmp(argv[i], "--fast")) g_packing = FenvPacking::Fast;
+        }
         int rc = 0;
-        for (int i = 2; i < argc; ++i) if (std::strcmp(argv[i], "--no-optimize")) rc = std::max(rc, upgrade(argv[i]));
+        for (int i = 2; i < argc; ++i) if (std::strcmp(argv[i], "--no-optimize") && std::strcmp(argv[i], "--fast")) rc = std::max(rc, upgrade(argv[i]));
         return rc;
     }
     if (argc >= 3 && !std::strcmp(argv[1], "report")) {
@@ -485,6 +519,7 @@ int main(int argc, char** argv) {
         for (int i = 3; i < argc; ++i) {
             const std::string a = argv[i];
             if (a == "--no-optimize") { g_optimize = false; continue; }
+            if (a == "--fast") { g_packing = FenvPacking::Fast; continue; }
             const std::vector<std::string> group = homeFiles(a);
             std::string base;
             for (const auto& g : group) base += (base.empty() ? "" : "+") + stem(g);

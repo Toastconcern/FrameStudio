@@ -1508,7 +1508,8 @@ inline std::shared_ptr<WalkGrid> decodeWalkGrid(const std::string& text) {
     if (text.empty() || !unb64(text, z) || z.size() < 8) return nullptr;
     uint32_t rawSize;
     std::memcpy(&rawSize, z.data(), 4);
-    if (rawSize > (1u << 30)) return nullptr;
+    // (deflate packs at most ~1032:1: a header claiming more is damaged, and isn't allocated)
+    if (rawSize > (1u << 30) || rawSize > (z.size() - 4) * 1100) return nullptr;
     std::vector<uint8_t> raw(rawSize);
     mz_ulong n = rawSize;
     if (mz_uncompress(raw.data(), &n, z.data() + 4, static_cast<mz_ulong>(z.size() - 4)) != MZ_OK || n != rawSize) return nullptr;
@@ -1535,7 +1536,12 @@ inline std::shared_ptr<WalkGrid> decodeWalkGrid(const std::string& text) {
     g->p.metaBounds = raw[3] >= '3' ? f32() : 1.0f;                    // made before walking past them was a choice
     g->p.inset = raw[3] >= '4' ? f32() : g->p.radius;                  // made when you stopped a body radius short
     g->nx = static_cast<int>(vi()); g->nz = static_cast<int>(vi());
-    if (bad || g->p.cell < 0.01f || g->nx < 0 || g->nz < 0 || static_cast<uint64_t>(g->nx) * g->nz > (1u << 26)) return nullptr;
+    // NaN fails every comparison: checked as "is finite" so it can't slip through to the floor queries' casts. Each
+    // cell takes at least a byte of what's left.
+    if (bad || !(g->p.cell >= 0.01f && g->p.cell <= 100.0f) || !std::isfinite(g->ox) || !std::isfinite(g->oz) ||
+        std::fabs(g->ox) > 1e6f || std::fabs(g->oz) > 1e6f || g->nx < 0 || g->nz < 0 ||
+        static_cast<uint64_t>(g->nx) * g->nz > (1u << 26) || static_cast<uint64_t>(g->nx) * g->nz > raw.size() - at)
+        return nullptr;
     const size_t cells = static_cast<size_t>(g->nx) * g->nz;
     g->start.resize(cells + 1);
     int32_t prevFirst = 0;

@@ -257,6 +257,8 @@ inline int run(const std::vector<std::string>& args, int nice, bool wait) {
     argv.push_back(nullptr);
     const pid_t pid = fork();
     if (pid == 0) {
+        // Not waited for: started from a child that exits at once, so init reaps it (no zombie left behind)
+        if (!wait && fork() != 0) _exit(0);
         if (nice > 0) setpriority(PRIO_PROCESS, 0, nice);
         const int null = ::open("/dev/null", O_RDWR);
         if (null >= 0) { dup2(null, 1); dup2(null, 2); }
@@ -264,8 +266,8 @@ inline int run(const std::vector<std::string>& args, int nice, bool wait) {
         _exit(127);
     }
     if (pid < 0) return -1;
-    if (!wait) return 0;
     int st = 0;
+    if (!wait) { waitpid(pid, &st, 0); return 0; }   // (the go-between, gone straight away)
     return waitpid(pid, &st, 0) == pid && WIFEXITED(st) ? WEXITSTATUS(st) : -1;
 }
 // This program again with the same arguments, in this process (SteamVR knows it by its path: still the environment).

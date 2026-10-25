@@ -30,6 +30,9 @@ struct RendtxtrInfo {
     // Cubemaps (skybox panoramas, IBL reflection maps): f7 = 6 faces, f6 = mips; the payload is
     // MIP-MAJOR (all six faces of mip0, then all six of mip1, ...). faces = 1 for plain 2D textures.
     u32 faces = 1;
+    // Uncompressed payload (header f2 = 4: RGBA8, 5: RGBA16F): bytes per texel, else 0 (ASTC). rawDataLen is then
+    // mip 0 alone (w*h*rawBpp), which every decoder takes as raw texels.
+    u32 rawBpp = 0;
 };
 
 // ── FlatBuffer vtable helpers (RENDTXTR header layout differs per env, so resolve
@@ -202,6 +205,29 @@ inline bool parseRendtxtrHeader(const std::vector<u8>& data, RendtxtrInfo& info)
         if (n <= 64) return false;          // no payload past the legacy header (n - 64 would wrap)
         info.rawDataOffset = 64;
         info.rawDataLen = (u32)(n - 64);
+    }
+
+    // f2 is the pixel format: 4 = RGBA8, 5 = RGBA16F, 15.. = ASTC. Uncompressed textures ship WITH their mip chain
+    // (Focused's rocky2 / homefg / midgroundb_02 basecolours: 2048^2 RGBA8 + mips = 22369620 bytes; Horror's
+    // t_lantern_unlit_baked_01 / t_vat_basecolor: RGBA16F + mips). No ASTC footprint tiles that, so the formatCode
+    // guess below decoded raw texels as ASTC: diagonal streaks and dots over the rocks, black lanterns. A payload
+    // that is exactly such a chain (any length of it) is cut to mip 0, which the decoders read as raw texels.
+    if (const u32 sFmt = fbFieldSlot(d, n, root, 2)) {
+        const u32 bpp = d[sFmt] == 4 ? 4 : d[sFmt] == 5 ? 8 : 0;
+        u64 chain = 0;
+        for (u32 w = info.width, h = info.height; bpp && chain < info.rawDataLen;) {
+            chain += (u64)w * h * bpp;
+            if (w == 1 && h == 1) break;
+            w = w > 1 ? w / 2 : 1;
+            h = h > 1 ? h / 2 : 1;
+        }
+        if (bpp && chain == info.rawDataLen) {
+            info.rawBpp = bpp;
+            info.rawDataLen = info.width * info.height * bpp;
+            info.blockW = info.blockH = 4;     // (unused for raw texels; keeps astcDimsOk's footprint check true)
+            info.mipCount = 1;
+            return (size_t)info.rawDataOffset + info.rawDataLen <= n;
+        }
     }
 
     u32 rawLen = info.rawDataLen;

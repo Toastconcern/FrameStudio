@@ -326,6 +326,7 @@ struct SystemPacer {
     uint64_t vsyncNs = 0;                      // a recent vsync
     static constexpr size_t kLeads = 240;      // two seconds at 120 Hz
     double pct = 0.98, marginMs = 1.0;
+    int stride = 1;                            // compositor samples per frame: 2 at half rate (every other one)
     // The lead to start with: a high percentile of recent make times + margin. More than a refresh (a frame that
     // can't be made in one) aims two samples ahead: frames overlap (render() waits for the one before) and every
     // compositor frame still gets a new one, a refresh later.
@@ -356,16 +357,19 @@ struct SystemPacer {
     void plan(uint64_t now, float vsyncToPhotons, uint64_t& start, uint64_t& target, float& predict) {
         const double p = period * 1e9, lead = leadMs() * 1e6;
         if (phaseNs < 0 || !vsyncNs) {         // nothing seen yet: once a refresh, aimed two refreshes ahead
-            start = std::max(now, lastTarget + static_cast<uint64_t>(p));
+            start = std::max(now, lastTarget + static_cast<uint64_t>(p * stride));
             target = start + static_cast<uint64_t>(p);
             lastTarget = start;
             predict = static_cast<float>(2 * period) + vsyncToPhotons;
             return;
         }
-        // The first sample far enough ahead to make a frame for, and never the same one twice.
+        // The first sample far enough ahead to make a frame for, and never the same one twice (at half rate, never the
+        // one straight after the last either: every other sample, locked to the display like full rate).
         double t = static_cast<double>(vsyncNs) + phaseNs;
-        while (t < static_cast<double>(now) + lead) t += p;
-        while (lastTarget && t < static_cast<double>(lastTarget) + p * 0.5) t += p;
+        // (whole periods at once: a vsync seen long ago, after the display slept, is many thousands of them back)
+        if (t < static_cast<double>(now) + lead) t += std::ceil((static_cast<double>(now) + lead - t) / p) * p;
+        if (t < static_cast<double>(now) + lead) t += p;
+        while (lastTarget && t < static_cast<double>(lastTarget) + p * (stride - 0.5)) t += p;
         target = static_cast<uint64_t>(t);
         start = target - static_cast<uint64_t>(lead);
         lastTarget = target;
@@ -377,7 +381,7 @@ struct SystemPacer {
 // System mode: publishes each frame to the compositor layer the moment the GPU has finished it, from a thread of its
 // own, so the next frame's CPU work overlaps this one's GPU work and no frame waits a refresh to go out.
 struct Publisher {
-    struct Job { uint64_t serial; int slot; float vp[2][16]; float eye[2][3]; uint64_t startNs, target; };
+    struct Job { uint64_t serial; int slot; float vp[2][16]; float eye[2][3]; uint64_t startNs, target; envshare::Motion motion; };
     struct Done { uint64_t ns; double leadMs; bool late; };
     HslRenderer* r = nullptr;
     EnvExport* env = nullptr;
@@ -398,8 +402,16 @@ struct Publisher {
                 const Job j = jobs.front();
                 working = true;
                 l.unlock();
-                while (!r->waitFrameSerial(j.serial, 100000000ull)) { std::lock_guard<std::mutex> g(m); if (stop) break; }
-                env->publish(j.slot, j.vp, j.eye);
+                // A GPU that never finishes it (the device lost): after 3 s the frame is let go, so drain() and
+                // the main loop (which notices the lost device and restarts) aren't held up forever.
+                bool finished = false;
+                for (int tries = 0; !finished && tries < 30; ++tries) {
+                    finished = r->waitFrameSerial(j.serial, 100000000ull);
+                    std::lock_guard<std::mutex> g(m);
+                    if (stop) break;
+                }
+                if (finished) env->publish(j.slot, j.vp, j.eye, j.motion);
+                else LOG("publisher: frame %llu never finished on the GPU: not shown", static_cast<unsigned long long>(j.serial));
                 const uint64_t now = envshare::nowNs();
                 l.lock();
                 jobs.pop_front();
@@ -581,7 +593,22 @@ int runSnapshot(const std::string& out, const std::vector<std::string>& apks, co
 // FH_BENCH_MOVES=1 (with FH_BENCH_WALK): every 8 s, after 4 s of walking, a snap turn, a teleport ahead (aimed with the
 // real arc, landing at once) and a fast head turn (180 degrees in half a second): what a visitor does. The JSON's
 // "moves" says, for each, how many frames ran late and the slowest; "spikes" the slowest frames (s, ms, move).
+// Timing starts after a quarter second of untimed frames at the spawn (FH_BENCH_WARMUP=s), once the GPU's clock is up.
+// FH_BENCH_TRACE=out.csv: every frame's times (CPU phases, GPU, uploads) and the GPU clock, one line each.
 static long peakRamMB() { return homeos::peakRamMB(); }
+
+// The CPU time this thread has used, ns: a bench frame's own work (what cpuAvg can't tell apart: it includes the
+// wait for the GPU's last frame). 0 where there's no per-thread clock.
+static uint64_t threadCpuNs() {
+#ifdef _WIN32
+    FILETIME c, e, k, u;
+    if (!GetThreadTimes(GetCurrentThread(), &c, &e, &k, &u)) return 0;
+    return ((static_cast<uint64_t>(k.dwHighDateTime) << 32 | k.dwLowDateTime) + (static_cast<uint64_t>(u.dwHighDateTime) << 32 | u.dwLowDateTime)) * 100;
+#else
+    timespec ts;
+    return clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts) == 0 ? static_cast<uint64_t>(ts.tv_sec) * 1000000000ull + ts.tv_nsec : 0;
+#endif
+}
 
 int runBench(const std::vector<std::string>& apks, double seconds, uint32_t w, uint32_t h, float hz, bool unpaced) {
     const fs::path settingsPath = rootDir() / "settings.json";
@@ -703,19 +730,77 @@ int runBench(const std::vector<std::string>& apks, double seconds, uint32_t w, u
     std::vector<View> views;                   // every frame's view and the GPU time that came back with it
     FrameProfile prof;
     prof.on = true;
-    Window make, cpu, gpu, gap;
+    Window make, cpu, gpu, gap, work;
     const double period = 1.0 / hz;
     uint32_t over = 0, hitches = 0, frames = 0, earlyFrames = 0;
     float animTime = 0;
-    const uint64_t t0 = envshare::nowNs();
-    uint64_t next = t0, lastDone = 0, gpuSeen = r.gpuResults();
     uint32_t slot = 0;
     // FH_BENCH_FRAMES=n: exactly n frames, each 1/120 s after the one before (the same pictures every run: with
     // FH_BENCH_SHOT=out.ppm, the last one is saved, so ways of making frames can be compared pixel for pixel).
     static const int fixedFrames = std::getenv("FH_BENCH_FRAMES") ? std::atoi(std::getenv("FH_BENCH_FRAMES")) : 0;
+    // Warm-up, untimed: the spawn view drawn at the display rate for a moment first. An idle GPU sits at its lowest
+    // clock (231-310 MHz on the Frame, of 903) until the governor's next look (every 50 ms) raises it, so a run's
+    // first frames took 3-4x as long and showed as 10-20 ms "spikes" at t=0 in every build. A shown home never draws
+    // those (it fades in). FH_BENCH_WARMUP=s (default 0.25; 0: none, the old way; never with FH_BENCH_FRAMES).
+    const double warmup = fixedFrames > 0 ? 0.0 : std::getenv("FH_BENCH_WARMUP") ? std::atof(std::getenv("FH_BENCH_WARMUP")) : 0.25;
+    if (warmup > 0) {
+        Mat4 pose = {};
+        pose.m[0] = std::cos(yaw0);  pose.m[2] = -std::sin(yaw0);
+        pose.m[5] = 1;
+        pose.m[8] = std::sin(yaw0);  pose.m[10] = std::cos(yaw0);
+        pose.m[15] = 1;
+        EyeView eyes[2];
+        for (int e = 0; e < 2; ++e) {
+            Mat4 p = pose;
+            for (int k = 0; k < 3; ++k) p.m[12 + k] = base[k] + pose.m[k] * (e ? 0.032f : -0.032f);
+            eyes[e] = eyeFromPose(p, proj);
+        }
+        const uint64_t w0 = envshare::nowNs();
+        uint64_t wn = w0;
+        while (envshare::nowNs() - w0 < static_cast<uint64_t>(warmup * 1e9) && !r.deviceLost()) {
+            if (!unpaced) { sleepUntilNs(wn); wn += static_cast<uint64_t>(period * 1e9); }
+            r.exportSlot = exported ? static_cast<int>(slot++ % static_cast<uint32_t>(envshare::kSlots)) : -1;
+            // (the CPU's animation too: its first frames took 5-25 ms while the CPU clock came up)
+            if (scene.animate && !scene.animatedMeshes.empty() && !std::getenv("FH_BENCH_NOANIM")) scene.animate(0, scene.meshes);
+            r.render(eyes, 0);
+        }
+        r.waitFrame();
+    }
+    const uint64_t t0 = envshare::nowNs();
+    uint64_t next = t0, lastDone = 0, gpuSeen = r.gpuResults();
+    // Latency, as system mode has it: from the pose (the frame's start) to the frame finished on the GPU (when the
+    // publisher hands it to the compositor), each frame's waited for on a thread of its own like Publisher does;
+    // and from the submit to finished (the GPU's queue and its work). Printed as "bench latency:" on stderr.
+    // (system mode reads the pose again inside render(): HslRenderer::latePose; here only the moment it would)
+    struct LatJob { uint64_t serial, startNs, lateNs, submitNs; };
+    std::mutex latM;
+    std::condition_variable latCv;
+    std::deque<LatJob> latJobs;
+    bool latStop = false;
+    Window latTotal, latLate, latGpu;
+    uint64_t lateNs = 0;
+    r.latePose = [&](EyeView*) { lateNs = envshare::nowNs(); return false; };
+    std::thread latThread([&] {
+        std::unique_lock<std::mutex> l(latM);
+        for (;;) {
+            latCv.wait(l, [&] { return latStop || !latJobs.empty(); });
+            if (latJobs.empty()) return;
+            const LatJob j = latJobs.front();
+            latJobs.pop_front();
+            l.unlock();
+            const bool ok = r.waitFrameSerial(j.serial, 1000000000ull);
+            const uint64_t doneNs = envshare::nowNs();
+            l.lock();
+            if (ok) {
+                latTotal.add((doneNs - j.startNs) / 1e6);
+                latLate.add((doneNs - (j.lateNs ? j.lateNs : j.startNs)) / 1e6);
+                latGpu.add((doneNs - j.submitNs) / 1e6);
+            }
+        }
+    });
     while (fixedFrames > 0 ? frames < static_cast<uint32_t>(fixedFrames) : envshare::nowNs() - t0 < static_cast<uint64_t>(seconds * 1e9)) {
         if (!unpaced) { sleepUntilNs(next); next += static_cast<uint64_t>(period * 1e9); if (next < envshare::nowNs()) next = envshare::nowNs(); }
-        const uint64_t fs0 = envshare::nowNs();
+        const uint64_t fs0 = envshare::nowNs(), cpu0 = threadCpuNs();
         const float t = fixedFrames > 0 ? frames / 120.0f : (fs0 - t0) / 1e9f;
         // Looking around at the spawn: a full turn every 16 s, nodding, swaying a little.
         const float yaw = yaw0 + t * 6.2831853f / 16.0f, pitch = 0.25f * std::sin(t * 0.9f);
@@ -812,12 +897,15 @@ int runBench(const std::vector<std::string>& apks, double seconds, uint32_t w, u
         static const bool early = [&] { const bool e = std::getenv("FH_BENCH_EARLY") != nullptr; r.setEarlyRecord(e); return e; }();
         (void)early;
         r.render(eyes, rt);
+        if (frames > 2) { std::lock_guard<std::mutex> l(latM); latJobs.push_back({r.frameSerial(), fs0, lateNs, envshare::nowNs()}); latCv.notify_one(); }
+        lateNs = 0;
         if (!overlap) r.waitFrame();
         if (r.deviceLost()) { LOG("bench: device lost (a GPU reset) after %u frames", frames); break; }
         const uint64_t done = envshare::nowNs();
         const double makeMs = (done - fs0) / 1e6;
         make.add(makeMs);
         cpu.add(r.lastStats().totalMs + animMs);
+        work.add((threadCpuNs() - cpu0) / 1e6);
         const bool gpuNew = r.gpuResults() != gpuSeen;
         gpuSeen = r.gpuResults();
         if (gpuNew && frames > 2) gpu.add(r.lastGpuMs());
@@ -839,9 +927,33 @@ int runBench(const std::vector<std::string>& apks, double seconds, uint32_t w, u
             if (makeMs > period * 1500) spikes.push_back({t, makeMs, move});
         }
         earlyFrames += r.lastStats().early ? 1 : 0;
+        // FH_BENCH_TRACE=out.csv: one line a frame (where a slow one's time went, and the GPU clock then).
+        static FILE* trace = [] {
+            const char* p = std::getenv("FH_BENCH_TRACE");
+            FILE* f = p ? std::fopen(p, "w") : nullptr;
+            if (f) std::fprintf(f, "frame,t,move,makeMs,waitMs,prepMs,uploadMs,uploads,recordMs,submitMs,animMs,gpuNew,gpuMs,gpuUploadMs,gpuCopyMs,draws,early,mhz\n");
+            return f;
+        }();
+        if (trace) {
+            int mhz = 0;
+#ifndef _WIN32
+            if (FILE* g = std::fopen("/sys/class/devfreq/3d00000.gpu/cur_freq", "r")) { long hzv = 0; if (std::fscanf(g, "%ld", &hzv) == 1) mhz = static_cast<int>(hzv / 1000000); std::fclose(g); }
+#endif
+            const HslRenderer::FrameStats& s = r.lastStats();
+            std::fprintf(trace, "%u,%.4f,%d,%.3f,%.3f,%.3f,%.3f,%u,%.3f,%.3f,%.3f,%d,%.3f,%.3f,%.3f,%u,%d,%d\n", frames, t, move, makeMs, s.waitMs,
+                         s.readbackMs + s.animMs + s.globalsMs + s.dynamicMs, s.uploadMs, s.uploads, s.recordMs, s.submitMs, animMs, gpuNew ? 1 : 0,
+                         r.lastGpuMs(), r.lastGpuUploadMs(), r.lastGpuCopyMs(), s.draws, s.early ? 1 : 0, mhz);
+        }
         ++frames;
     }
     const double secs = (envshare::nowNs() - t0) / 1e9;
+    { std::lock_guard<std::mutex> l(latM); latStop = true; }
+    latCv.notify_all();
+    latThread.join();
+    r.latePose = nullptr;
+    std::fprintf(stderr, "bench latency: first pose to GPU done %.2f/%.2f/%.2f, late pose to GPU done %.2f/%.2f/%.2f, submit to GPU done %.2f/%.2f/%.2f "
+                 "(avg/p95/max ms, %zu frames)\n", latTotal.avg(), latTotal.pct(0.95), latTotal.max(), latLate.avg(), latLate.pct(0.95), latLate.max(),
+                 latGpu.avg(), latGpu.pct(0.95), latGpu.max(), latTotal.v.size());
     std::sort(views.begin(), views.end(), [](const View& a, const View& b) { return a.gpuMs > b.gpuMs; });
     std::string worst;
     std::vector<const View*> picked;
@@ -887,10 +999,11 @@ int runBench(const std::vector<std::string>& apks, double seconds, uint32_t w, u
     }
     std::printf("{\"home\":\"%s\",\"width\":%u,\"height\":%u,\"msaa\":%d,\"foveation\":%s,\"fovStrength\":%.2f,\"frames\":%u,\"fps\":%.1f,"
                 "\"makeAvg\":%.2f,\"makeP95\":%.2f,\"makeP99\":%.2f,\"makeMax\":%.2f,\"cpuAvg\":%.2f,\"cpuP95\":%.2f,\"cpuMax\":%.2f,"
+                "\"cpuWorkAvg\":%.2f,\"cpuWorkP95\":%.2f,"
                 "\"gpuP10\":%.2f,\"gpuAvg\":%.2f,\"gpuP95\":%.2f,\"gpuMax\":%.2f,\"gapSd\":%.2f,\"gapMax\":%.2f,\"overBudget\":%u,\"hitches\":%u,"
                 "\"parseS\":%.2f,\"uploadS\":%.2f,\"draws\":%u,\"early\":%u,\"walkedM\":%.1f,\"peakRamMB\":%ld,\"worst\":[%s],\"moves\":{%s},\"spikes\":[%s]}\n",
                 fs::path(apks.front()).filename().c_str(), r.width(), r.height(), perf.msaa, r.foveationActive() ? "true" : "false", r.foveationStrength(), frames,
-                frames / secs, make.avg(), make.pct(0.95), make.pct(0.99), make.max(), cpu.avg(), cpu.pct(0.95), cpu.max(), gpu.pct(0.10), gpu.avg(),
+                frames / secs, make.avg(), make.pct(0.95), make.pct(0.99), make.max(), cpu.avg(), cpu.pct(0.95), cpu.max(), work.avg(), work.pct(0.95), gpu.pct(0.10), gpu.avg(),
                 gpu.pct(0.95), gpu.max(), gap.stddev(), gap.max(), over, hitches, std::chrono::duration<double>(tl1 - tl0).count(),
                 std::chrono::duration<double>(tl3 - tl2).count(), r.lastStats().draws, earlyFrames, walked, peakRamMB(), worst.c_str(), movesJson.c_str(), spikesJson.c_str());
     for (const auto& pc : r.perfCounterAverages()) std::fprintf(stderr, "perf: %14.0f  %s\n", pc.second, pc.first.c_str());
@@ -1056,7 +1169,7 @@ int runVr(const std::vector<std::string>& apks, bool system = false) {
     }
     std::string debugStamp = stamp(debugPath.string());
     int shotSeen = dbg.shot;
-    const long startedAt = static_cast<long>(std::time(nullptr));   // picture requests from before this are old
+    long startedAt = static_cast<long>(std::time(nullptr));         // picture requests from before this are old
     bool overlayDirty = true;                         // the world overlay is (re)built for the home shown
     r.msaa = perf.msaa;
     r.anisotropy = static_cast<float>(perf.anisotropy);
@@ -1077,7 +1190,7 @@ int runVr(const std::vector<std::string>& apks, bool system = false) {
     r.setDebugView(dbg.view);
     r.debugHide = dbg.hideBits();
     float hz = vr::VRSystem()->GetFloatTrackedDeviceProperty(vr::k_unTrackedDeviceIndex_Hmd, vr::Prop_DisplayFrequency_Float);
-    if (hz < 30 || hz > 500) hz = 90;
+    if (!(hz >= 30 && hz <= 500)) hz = 90;   // (NaN too: it would pace system mode's frames to never)
     LOG("settings: resolution %s (%ux%u per eye), %dx MSAA, %dx filtering, foveation %s, %.0f Hz display", perf.autoResolution ? "auto" : "fixed",
         r.width(), r.height(), perf.msaa, perf.anisotropy, !r.foveationActive() ? "off" : perf.foveation == 2 ? "eye tracked" : "fixed", hz);
     // Walking, turning and teleporting through the home's world layer (spawns, floors, walls, seats).
@@ -1085,6 +1198,7 @@ int runVr(const std::vector<std::string>& apks, bool system = false) {
     if (!loco.init(rootDir() / "input")) LOG("controller input unavailable: walking and teleport are off");
     loco.setOptions(perf.walk, perf.teleport, perf.turn, perf.snapAngle, perf.moveSpeed);
     loco.setRingFallback(!r.guideAvailable());       // Frame Home draws the arc itself; the overlay ring only if it can't
+    loco.setOwnFade(system);                         // (SteamVR's fade is the scene app's: a blink fades through the layer)
     std::vector<GuideVertex> guideVerts;
     // Homes are parsed (and their textures decoded) on a worker thread and uploaded between frames,
     // so the headset keeps getting frames while a new home loads.
@@ -1125,7 +1239,15 @@ int runVr(const std::vector<std::string>& apks, bool system = false) {
             const auto began = std::chrono::steady_clock::now();
             auto s = std::make_unique<HslScene>();
             std::string e;
-            if (loadHslScene(home, *s, e)) {
+            bool loaded = false;
+            try {   // (thrown out of this thread it would end Frame Home: a damaged home fails to load instead)
+                loaded = loadHslScene(home, *s, e);
+            } catch (const std::exception& x) {
+                e = std::string("couldn't load ") + home.front() + ": " + x.what();
+            } catch (...) {
+                e = "couldn't load " + home.front();
+            }
+            if (loaded) {
                 // The world layer sent from Frame Studio next to the home replaces the converted one; then the
                 // walkable area (read from it, or baked) — here, not on the frame loop: a bake can take a while.
                 std::ifstream wf(worldPathFor(home.front()));
@@ -1244,7 +1366,9 @@ int runVr(const std::vector<std::string>& apks, bool system = false) {
     {
         std::ifstream in(rootDir() / "autoscale.txt");
         float v;
-        for (std::string key; in >> v && std::getline(in >> std::ws, key);) if (v > 0) autoScales[key] = v;
+        // (only what auto resolution itself would pick: a damaged line mustn't make enormous render targets)
+        for (std::string key; in >> v && std::getline(in >> std::ws, key);)
+            if (v >= PerfSettings::kAutoMin && v <= PerfSettings::kAutoMax) autoScales[key] = v;
     }
     auto homeKey = [&] { std::string k; for (const auto& f : shown) k += fs::path(f).filename().string() + "+"; return k; };
     auto rememberScale = [&] {
@@ -1286,6 +1410,12 @@ int runVr(const std::vector<std::string>& apks, bool system = false) {
         prof.published(ns, leadMs, late);
     };
     uint64_t frameStartNs = 0, frameTarget = 0;
+    uint64_t posePhotonNs = 0;                       // system mode: when the frame's pose was predicted for (its light)
+    uint64_t lastLocoTarget = 0;                     // system mode: the last frame's target (walking steps by targets)
+    int frameStride = 1;                             // system mode: compositor samples per frame (2: half rate)
+    auto movingUntil = std::chrono::steady_clock::time_point{};   // half rate: drawn at full rate until then (moving)
+    bool moveFull = false;                           // ...and frames fit in a refresh (decided as the moving starts)
+    envshare::Motion motion;                         // this frame's, for the layer (env_share.h)
     const float vsyncToPhotons = vr::VRSystem()->GetFloatTrackedDeviceProperty(vr::k_unTrackedDeviceIndex_Hmd, vr::Prop_SecondsFromVsyncToPhotons_Float);
     if (system) LOG("display: %.0f Hz, %.1f ms from vsync to photons", hz, vsyncToPhotons * 1000);
     auto loopStart = std::chrono::steady_clock::now();
@@ -1302,8 +1432,9 @@ int runVr(const std::vector<std::string>& apks, bool system = false) {
     bool haveLastRig = false;
     float frozenT = -1;                              // Settings > Animations off: the clock the home holds at
     bool dashboard = false;                          // system mode: the Steam menu is open
-    uint64_t dashFrames = 0;
     auto dashChecked = std::chrono::steady_clock::now();
+    vr::EVRSceneApplicationState sceneState = vr::EVRSceneApplicationState_None;   // system mode: a game's (every 250 ms)
+    bool inGame = false;                             // system mode: a game is on screen and the home is stopped
     while (running) {
         vr::VREvent_t ev;
         while (vr::VRSystem()->PollNextEvent(&ev, sizeof(ev)))
@@ -1336,7 +1467,7 @@ int runVr(const std::vector<std::string>& apks, bool system = false) {
         // Its textures in isn't yet smooth: the first frames with them still stall (Windows makes new GPU memory
         // resident on first use, drivers finish shaders on first draw: 100 ms frames for a second or two). Black
         // until 45 frames in a row are on time as well (8 s at most).
-        smoothFrames = r.texturesPending() == 0 && lastLoopMs < 1.2 * 1000.0 / hz ? smoothFrames + 1 : 0;
+        smoothFrames = r.texturesPending() == 0 && lastLoopMs < 1.2 * 1000.0 / hz * frameStride ? smoothFrames + 1 : 0;
         if (texturesUntil != std::chrono::steady_clock::time_point{} && loadState == 0) {
             const bool late = std::chrono::steady_clock::now() > texturesUntil;
             if ((r.texturesPending() == 0 && smoothFrames >= 45) || late) {
@@ -1348,7 +1479,7 @@ int runVr(const std::vector<std::string>& apks, bool system = false) {
             }
         }
         if (uploadDone || loadState == 3) {
-            const bool ok = uploadDone && r.meshCount() > 0;
+            const bool ok = uploadDone && (r.meshCount() > 0 || r.splatObjectCount() > 0);   // (a splats-only environment has no meshes)
             uploadDone = false;
             const std::string edits = stamp(editsPathFor(pendingHome.front())), file = fileSig(pendingHome) + stamp(worldPathFor(pendingHome.front()));
             const double uploadSec = std::chrono::duration<double>(std::chrono::steady_clock::now() - uploadStart).count();
@@ -1456,7 +1587,7 @@ int runVr(const std::vector<std::string>& apks, bool system = false) {
             // Debug tools changed? All of them apply now.
             const std::string ds = stamp(debugPath.string());
             DebugSettings nd;
-            if (ds != debugStamp && (ds.empty() || nd.fromJson(readText(debugPath)))) {
+            if (ds != debugStamp && (ds == "-" || nd.fromJson(readText(debugPath)))) {   // ("-": deleted, every view off)
                 debugStamp = ds;
                 if (!(nd == dbg)) {
                     LOG("debug: %s", nd.toJson().c_str());
@@ -1629,27 +1760,57 @@ int runVr(const std::vector<std::string>& apks, bool system = false) {
             env.state()->show = scene && !exportLost ? 1 : 0;
             const float dtFade = 1.0f / hz / 0.3f;   // 0.3 s fades
             fade = fadeTarget > fade ? std::min(fadeTarget, fade + dtFade) : std::max(fadeTarget, fade - dtFade);
-            env.state()->fade = static_cast<uint32_t>(fade * 1000);
-            // Nobody looking (a game is running, the compositor is idle, or no layer yet): a frame a second keeps one
-            // fresh for the layer (it goes back to Aurora only after 5 s without one) and leaves the GPU to the game;
-            // waking every 50 ms catches Aurora's slot being drawn again, and then it's full rate. No layer yet:
-            // every 100 ms (it connects once a second).
-            const bool idle = !layer || env.sinceSampled() > 1.0;
+            env.state()->fade = static_cast<uint32_t>(fade * loco.blinkLevel() * 1000);   // (a teleport blink too)
             // The Steam menu is open: the home is only the dimmed backdrop behind it, so it's drawn every other
             // compositor frame (the layer re-aims the last one) and the GPU goes to the menu and the apps in it.
             // Auto resolution waits it out: the GPU is shared then, and its times would only lower the home's size.
             if (now - dashChecked > std::chrono::milliseconds(250)) {
                 dashChecked = now;
                 dashboard = vr::VROverlay() && vr::VROverlay()->IsDashboardVisible();
+                sceneState = vr::VRApplications() ? vr::VRApplications()->GetSceneApplicationState() : vr::EVRSceneApplicationState_None;
             }
-            if (dashboard && perf.menuRate == 0) settleUntil = now + std::chrono::seconds(2);
-            // Settings > Frame rate: Half draws every other frame all the time (as Meta's home does).
-            if (!idle && ((dashboard && perf.menuRate == 0) || perf.frameRate == 1) && (++dashFrames & 1)) {
-                std::this_thread::sleep_for(std::chrono::duration<double>(1.0 / hz));
-                continue;
-            }
+            // A game loading (launched, or connected and waiting to be shown): the home is what's on screen meanwhile,
+            // so it keeps going at full rate, never idle.
+            const bool gameLoading = sceneState == vr::EVRSceneApplicationState_Starting || sceneState == vr::EVRSceneApplicationState_Waiting;
+            // Nobody looking (the compositor is idle, passthrough, or no layer yet): a frame a second keeps one fresh
+            // for the layer (it goes back to Aurora only after 5 s without one); waking every 50 ms catches Aurora's
+            // slot being drawn again, and then it's full rate. No layer yet: every 100 ms (it connects once a second).
+            const bool idle = !layer || (env.sinceSampled() > 1.0 && !gameLoading);
             // (an idle home still loads at full speed: uploading, or its textures' 8 s window)
             const bool loadingIn = uploading || texturesUntil != std::chrono::steady_clock::time_point{};
+            // A game on screen (running, and the home not drawn for a second): nothing of the home runs. No frames,
+            // no sound, no clock, no controllers: the GPU and CPU are the game's. The last frame stays in the layer,
+            // marked fresh once a second instead of drawn again (so Aurora doesn't take over), for the moment the
+            // game quits or the Steam menu shows the home; checking every 50 ms, the home is back at full rate then.
+            if (layer && idle && !loadingIn && sceneState == vr::EVRSceneApplicationState_Running) {
+                if (!inGame) { inGame = true; LOG("a game is on screen: the home stops (no frames, no sound) until it shows again"); }
+                g_audioMuted = true;
+                ambience.pause(true);
+                addedSound.pause(true);
+                if (env.state()->published.load() && envshare::nowNs() - env.state()->publishNs.load() > 1000000000ull)
+                    env.state()->publishNs.store(envshare::nowNs());
+                env.still();                               // (a turn under way isn't carried on while the frame waits)
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                lastFrame = animTick = std::chrono::steady_clock::now();   // (back: no long step in walking or the clock)
+                lastLocoTarget = 0;
+                continue;
+            }
+            if (inGame) {
+                inGame = false;
+                ambience.pause(false);
+                addedSound.pause(false);
+                LOG("the home shows again: drawing");
+            }
+            if (dashboard && perf.menuRate == 0) settleUntil = now + std::chrono::seconds(2);
+            // Settings > Frame rate: Half draws every other compositor frame (as Meta's home does), timed to the
+            // display like full rate (SystemPacer::stride). The layer shows each frame twice, carrying the second on
+            // by your head's turn and the rig's (Motion). Walking it can only guess at (no depth), so while you move
+            // (walk, turn, dash, blink, fall) every frame is drawn, if frames are made within a refresh (a home too
+            // heavy for that stays at half: frames would come late, which is worse).
+            const bool halfAsked = !idle && ((dashboard && perf.menuRate == 0) || perf.frameRate == 1);
+            if (now >= movingUntil) moveFull = false;
+            frameStride = halfAsked && !moveFull ? 2 : 1;
+            pacer.stride = frameStride;
             if (idle && !layer && !loadingIn) std::this_thread::sleep_for(std::chrono::milliseconds(100));
             else if (idle && !loadingIn)
                 for (int i = 0; i < 20 && env.sinceSampled() > 1.0 && running; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(50));
@@ -1672,22 +1833,61 @@ int runVr(const std::vector<std::string>& apks, bool system = false) {
             }
             frameStartNs = envshare::nowNs();
             if (frameStartNs > startNs) predict = std::max(0.0f, predict - (frameStartNs - startNs) / 1e9f);   // started late
+            posePhotonNs = frameStartNs + static_cast<uint64_t>(predict * 1e9);
             vr::VRSystem()->GetDeviceToAbsoluteTrackingPose(vr::TrackingUniverseStanding, predict, poses, vr::k_unMaxTrackedDeviceCount);
             r.exportSlot = env.beginFrame();
         } else {
             vr::VRCompositor()->WaitGetPoses(poses, vr::k_unMaxTrackedDeviceCount, nullptr, 0);
             frameStartNs = envshare::nowNs();
         }
-        loco.setPoseValid(poses[vr::k_unTrackedDeviceIndex_Hmd].bPoseIsValid);
-        if (poses[vr::k_unTrackedDeviceIndex_Hmd].bPoseIsValid)
-            head = fromHmd34(poses[vr::k_unTrackedDeviceIndex_Hmd].mDeviceToAbsoluteTracking);
+        {   // A pose with a NaN or infinity in it (tracking glitch) is taken as no pose: one would poison the rig for good.
+            const vr::TrackedDevicePose_t& hp = poses[vr::k_unTrackedDeviceIndex_Hmd];
+            bool valid = hp.bPoseIsValid;
+            for (int i = 0; i < 3 && valid; ++i)
+                for (int k = 0; k < 4 && valid; ++k) valid = std::isfinite(hp.mDeviceToAbsoluteTracking.m[i][k]);
+            loco.setPoseValid(valid);
+            if (valid) head = fromHmd34(hp.mDeviceToAbsoluteTracking);
+        }
         const auto frameNow = std::chrono::steady_clock::now();
-        const float frameDt = std::chrono::duration<float>(frameNow - lastFrame).count();
+        float frameDt = std::chrono::duration<float>(frameNow - lastFrame).count();
+        // System mode: each frame is shown at its target, so walking and turning step by the time between targets
+        // (whole display periods: speed / 120 a frame at 120 Hz, / 60 at half rate), not by when the loop woke up
+        // (sleep jitter, a changing lead), which made the speed per shown frame wobble.
+        if (system && lastLocoTarget && frameTarget > lastLocoTarget && frameTarget - lastLocoTarget < 250000000ull)
+            frameDt = static_cast<float>((frameTarget - lastLocoTarget) / 1e9);
+        lastLocoTarget = system ? frameTarget : 0;
+        Mat4 rigBefore;
+        loco.rig(rigBefore.m);
         loco.update(frameDt, head.m);
         lastFrame = frameNow;
         Mat4 rig;
         loco.rig(rig.m);
         const Mat4 headWorld = mul(rig, head);
+        if (system) {
+            env.state()->fade = static_cast<uint32_t>(fade * loco.blinkLevel() * 1000);
+            // How the rig moves this frame (not your body): its smooth turn, and where the head's spot in the room
+            // went (walking, a dash, a step; turning pivots about the head, so it isn't in this), in this frame's
+            // tracking space. A jump (a teleport, a seat, a snap turn) isn't motion: nothing to carry on.
+            motion = envshare::Motion();
+            motion.targetNs = frameTarget;
+            motion.yawRate = loco.turnRate();
+            const float dtm = std::max(frameDt, 1e-3f);
+            float dw[3];
+            for (int k = 0; k < 3; ++k)
+                dw[k] = rig.m[k] * head.m[12] + rig.m[4 + k] * head.m[13] + rig.m[8 + k] * head.m[14] + rig.m[12 + k] -
+                        (rigBefore.m[k] * head.m[12] + rigBefore.m[4 + k] * head.m[13] + rigBefore.m[8 + k] * head.m[14] + rigBefore.m[12 + k]);
+            const float moved = std::sqrt(dw[0] * dw[0] + dw[1] * dw[1] + dw[2] * dw[2]);
+            if (moved < 0.3f && moved > 1e-5f) {
+                for (int k = 0; k < 3; ++k)   // world to tracking: the rig's rotation, transposed
+                    motion.velocity[k] = (rig.m[k * 4] * dw[0] + rig.m[k * 4 + 1] * dw[1] + rig.m[k * 4 + 2] * dw[2]) / dtm;
+                motion.depth = loco.viewDepth(head.m);
+            }
+            // Moving (half rate: every frame drawn meanwhile, and 0.3 s after, so stopping isn't a step back down)
+            if ((moved < 0.3f && moved / dtm > 0.02f) || motion.yawRate != 0 || loco.sliding() || loco.blinkLevel() < 1) {
+                if (now >= movingUntil) moveFull = pacer.leadMs() < 1000.0 / hz * 0.9;   // frames fit in a refresh
+                movingUntil = now + std::chrono::milliseconds(300);
+            }
+        }
         if (system && widenFixed <= 0) {
             // head turn rate (rad/s) from the rotation since the last frame: angle of R_prev^T * R
             float tr = 0;
@@ -1698,7 +1898,7 @@ int runVr(const std::vector<std::string>& apks, bool system = false) {
             const float rate = frameDt > 1e-4f ? ang / std::max(frameDt, 1.0f / hz) : 0.0f;
             // The frame is shown up to ~2 refreshes after its pose was predicted (more when only every other one is
             // drawn): the margin covers that much turning at the lens edge (tan grows ~2.5x per radian out there).
-            const bool half = (dashboard && perf.menuRate == 0) || perf.frameRate == 1;
+            const bool half = frameStride == 2;
             const float hold = (half ? 3.0f : 2.0f) / hz;
             const float want = std::clamp(1.03f + rate * hold * 2.5f, half ? 1.05f : 1.03f, 1.18f);
             const float next = want > widen ? want : std::max(want, widen - frameDt * 0.25f);   // up at once, down over ~0.4 s
@@ -1789,7 +1989,33 @@ int runVr(const std::vector<std::string>& apks, bool system = false) {
             r.setGuide(guideVerts);
         }
         if (prof.on) prof.pre.add((envshare::nowNs() - frameStartNs) / 1e6);   // this frame's main-thread work before render()
+        // System mode: the head pose read again inside render(), once the frame is recorded and the GPU is free for it,
+        // for the same moment of light: the frame's view is that much newer (the CPU's work for the frame, and any wait
+        // for the frame before, no longer age it). The rig, culling and the rest stay with the first read; the frame
+        // is published with the pose it was drawn from. FH_NO_LATE_POSE=1: the first read only (A/B).
+        static const bool latePoseOff = std::getenv("FH_NO_LATE_POSE") != nullptr;
+        if (system && posePhotonNs && !latePoseOff)
+            r.latePose = [&](EyeView out[2]) {
+                const uint64_t nowL = envshare::nowNs();
+                const float ahead = posePhotonNs > nowL ? (posePhotonNs - nowL) / 1e9f : 0.0f;
+                vr::TrackedDevicePose_t lp[vr::k_unMaxTrackedDeviceCount];
+                vr::VRSystem()->GetDeviceToAbsoluteTrackingPose(vr::TrackingUniverseStanding, ahead, lp, vr::k_unMaxTrackedDeviceCount);
+                const vr::TrackedDevicePose_t& hp = lp[vr::k_unTrackedDeviceIndex_Hmd];
+                bool valid = hp.bPoseIsValid;
+                for (int i = 0; i < 3 && valid; ++i)
+                    for (int k = 0; k < 4 && valid; ++k) valid = std::isfinite(hp.mDeviceToAbsoluteTracking.m[i][k]);
+                if (!valid) return false;
+                const Mat4 lh = fromHmd34(hp.mDeviceToAbsoluteTracking);
+                // (a jump since the first read, e.g. tracking recentred: that frame keeps the first)
+                const float dx = lh.m[12] - head.m[12], dy = lh.m[13] - head.m[13], dz = lh.m[14] - head.m[14];
+                if (dx * dx + dy * dy + dz * dz > 0.05f * 0.05f) return false;
+                head = lh;
+                const Mat4 hw = mul(rig, head);
+                for (int e = 0; e < 2; ++e) out[e] = eyeFromPose(mul(hw, eyeToHead[e]), proj[e]);
+                return true;
+            };
         r.render(eyes, t);
+        r.latePose = nullptr;
         if (r.deviceLost()) {   // a GPU reset (a hang anywhere on the GPU) took the device: start again with a new one
             LOG("the GPU was reset and this process lost its device: restarting");
             restart = lostDevice = true;
@@ -1800,6 +2026,9 @@ int runVr(const std::vector<std::string>& apks, bool system = false) {
         ++statFrames;
         if (dbg.shot != shotSeen) {   // Debug > Save a Picture: the left eye as it was just drawn, to logs/
             shotSeen = dbg.shot;
+            // The clock set back since the start (a fast clock corrected after boot): the start moves back with it,
+            // or every request would look older than it.
+            if (const long t = static_cast<long>(std::time(nullptr)); t < startedAt) startedAt = t;
             std::vector<u8> px;
             if (dbg.shot >= startedAt && r.readback(0, px) && px.size() >= static_cast<size_t>(r.width()) * r.height() * 4) {
                 char name[64];
@@ -1833,10 +2062,11 @@ int runVr(const std::vector<std::string>& apks, bool system = false) {
                 std::memcpy(j.eye, eyeOut, sizeof j.eye);
                 j.startNs = frameStartNs;
                 j.target = frameTarget;
+                j.motion = motion;
                 publisher.push(j);
             } else {                                     // no timeline semaphores: wait here
                 r.waitFrame();
-                env.publish(r.exportSlot, vpOut, eyeOut);
+                env.publish(r.exportSlot, vpOut, eyeOut, motion);
                 const uint64_t pubNs = envshare::nowNs();
                 published(pubNs, (pubNs - frameStartNs) / 1e6, frameTarget && pubNs > frameTarget);
             }
@@ -1866,7 +2096,7 @@ int runVr(const std::vector<std::string>& apks, bool system = false) {
             const auto le = std::chrono::steady_clock::now();
             const double loopMs = std::chrono::duration<double, std::milli>(le - loopStart).count();
             lastLoopMs = loopMs;
-            if (fade >= 0.99f && loopMs > 1.5 * 1000.0 / hz) ++statHitchShown;   // a frame you could see, late (stuttered)
+            if (fade >= 0.99f && loopMs > 1.5 * 1000.0 / hz * frameStride) ++statHitchShown;   // a frame you could see, late (stuttered)
             prof.frame(r, loopMs, animMs, r.lastGpuMs(), gpuNew);
             loopStart = le;
             prof.report(system ? (uploading ? "system(loading)" : "system") : "scene");
@@ -1896,6 +2126,12 @@ int runVr(const std::vector<std::string>& apks, bool system = false) {
         LOG("restarting %s", lostDevice ? "with a new GPU device" : "with the new settings");
         std::fflush(stderr);
         homeos::setEnv("FH_RESTARTED", "1");
+#ifdef _WIN32
+        // (restartSelf ends with exit(), which skips the guard's destructor: let go of the mutex and the pid file
+        // here, or the new copy finds the mutex still held and steps aside, leaving no renderer)
+        if (systemGuard.held) { std::error_code ec; fs::remove(systemGuard.pidFile, ec); systemGuard.held = false; }
+        if (systemGuard.mutex) { ReleaseMutex(systemGuard.mutex); CloseHandle(systemGuard.mutex); systemGuard.mutex = nullptr; }
+#endif
         homeos::restartSelf();
     }
     return 0;

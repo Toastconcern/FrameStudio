@@ -154,10 +154,17 @@ inline bool inside(const std::vector<float>& tris, const float* p) {
     return n & 1;
 }
 // The volume a soup encloses (0 for an open sheet: a flat plate has no inside to bury anything in).
+// In doubles, about its first corner: far from the world's origin (a home 100 m out) float products of the
+// coordinates lose the volume to rounding, and a plate off the origin's plane would seem to enclose one.
 inline float volume(const std::vector<float>& t) {
+    if (t.size() < 9) return 0;
     double v = 0;
-    for (size_t i = 0; i + 8 < t.size(); i += 9)
-        v += t[i] * (t[i + 4] * t[i + 8] - t[i + 5] * t[i + 7]) - t[i + 1] * (t[i + 3] * t[i + 8] - t[i + 5] * t[i + 6]) + t[i + 2] * (t[i + 3] * t[i + 7] - t[i + 4] * t[i + 6]);
+    const double o[3] = {t[0], t[1], t[2]};
+    for (size_t i = 0; i + 8 < t.size(); i += 9) {
+        double q[9];
+        for (int k = 0; k < 9; ++k) q[k] = t[i + k] - o[k % 3];
+        v += q[0] * (q[4] * q[8] - q[5] * q[7]) - q[1] * (q[3] * q[8] - q[5] * q[6]) + q[2] * (q[3] * q[7] - q[4] * q[6]);
+    }
     return static_cast<float>(std::fabs(v) / 6);
 }
 inline void bounds(const std::vector<float>& tris, float* lo, float* hi) {

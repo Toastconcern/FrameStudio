@@ -21,12 +21,15 @@
 #else
 #include <fcntl.h>
 #include <sys/file.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #endif
 #include "fenv_lzma.h"
 #include "miniz.h"
 
 #include <algorithm>
+#include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -35,6 +38,9 @@
 #include <fstream>
 #include <exception>
 #include <functional>
+#include <iterator>
+#include <memory>
+#include <mutex>
 #include <string>
 #include <system_error>
 #include <vector>
@@ -43,14 +49,31 @@ struct FenvSource {
     std::string file, role, format, package, version;
 };
 
+// A Gaussian splat object (splat_import.h): its .spz member, its name, how many splats and where it's placed.
+struct FenvSplats {
+    std::string file, name;
+    uint64_t count = 0;
+    float xform[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};   // world from the splats' own frame, column-major
+};
+
 struct FenvManifest {
     std::string name;
     std::vector<FenvSource> sources;    // footprint first, then the vista (or one whole home)
     std::vector<std::string> models;    // imported model files (member paths)
+    std::vector<FenvSplats> splats;     // Gaussian splat objects (written with needs = {"splats"})
     std::string edits, thumbnail;       // member paths, empty when absent
     std::string scene;                  // the baked scene (scene_bake.h): when present it IS the home, sources are info
     std::string world;                  // world.json (core/world.h): spawns, seats, walls, walkable areas
+    std::string studioVersion;          // "studio": the Frame Studio that saved it ("v0.2.3"; "" for files from before v0.2)
     WorldSettings settings;             // the world's own render settings (world_settings.h): none set = the headset's
+    // What it needs a reader to understand ("splats", ...): a reader that doesn't know one refuses the file with "needs
+    // a newer Frame Home" instead of showing it wrong. Written only when something is needed (older readers ignore it,
+    // so content they can't show must also change something they do check, e.g. the baked scene's version).
+    std::vector<std::string> needs;
+    // What a newer Frame Studio wrote that this one doesn't know: its version and its other top-level keys (as JSON
+    // ",\n  "key": value" pairs), written back as they were when this one rewrites the manifest.
+    int64_t version = 1;
+    std::string unknown;
 };
 
 namespace fenv_detail {
@@ -65,8 +88,33 @@ inline std::string quote(const std::string& s) {
     return o + "\"";
 }
 
+// A parsed value written out again (the keys this version doesn't know, kept as they were).
+inline std::string toJson(const tinyjson::Value& v) {
+    char b[40];
+    switch (v.type) {
+        case tinyjson::Type::Bool: return v.boolVal ? "true" : "false";
+        case tinyjson::Type::Int: std::snprintf(b, sizeof b, "%lld", static_cast<long long>(v.intVal)); return b;
+        // (inf / nan aren't JSON: written so, the manifest would never parse again and the file wouldn't open)
+        case tinyjson::Type::Float: if (!std::isfinite(v.floatVal)) return "null"; std::snprintf(b, sizeof b, "%.17g", v.floatVal); return b;
+        case tinyjson::Type::String: return quote(v.strVal);
+        case tinyjson::Type::Array: {
+            std::string o = "[";
+            for (size_t i = 0; i < v.arrVal.size(); ++i) o += (i ? ", " : "") + toJson(v.arrVal[i]);
+            return o + "]";
+        }
+        case tinyjson::Type::Object: {
+            std::string o = "{";
+            bool first = true;
+            for (const auto& kv : v.objVal) { o += (first ? "" : ", ") + quote(kv.first) + ": " + toJson(kv.second); first = false; }
+            return o + "}";
+        }
+        default: return "null";
+    }
+}
+
 inline std::string manifestJson(const FenvManifest& m) {
-    std::string j = "{\n  \"format\": \"fenv\",\n  \"version\": 1,\n  \"name\": " + quote(m.name) + ",\n  \"sources\": [";
+    std::string j = "{\n  \"format\": \"fenv\",\n  \"version\": " + std::to_string(std::max<int64_t>(1, m.version)) + ",\n  \"name\": " +
+                    quote(m.name) + ",\n  \"sources\": [";
     for (size_t i = 0; i < m.sources.size(); ++i) {
         const FenvSource& s = m.sources[i];
         j += std::string(i ? "," : "") + "\n    { \"file\": " + quote(s.file) + ", \"role\": " + quote(s.role) + ", \"format\": " +
@@ -75,19 +123,42 @@ inline std::string manifestJson(const FenvManifest& m) {
     j += "\n  ],\n  \"models\": [";
     for (size_t i = 0; i < m.models.size(); ++i) j += std::string(i ? "," : "") + "\n    { \"file\": " + quote(m.models[i]) + " }";
     j += "\n  ]";
+    if (!m.splats.empty()) {
+        j += ",\n  \"splats\": [";
+        for (size_t i = 0; i < m.splats.size(); ++i) {
+            const FenvSplats& s = m.splats[i];
+            j += std::string(i ? "," : "") + "\n    { \"file\": " + quote(s.file) + ", \"name\": " + quote(s.name) + ", \"count\": " +
+                 std::to_string(s.count) + ", \"xform\": [";
+            // A placement that isn't all finite numbers ("nan" / "inf" aren't JSON: the file would never open again)
+            // is written as where the splats were captured.
+            static const float kIdentity[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+            const float* x = std::all_of(std::begin(s.xform), std::end(s.xform), [](float v) { return std::isfinite(v); }) ? s.xform : kIdentity;
+            for (int k = 0; k < 16; ++k) { char b[24]; std::snprintf(b, sizeof b, "%s%.9g", k ? ", " : "", x[k]); j += b; }
+            j += "] }";
+        }
+        j += "\n  ]";
+    }
     if (!m.edits.empty()) j += ",\n  \"edits\": " + quote(m.edits);
     if (!m.thumbnail.empty()) j += ",\n  \"thumbnail\": " + quote(m.thumbnail);
     if (!m.scene.empty()) j += ",\n  \"scene\": " + quote(m.scene);
     if (!m.world.empty()) j += ",\n  \"world\": " + quote(m.world);
+    if (!m.studioVersion.empty()) j += ",\n  \"studio\": " + quote(m.studioVersion);
     if (!m.settings.empty() || !m.settings.tuned.empty()) j += ",\n  \"settings\": " + m.settings.toJson();
-    return j + "\n}\n";
+    if (!m.needs.empty()) {
+        j += ",\n  \"requires\": [";
+        for (size_t i = 0; i < m.needs.size(); ++i) j += (i ? ", " : "") + quote(m.needs[i]);
+        j += "]";
+    }
+    return j + m.unknown + "\n}\n";
 }
 
 // Everything one .fenv may unpack to (its members, LZMA ones as unpacked): a damaged or hostile file must not
 // fill the disk or memory. The largest homes are a few hundred MB.
 constexpr uint64_t kExtractBudget = uint64_t(4) << 30;
 
-// Empty when missing or larger than `limit` (the zip's declared size, which miniz holds the inflate to).
+// Empty when missing, larger than `limit` (the zip's declared size, which miniz holds the inflate to) or damaged.
+// The CRC is checked here: miniz is built without its own checks (APKs are read in place, and quickly), but a .fenv's
+// members are copied out and kept, so a flipped bit (a bad card, a cut-off copy) must not pass as the real thing.
 inline std::vector<uint8_t> readMember(mz_zip_archive& z, const char* name, uint64_t limit = uint64_t(64) << 20) {
     std::vector<uint8_t> out;
     const int i = mz_zip_reader_locate_file(&z, name, nullptr, 0);
@@ -96,9 +167,49 @@ inline std::vector<uint8_t> readMember(mz_zip_archive& z, const char* name, uint
     size_t n = 0;
     void* p = mz_zip_reader_extract_to_heap(&z, static_cast<mz_uint>(i), &n, 0);
     if (!p) return out;
-    try { out.assign(static_cast<uint8_t*>(p), static_cast<uint8_t*>(p) + n); } catch (const std::exception&) { out = {}; }
+    if (mz_crc32(MZ_CRC32_INIT, static_cast<const unsigned char*>(p), n) == st.m_crc32)
+        try { out.assign(static_cast<uint8_t*>(p), static_cast<uint8_t*>(p) + n); } catch (const std::exception&) { out = {}; }
     mz_free(p);
     return out;
+}
+
+// `tmp` (a finished file) in place of `out`. Where a plain rename can't (Windows, `out` open in another program),
+// the old one is set aside first and put back if `tmp` still can't take its place: the user's only copy is never
+// removed before the new one is there. A `tmp` that couldn't go in is removed (no stray .part left behind).
+inline bool replaceWith(const std::filesystem::path& tmp, const std::filesystem::path& out, std::error_code& ec) {
+    namespace fs = std::filesystem;
+    fs::rename(tmp, out, ec);
+    if (ec) {
+        std::error_code e2;
+        fs::path old = out;
+        old += ".old";
+        fs::remove(old, e2);
+        fs::rename(out, old, e2);
+        if (!e2) {
+            fs::rename(tmp, out, ec);
+            if (ec) fs::rename(old, out, e2);
+            else fs::remove(old, e2);
+        }
+    }
+    if (ec) { std::error_code e2; fs::remove(tmp, e2); return false; }
+    return true;
+}
+
+// Member `i` into the file `out`, its CRC checked as it's written (false: unreadable, damaged, or the disk).
+inline bool extractMember(mz_zip_archive& z, mz_uint i, const mz_zip_archive_file_stat& st, const std::filesystem::path& out) {
+    struct Sink { std::ofstream f; mz_ulong crc = MZ_CRC32_INIT; };
+    Sink s;
+    s.f.open(out, std::ios::binary);
+    if (!s.f) return false;
+    const auto write = [](void* o, mz_uint64, const void* p, size_t n) -> size_t {
+        Sink& k = *static_cast<Sink*>(o);
+        k.crc = mz_crc32(k.crc, static_cast<const unsigned char*>(p), n);
+        k.f.write(static_cast<const char*>(p), static_cast<std::streamsize>(n));
+        return k.f ? n : 0;
+    };
+    const bool ok = mz_zip_reader_extract_to_callback(&z, i, write, &s, 0) && s.crc == st.m_crc32;
+    s.f.close();
+    return ok && !s.f.fail();
 }
 
 // A short tag for a file's full path: two "haven.fenv" in different folders get different cache folders.
@@ -138,6 +249,80 @@ struct ExtractLock {
     ExtractLock& operator=(const ExtractLock&) = delete;
 };
 
+// "In use": a lock on <cache folder>/.inuse. Every process with the folder open holds it shared; whoever removes an
+// old folder (a stale version, or one not opened for 30 days) must take it exclusively without waiting, and leaves
+// the folder alone when it can't. So a Frame Home that has shown one home for over a month (or Studio, or the
+// switcher's unpacker in another process) never has its files pulled from under it.
+struct UseLock {
+#ifdef _WIN32
+    HANDLE h = INVALID_HANDLE_VALUE;
+    OVERLAPPED ov = {};
+    // shared: waits (only a remover holds it exclusively, briefly); exclusive: doesn't (false: in use).
+    bool take(const std::filesystem::path& folder, bool exclusive) {
+        h = CreateFileW((folder / L".inuse").wstring().c_str(), GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                        nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (h == INVALID_HANDLE_VALUE) return false;
+        if (!LockFileEx(h, exclusive ? LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY : 0, 0, MAXDWORD, MAXDWORD, &ov)) { CloseHandle(h); h = INVALID_HANDLE_VALUE; return false; }
+        return true;
+    }
+    void release() { if (h != INVALID_HANDLE_VALUE) { UnlockFileEx(h, 0, MAXDWORD, MAXDWORD, &ov); CloseHandle(h); h = INVALID_HANDLE_VALUE; } }
+#else
+    int fd = -1;
+    bool take(const std::filesystem::path& folder, bool exclusive) {
+        const std::filesystem::path p = folder / ".inuse";
+        fd = open(p.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+        if (fd < 0) return false;
+        if (flock(fd, exclusive ? LOCK_EX | LOCK_NB : LOCK_SH) != 0) { close(fd); fd = -1; return false; }
+        // A remover may have had it just before us and removed the folder meanwhile: then this lock is on a file
+        // that's gone (or one a new unpack made since), and protects nothing.
+        struct stat a, b;
+        if (fstat(fd, &a) != 0 || ::stat(p.c_str(), &b) != 0 || a.st_ino != b.st_ino || a.st_dev != b.st_dev) { release(); return false; }
+        return true;
+    }
+    void release() { if (fd >= 0) { flock(fd, LOCK_UN); close(fd); fd = -1; } }
+#endif
+    UseLock() = default;
+    ~UseLock() { release(); }
+    UseLock(const UseLock&) = delete;
+    UseLock& operator=(const UseLock&) = delete;
+};
+
+// The folders this process has open, newest first: a shared UseLock on each of the last kHeld it unpacked or opened
+// (Frame Home shows one home at a time and loads the next beside it; older ones are released and may be pruned).
+// Held until the process exits, or fenvRelease().
+struct HeldFolders {
+    static constexpr size_t kHeld = 4;
+    std::mutex m;
+    std::vector<std::pair<std::string, std::unique_ptr<UseLock>>> held;
+    static HeldFolders& get() { static HeldFolders h; return h; }
+    void hold(const std::string& folder, std::unique_ptr<UseLock> l) {
+        if (!l) return;
+        std::lock_guard<std::mutex> g(m);
+        for (auto it = held.begin(); it != held.end(); ++it) if (it->first == folder) { held.erase(it); break; }
+        held.insert(held.begin(), {folder, std::move(l)});
+        if (held.size() > kHeld) held.resize(kHeld);
+    }
+    void releaseUnder(const std::string& root) {
+        std::lock_guard<std::mutex> g(m);
+        held.erase(std::remove_if(held.begin(), held.end(), [&](const auto& h) { return h.first.compare(0, root.size(), root) == 0; }), held.end());
+    }
+};
+
+// Removes a cache folder unless something has it open (UseLock), and only if `doomed()` still says so with the
+// lock held (it may have been opened, and its .complete touched, just before). True when it went.
+inline bool removeUnused(const std::filesystem::path& folder, const std::function<bool()>& doomed = {}) {
+    std::error_code ec;
+    UseLock l;
+    if (!l.take(folder, true)) return false;
+    if (doomed && !doomed()) return false;
+    std::filesystem::remove_all(folder, ec);
+#ifdef _WIN32
+    l.release();                                   // (Windows keeps the folder while its .inuse is open)
+    std::filesystem::remove_all(folder, ec);
+#endif
+    return !std::filesystem::exists(folder, ec);
+}
+
 inline long processId() {
 #ifdef _WIN32
     return static_cast<long>(_getpid());
@@ -146,9 +331,27 @@ inline long processId() {
 #endif
 }
 
-// A member path is safe to extract: relative, no "..", no drive letters.
+// Well-formed UTF-8 (fs::u8path throws on anything else on Windows: a damaged name must not take Studio down).
+inline bool validUtf8(const std::string& s) {
+    for (size_t i = 0; i < s.size();) {
+        const unsigned char c = static_cast<unsigned char>(s[i]);
+        const size_t n = c < 0x80 ? 1 : (c >> 5) == 6 ? 2 : (c >> 4) == 14 ? 3 : (c >> 3) == 30 ? 4 : 0;
+        if (!n || i + n > s.size() || (n == 2 && c < 0xC2)) return false;
+        uint32_t cp = n == 1 ? c : c & (0x7F >> n);
+        for (size_t k = 1; k < n; ++k) {
+            const unsigned char d = static_cast<unsigned char>(s[i + k]);
+            if ((d & 0xC0) != 0x80) return false;
+            cp = cp << 6 | (d & 0x3F);
+        }
+        if ((n == 3 && (cp < 0x800 || (cp >= 0xD800 && cp <= 0xDFFF))) || (n == 4 && (cp < 0x10000 || cp > 0x10FFFF))) return false;
+        i += n;
+    }
+    return true;
+}
+
+// A member path is safe to extract: relative, no "..", no drive letters, UTF-8, no NUL.
 inline bool safeMember(const std::string& m) {
-    if (m.empty() || m[0] == '/' || m[0] == '\\' || m.find(':') != std::string::npos) return false;
+    if (m.empty() || m[0] == '/' || m[0] == '\\' || m.find(':') != std::string::npos || m.find('\0') != std::string::npos || !validUtf8(m)) return false;
     for (size_t a = 0; a <= m.size();) {
         size_t b = m.find_first_of("/\\", a);
         if (b == std::string::npos) b = m.size();
@@ -161,11 +364,14 @@ inline bool safeMember(const std::string& m) {
 }  // namespace fenv_detail
 
 // Where opened .fenv files are unpacked: FRAME_FENV_CACHE, else %LOCALAPPDATA%\FrameStudio\cache (Windows) or
-// $XDG_CACHE_HOME / ~/.cache /frame-home/fenv.
+// $XDG_CACHE_HOME / ~/.cache /frame-home/fenv. UTF-8: on Windows read wide (the narrow getenv is the ANSI code
+// page, which u8path throws on for a user name like "José").
 inline std::string fenvCacheDir() {
-    if (const char* e = std::getenv("FRAME_FENV_CACHE")) return e;
 #ifdef _WIN32
-    if (const char* l = std::getenv("LOCALAPPDATA")) return std::string(l) + "\\FrameStudio\\cache";
+    if (const wchar_t* e = _wgetenv(L"FRAME_FENV_CACHE")) return std::filesystem::path(e).u8string();
+    if (const wchar_t* l = _wgetenv(L"LOCALAPPDATA")) return (std::filesystem::path(l) / L"FrameStudio" / L"cache").u8string();
+#else
+    if (const char* e = std::getenv("FRAME_FENV_CACHE")) return e;
 #endif
     if (const char* x = std::getenv("XDG_CACHE_HOME")) return std::string(x) + "/frame-home/fenv";
     const char* h = std::getenv("HOME");
@@ -193,15 +399,46 @@ inline bool fenvParseManifest(const std::string& json, FenvManifest& m) {
             const std::string f = doc["models"][i]["file"].asString();
             if (fenv_detail::safeMember(f)) m.models.push_back(f);
         }
+        for (size_t i = 0; i < doc["splats"].size(); ++i) {
+            const auto& e = doc["splats"][i];
+            FenvSplats s;
+            s.file = e["file"].asString(); s.name = e["name"].asString();
+            s.count = static_cast<uint64_t>(std::max<int64_t>(0, e["count"].asInt()));
+            if (e["xform"].size() == 16)
+                for (size_t k = 0; k < 16; ++k) s.xform[k] = static_cast<float>(e["xform"][k].asFloat());
+            if (fenv_detail::safeMember(s.file)) m.splats.push_back(s);
+        }
         if (doc.has("edits") && fenv_detail::safeMember(doc["edits"].asString())) m.edits = doc["edits"].asString();
         if (doc.has("thumbnail") && fenv_detail::safeMember(doc["thumbnail"].asString())) m.thumbnail = doc["thumbnail"].asString();
         if (doc.has("scene") && fenv_detail::safeMember(doc["scene"].asString())) m.scene = doc["scene"].asString();
         if (doc.has("world") && fenv_detail::safeMember(doc["world"].asString())) m.world = doc["world"].asString();
         if (doc.has("settings")) m.settings.fromValue(doc["settings"]);
-        return !m.sources.empty() || !m.models.empty() || !m.scene.empty();
+        m.studioVersion = doc["studio"].asString();
+        for (size_t i = 0; i < doc["requires"].size(); ++i) m.needs.push_back(doc["requires"][i].asString());
+        m.version = std::max<int64_t>(1, doc["version"].asInt());
+        static const char* kKnown[] = {"format", "version", "name", "sources", "models", "splats", "edits", "thumbnail", "scene", "world",
+                                       "settings", "requires", "studio"};
+        for (const auto& kv : doc.objVal)
+            if (std::none_of(std::begin(kKnown), std::end(kKnown), [&](const char* k) { return kv.first == k; }))
+                m.unknown += ",\n  " + fenv_detail::quote(kv.first) + ": " + fenv_detail::toJson(kv.second);
+        return !m.sources.empty() || !m.models.empty() || !m.scene.empty() || !m.splats.empty();
     } catch (...) {
         return false;
     }
+}
+
+// The features this build reads (FenvManifest::needs), and the ones a manifest asks for that it doesn't ("" none).
+inline const std::vector<std::string>& fenvFeatures() {
+    static const std::vector<std::string> known = {"splats"};   // (sky panoramas, ... join as they're written)
+    return known;
+}
+// Who made it, as shown: "Frame Studio v0.2.3", or "made before v0.2" (the version wasn't written then).
+inline std::string fenvMadeWith(const FenvManifest& m) { return m.studioVersion.empty() ? "made before v0.2" : "Frame Studio " + m.studioVersion; }
+inline std::string fenvMissingFeatures(const FenvManifest& m) {
+    std::string missing;
+    for (const std::string& r : m.needs)
+        if (std::find(fenvFeatures().begin(), fenvFeatures().end(), r) == fenvFeatures().end()) missing += (missing.empty() ? "" : ", ") + r;
+    return missing;
 }
 
 // Reads fenv.json (and, if asked, the thumbnail bytes) without extracting anything else.
@@ -216,7 +453,8 @@ inline bool fenvReadManifest(const std::string& path, FenvManifest& m, std::vect
 }
 
 // Extracts every member into <cacheRoot>/<name>-<path tag>-<size>-<time>/ (once) and returns the sources' and
-// models' paths there, plus the edits file ("" when the environment has none).
+// models' paths there, plus the edits file ("" when the environment has none). The scene, world and splat members `m`
+// names become their paths there too.
 inline bool fenvExtract(const std::string& path, const std::string& cacheRoot, FenvManifest& m,
                         std::vector<std::string>& sources, std::vector<std::string>& models, std::string& editsPath,
                         std::string& error) {
@@ -227,13 +465,22 @@ inline bool fenvExtract(const std::string& path, const std::string& cacheRoot, F
     // (a 128-bit count on some standard libraries: no to_string for it, and 64 bits hold any file's date)
     const long long time = static_cast<long long>(fs::last_write_time(src, ec).time_since_epoch().count());
     if (!fenvReadManifest(path, m)) { error = "not a Frame environment (.fenv): " + path; return false; }
+    if (const std::string missing = fenvMissingFeatures(m); !missing.empty()) {
+        error = "made by a newer Frame Studio: update Frame Studio and Frame Home to open it (it uses " + missing + ")";
+        return false;
+    }
     const std::string stem = src.stem().u8string(), key = stem + "-" + fenv_detail::pathTag(src);
     const fs::path root = fs::u8path(cacheRoot);
     const fs::path dir = root / (key + "-" + std::to_string(size) + "-" + std::to_string(time));
     const fs::path done = dir / ".complete";
     fs::create_directories(root, ec);
     const fenv_detail::ExtractLock lock(root / (key + ".lock"));
-    if (!fs::exists(done, ec)) {
+    // In use from before it's looked at until this process is done with it (fenv_detail::UseLock): no other process's
+    // prune can take it away now. (None yet, or a remover got it first: unpacked again below.)
+    auto use = std::make_unique<fenv_detail::UseLock>();
+    if (!fs::is_directory(dir, ec) || !use->take(dir, false)) use.reset();
+    if (!use || !fs::exists(done, ec)) {
+        use.reset();
         // Earlier versions of this environment (same file, other size / time) are stale now, as are folders of the
         // naming before the path tag ("<name>-<size>-<time>") and unpacks that never finished (".tmp-<pid>": the
         // lock is ours, so nobody is still writing one).
@@ -257,7 +504,7 @@ inline bool fenvExtract(const std::string& path, const std::string& cacheRoot, F
                 ours = sizeTime(rest);
             }
             const bool legacy = f.rfind(stem + "-", 0) == 0 && sizeTime(f.substr(stem.size() + 1));
-            if (ours || legacy) fs::remove_all(e.path(), ec);
+            if (ours || legacy) fenv_detail::removeUnused(e.path());   // (one still open somewhere stays: next time)
         }
         // Unpacked beside the cache folder and renamed into place once whole: a crash or a full disk midway
         // leaves no folder that looks finished.
@@ -284,6 +531,7 @@ inline bool fenvExtract(const std::string& path, const std::string& cacheRoot, F
             const fs::path out = tmp / fs::u8path(name);
             fs::create_directories(out.parent_path(), ec);
             if (name.size() > 3 && name.compare(name.size() - 3, 3, ".lz") == 0) {
+                if (!fenv_detail::safeMember(name.substr(0, name.size() - 3))) continue;   // ("...lz" would unpack to "..")
                 std::string why;
                 try {
                     std::vector<uint8_t> packed = fenv_detail::readMember(z, name.c_str(), fenv_detail::kExtractBudget - written), raw;
@@ -305,8 +553,8 @@ inline bool fenvExtract(const std::string& path, const std::string& cacheRoot, F
                 continue;
             }
             written += std::max(st.m_comp_size, st.m_uncomp_size);
-            ok = written <= fenv_detail::kExtractBudget && mz_zip_reader_extract_to_file(&z, i, out.u8string().c_str(), 0);
-            if (!ok) error = "couldn't extract " + name + " from " + path;
+            ok = written <= fenv_detail::kExtractBudget && fenv_detail::extractMember(z, i, st, out);
+            if (!ok) error = "couldn't extract " + name + " from " + path + " (damaged, or the disk is full)";
         }
         mz_zip_reader_end(&z);
         if (ok) {
@@ -322,7 +570,29 @@ inline bool fenvExtract(const std::string& path, const std::string& cacheRoot, F
             if (!ok) error = "couldn't finish the cache for " + path + ": " + ec.message();
         }
         if (!ok) { fs::remove_all(tmp, ec); return false; }
+        use = std::make_unique<fenv_detail::UseLock>();
+        if (!use->take(dir, false)) use.reset();
+        // Environments not opened for 30 days go (they unpack again when they're next opened): the cache doesn't
+        // grow by every .fenv ever opened. One still open somewhere stays, however long ago it was opened: a Frame
+        // Home showing the same home for a month holds it (UseLock), and so does every other process using one.
+        const auto unused = fs::file_time_type::clock::now() - std::chrono::hours(24 * 30);
+        std::vector<fs::path> old;
+        for (const auto& e : fs::directory_iterator(root, ec)) {
+            if (!e.is_directory(ec) || e.path() == dir) continue;
+            std::error_code tec;
+            const fs::file_time_type used = fs::last_write_time(e.path() / ".complete", tec);
+            if (!tec && used < unused) old.push_back(e.path());
+        }
+        for (const fs::path& o : old)
+            fenv_detail::removeUnused(o, [&] {   // (still unused with the lock held: not opened just now)
+                std::error_code tec;
+                const fs::file_time_type used = fs::last_write_time(o / ".complete", tec);
+                return !tec && used < unused;
+            });
+    } else {
+        fs::last_write_time(done, fs::file_time_type::clock::now(), ec);   // used now: the last to be pruned
     }
+    fenv_detail::HeldFolders::get().hold(dir.u8string(), std::move(use));
     sources.clear();
     models.clear();
     for (const FenvSource& s : m.sources)
@@ -331,8 +601,13 @@ inline bool fenvExtract(const std::string& path, const std::string& cacheRoot, F
     editsPath = m.edits.empty() ? std::string() : (dir / fs::u8path(m.edits)).u8string();
     if (!m.scene.empty()) m.scene = (dir / fs::u8path(m.scene)).u8string();   // now the extracted file
     if (!m.world.empty()) m.world = (dir / fs::u8path(m.world)).u8string();
+    for (FenvSplats& s : m.splats) s.file = (dir / fs::u8path(s.file)).u8string();
     return true;
 }
+
+// This process is done with the cache folders it unpacked under `cacheRoot` (fenvExtract holds the last few open):
+// they may be pruned, or removed, now (on Windows a folder can't be removed while its .inuse is held).
+inline void fenvRelease(const std::string& cacheRoot) { fenv_detail::HeldFolders::get().releaseUnder(cacheRoot); }
 
 // One member to write: its path inside the .fenv and either a file on disk or bytes.
 struct FenvMember {
@@ -349,8 +624,22 @@ inline bool fenvWrite(const std::string& outPath, const FenvManifest& m, const s
                       const std::function<void(size_t, size_t)>& progress = {}) {
     namespace fs = std::filesystem;
     const std::string tmp = outPath + ".part";
+    // At most what it holds unpacked (as fenvExtract counts it): past the extract budget it could never be opened,
+    // so it isn't written; near 4 GB it's zip64 from the start (as fenv_bundle.h: miniz can't finish an archive whose
+    // member ends past 4 GB unless it was zip64 before that member began).
+    uint64_t total = 0;
+    for (const FenvMember& f : members) {
+        std::error_code ec;
+        total += f.file.empty() ? f.bytes.size() : fs::file_size(fs::u8path(f.file), ec);
+    }
+    if (total > fenv_detail::kExtractBudget) {
+        error = "too large: " + std::to_string(total >> 20) + " MB unpacked, over the " + std::to_string(fenv_detail::kExtractBudget >> 20) +
+                " MB an environment may hold";
+        return false;
+    }
+    const mz_uint zip64 = total + (uint64_t(1) << 20) >= 0xFFFFFFFFull ? MZ_ZIP_FLAG_WRITE_ZIP64 : 0;
     mz_zip_archive z = {};
-    if (!mz_zip_writer_init_file_v2(&z, tmp.c_str(), 0, 0)) { error = "can't write " + outPath; return false; }
+    if (!mz_zip_writer_init_file_v2(&z, tmp.c_str(), 0, zip64)) { error = "can't write " + outPath; return false; }
     const std::string json = fenv_detail::manifestJson(m);
     bool ok = mz_zip_writer_add_mem(&z, "fenv.json", json.data(), json.size(), MZ_DEFAULT_COMPRESSION);
     for (const FenvMember& f : members) {
@@ -372,9 +661,7 @@ inline bool fenvWrite(const std::string& outPath, const FenvManifest& m, const s
     mz_zip_writer_end(&z);
     std::error_code ec;
     if (!ok) { fs::remove(fs::u8path(tmp), ec); if (error.empty()) error = "couldn't finish " + outPath; return false; }
-    fs::rename(fs::u8path(tmp), fs::u8path(outPath), ec);
-    if (ec) { fs::remove(fs::u8path(outPath), ec); fs::rename(fs::u8path(tmp), fs::u8path(outPath), ec); }
-    if (ec) { error = "couldn't replace " + outPath + ": " + ec.message(); return false; }
+    if (!fenv_detail::replaceWith(fs::u8path(tmp), fs::u8path(outPath), ec)) { error = "couldn't replace " + outPath + ": " + ec.message(); return false; }
     return true;
 }
 
@@ -385,7 +672,11 @@ inline bool fenvRewriteManifest(const std::string& path, const FenvManifest& m, 
     mz_zip_archive in = {}, out = {};
     if (!mz_zip_reader_init_file(&in, path.c_str(), 0)) { error = "can't read " + path; return false; }
     const std::string tmp = path + ".part";
-    if (!mz_zip_writer_init_file_v2(&out, tmp.c_str(), 0, 0)) { mz_zip_reader_end(&in); error = "can't write " + tmp; return false; }
+    // Zip64 again when the one read is (or nearly so): miniz can't finish an archive past 4 GB that didn't start as zip64.
+    std::error_code sizeEc;
+    const uint64_t inSize = std::filesystem::file_size(std::filesystem::u8path(path), sizeEc);
+    const mz_uint zip64 = mz_zip_is_zip64(&in) || (!sizeEc && inSize + (uint64_t(1) << 20) >= 0xFFFFFFFFull) ? MZ_ZIP_FLAG_WRITE_ZIP64 : 0;
+    if (!mz_zip_writer_init_file_v2(&out, tmp.c_str(), 0, zip64)) { mz_zip_reader_end(&in); error = "can't write " + tmp; return false; }
     const std::string json = fenv_detail::manifestJson(m);
     bool ok = mz_zip_writer_add_mem(&out, "fenv.json", json.data(), json.size(), MZ_DEFAULT_COMPRESSION);
     const mz_uint n = mz_zip_reader_get_num_files(&in);
@@ -401,8 +692,7 @@ inline bool fenvRewriteManifest(const std::string& path, const FenvManifest& m, 
     mz_zip_reader_end(&in);
     std::error_code ec;
     if (!ok) { fs::remove(fs::u8path(tmp), ec); if (error.empty()) error = "couldn't finish " + tmp; return false; }
-    fs::rename(fs::u8path(tmp), fs::u8path(path), ec);
-    if (ec) { fs::remove(fs::u8path(tmp), ec); error = "couldn't replace " + path + ": " + ec.message(); return false; }
+    if (!fenv_detail::replaceWith(fs::u8path(tmp), fs::u8path(path), ec)) { error = "couldn't replace " + path + ": " + ec.message(); return false; }
     return true;
 }
 
@@ -414,12 +704,9 @@ inline WorldSettings worldSettingsFor(const std::string& homePath) {
         if (fenvReadManifest(homePath, m)) w = m.settings;
         return w;
     }
-    std::FILE* f = std::fopen(worldSettingsPathFor(homePath).c_str(), "rb");
+    std::ifstream f(std::filesystem::u8path(worldSettingsPathFor(homePath)), std::ios::binary);   // (by its UTF-8 name)
     if (!f) return w;
-    std::string j;
-    char b[4096];
-    for (size_t k; (k = std::fread(b, 1, sizeof b, f)) > 0;) j.append(b, k);
-    std::fclose(f);
+    const std::string j((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
     if (!w.fromJson(j)) w = WorldSettings();
     return w;
 }
@@ -436,9 +723,12 @@ inline bool setWorldSettings(const std::string& homePath, const WorldSettings& w
     std::error_code ec;
     if (w.empty() && w.tuned.empty()) { std::filesystem::remove(std::filesystem::u8path(p), ec); return true; }
     const std::string j = w.toJson() + "\n", tmp = p + ".part";
-    std::FILE* f = std::fopen(tmp.c_str(), "wb");
-    if (!f || std::fwrite(j.data(), 1, j.size(), f) != j.size()) { if (f) std::fclose(f); error = "can't write " + p; return false; }
-    std::fclose(f);
+    {
+        std::ofstream f(std::filesystem::u8path(tmp), std::ios::binary | std::ios::trunc);
+        f.write(j.data(), static_cast<std::streamsize>(j.size()));
+        f.close();
+        if (!f) { error = "can't write " + p; return false; }
+    }
     std::filesystem::rename(std::filesystem::u8path(tmp), std::filesystem::u8path(p), ec);
     if (ec) { error = "can't write " + p + ": " + ec.message(); return false; }
     return true;

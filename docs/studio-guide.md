@@ -111,7 +111,7 @@ edges, grey are floors you can't reach. **W** shows or hides it.
 | Item | What it does on the headset |
 |---|---|
 | **Spawn Point** | where you start, facing the way it faces |
-| **Seat** | a place to sit: point at it and pull the trigger; its "stand up here" ring is where you get up |
+| **Seat** | a place to sit: point at it and pull the trigger; you sit facing the way its arrow points; its "stand up here" ring is where you get up |
 | **Teleport Hotspot** | a spot the teleport arc snaps to |
 | **Surface** | a box you can scale into a floor, a step or a wall |
 | **Invisible Wall** | stops you; never drawn on the headset. Scale and turn it to fit; where it stands is no longer walkable |

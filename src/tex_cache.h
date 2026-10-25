@@ -7,8 +7,10 @@
 #include "tex_mips.h"
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <filesystem>
@@ -28,10 +30,13 @@
 namespace texcache {
 
 // FRAME_TEX_CACHE, else %LOCALAPPDATA%\FrameStudio\cache\texmips (Windows) or ~/.cache/frame-home/texmips.
+// (Windows: read wide; the narrow getenv is the ANSI code page, which u8path throws on for a user name like "José")
 inline std::filesystem::path dir() {
-    if (const char* e = std::getenv("FRAME_TEX_CACHE")) return std::filesystem::u8path(e);
 #ifdef _WIN32
-    if (const char* l = std::getenv("LOCALAPPDATA")) return std::filesystem::u8path(std::string(l) + "\\FrameStudio\\cache\\texmips");
+    if (const wchar_t* e = _wgetenv(L"FRAME_TEX_CACHE")) return std::filesystem::path(e);
+    if (const wchar_t* l = _wgetenv(L"LOCALAPPDATA")) return std::filesystem::path(l) / L"FrameStudio" / L"cache" / L"texmips";
+#else
+    if (const char* e = std::getenv("FRAME_TEX_CACHE")) return std::filesystem::u8path(e);
 #endif
     if (const char* x = std::getenv("XDG_CACHE_HOME")) return std::filesystem::u8path(std::string(x) + "/frame-home/texmips");
     const char* h = std::getenv("HOME");
@@ -58,16 +63,26 @@ inline std::filesystem::path pathFor(uint64_t k) {
 
 struct Header { char magic[4]; uint32_t version, w, h, bw, bh, mips; uint64_t bytes; };
 
+// (Windows: by its wide name, so a cache under a non-ASCII user folder opens)
+inline FILE* open(const std::filesystem::path& p, bool write) {
+#ifdef _WIN32
+    return _wfopen(p.c_str(), write ? L"wb" : L"rb");
+#else
+    return std::fopen(p.c_str(), write ? "wb" : "rb");
+#endif
+}
+
 // The cached chain for `t`, or null.
 inline std::shared_ptr<TexSource> load(const TexSource& t) {
     if (!texmips::wants(t)) return nullptr;
     const std::filesystem::path p = pathFor(key(t));
-    FILE* f = std::fopen(p.string().c_str(), "rb");
+    FILE* f = open(p, false);
     if (!f) return nullptr;
     Header hd = {};
     std::shared_ptr<TexSource> out;
     if (std::fread(&hd, sizeof hd, 1, f) == 1 && std::memcmp(hd.magic, "FTXM", 4) == 0 && hd.version == 1 && hd.w == t.w && hd.h == t.h &&
-        hd.bw == t.bw && hd.bh == t.bh && hd.mips == astcFullMipCount(t.w, t.h) && hd.bytes < (1ull << 31)) {
+        hd.bw == t.bw && hd.bh == t.bh && hd.mips == astcFullMipCount(t.w, t.h) &&
+        hd.bytes == astcMipBytesForCount(t.w, t.h, t.bw, t.bh, hd.mips)) {   // (exactly the chain: a damaged entry isn't used)
         auto s = std::make_shared<TexSource>();
         s->w = t.w; s->h = t.h; s->bw = t.bw; s->bh = t.bh; s->mips = hd.mips; s->hdr = t.hdr; s->faces = 1;
         s->astc.resize(static_cast<size_t>(hd.bytes));
@@ -85,7 +100,12 @@ inline void prune(uint64_t limit) {
     std::error_code ec;
     std::vector<std::pair<std::filesystem::file_time_type, std::filesystem::path>> files;
     uint64_t total = 0;
+    const auto stale = std::filesystem::file_time_type::clock::now() - std::chrono::hours(1);
     for (const auto& e : std::filesystem::directory_iterator(dir(), ec)) {
+        if (e.path().extension() == ".part") {   // a chain an exit left half written (an hour old: nobody's writing it)
+            if (e.last_write_time(ec) < stale) std::filesystem::remove(e.path(), ec);
+            continue;
+        }
         if (e.path().extension() != ".ftxm") continue;
         const uint64_t s = e.file_size(ec);
         total += s;
@@ -103,8 +123,10 @@ inline void prune(uint64_t limit) {
 inline bool store(const TexSource& chain, uint64_t k) {
     std::error_code ec;
     std::filesystem::create_directories(dir(), ec);
-    const std::filesystem::path p = pathFor(k), tmp = p.string() + ".part";
-    FILE* f = std::fopen(tmp.string().c_str(), "wb");
+    std::filesystem::path tmp = pathFor(k);
+    const std::filesystem::path p = tmp;
+    tmp += ".part";
+    FILE* f = open(tmp, true);
     if (!f) return false;
     Header hd = {{'F', 'T', 'X', 'M'}, 1, chain.w, chain.h, chain.bw, chain.bh, chain.mips, chain.astc.size()};
     const bool ok = std::fwrite(&hd, sizeof hd, 1, f) == 1 && std::fwrite(chain.astc.data(), 1, chain.astc.size(), f) == chain.astc.size();
@@ -119,7 +141,9 @@ inline bool store(const TexSource& chain, uint64_t k) {
 // threads (never in the way of a frame). Each texture once per run.
 class Builder {
 public:
-    static Builder& get() { static Builder b; return b; }
+    // Never destroyed: its thread may still be encoding at exit, and must not find its mutex gone (it dies with the
+    // process; a texture half encoded is left as a .part file, which prune clears).
+    static Builder& get() { static Builder* b = new Builder; return *b; }
     void add(std::shared_ptr<const TexSource> t) {
         if (!t || !texmips::wants(*t)) return;
         std::lock_guard<std::mutex> l(m_);

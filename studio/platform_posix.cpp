@@ -152,26 +152,29 @@ int run(const std::string& commandLine, const fs::path& workingDir, std::string&
     // Both ends close on exec: a command started meanwhile by another thread (Send to Frame and Install run at once)
     // must not inherit this pipe, or its reader never sees the end. The child's own copies (dup2) stay open.
     int pipeFds[2];
-    {
-        static std::mutex creating;   // (no pipe2 on macOS: made and marked as one step)
-        std::lock_guard<std::mutex> lock(creating);
-        if (::pipe(pipeFds) != 0) return -1;
-        ::fcntl(pipeFds[0], F_SETFD, FD_CLOEXEC);
-        ::fcntl(pipeFds[1], F_SETFD, FD_CLOEXEC);
-    }
-    posix_spawn_file_actions_t actions;
-    posix_spawn_file_actions_init(&actions);
-    posix_spawn_file_actions_addopen(&actions, 0, "/dev/null", O_RDONLY, 0);
-    posix_spawn_file_actions_adddup2(&actions, pipeFds[1], 1);
-    posix_spawn_file_actions_adddup2(&actions, pipeFds[1], 2);
-    posix_spawn_file_actions_addclose(&actions, pipeFds[0]);
-    posix_spawn_file_actions_addclose(&actions, pipeFds[1]);
     // (the working directory through the shell: posix_spawn_file_actions_addchdir isn't everywhere yet)
     const std::string line = workingDir.empty() ? commandLine : "cd " + shellQuote(workingDir.string()) + " && " + commandLine;
     const char* argv[] = {"/bin/sh", "-c", line.c_str(), nullptr};
     pid_t pid = -1;
-    const int spawned = posix_spawn(&pid, "/bin/sh", &actions, nullptr, const_cast<char* const*>(argv), environ);
-    posix_spawn_file_actions_destroy(&actions);
+    int spawned;
+    {
+        // (no pipe2 on macOS: made, marked and handed to the child as one step, so another thread's spawn can't
+        // catch the pipe in between, still inheritable, and keep it open)
+        static std::mutex creating;
+        std::lock_guard<std::mutex> lock(creating);
+        if (::pipe(pipeFds) != 0) return -1;
+        ::fcntl(pipeFds[0], F_SETFD, FD_CLOEXEC);
+        ::fcntl(pipeFds[1], F_SETFD, FD_CLOEXEC);
+        posix_spawn_file_actions_t actions;
+        posix_spawn_file_actions_init(&actions);
+        posix_spawn_file_actions_addopen(&actions, 0, "/dev/null", O_RDONLY, 0);
+        posix_spawn_file_actions_adddup2(&actions, pipeFds[1], 1);
+        posix_spawn_file_actions_adddup2(&actions, pipeFds[1], 2);
+        posix_spawn_file_actions_addclose(&actions, pipeFds[0]);
+        posix_spawn_file_actions_addclose(&actions, pipeFds[1]);
+        spawned = posix_spawn(&pid, "/bin/sh", &actions, nullptr, const_cast<char* const*>(argv), environ);
+        posix_spawn_file_actions_destroy(&actions);
+    }
     ::close(pipeFds[1]);
     if (spawned != 0) { ::close(pipeFds[0]); out = "could not start: " + commandLine; return -1; }
     char buf[4096];

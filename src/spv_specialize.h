@@ -84,18 +84,28 @@ inline uint32_t scalarBytes(const Module& m, uint32_t t) {
     return 0;
 }
 
+// An offset moved by `by` bytes, false past kMaxOffset: the strides and indices are the shader's word (an APK's or a
+// .fenv's), and a wrapped 32-bit offset would pass the block-size checks and read far outside the block.
+constexpr uint64_t kMaxOffset = uint64_t(1) << 30;
+inline bool advance(uint32_t& offset, uint64_t by) {
+    if (offset + by > kMaxOffset) return false;
+    offset = static_cast<uint32_t>(offset + by);
+    return true;
+}
+
 // One step down an access chain: (type, offset) of member / element `index`.
 inline bool step(const Module& m, Ptr& p, uint32_t index) {
     const auto it = m.types.find(p.type);
     if (it == m.types.end()) return false;
     const Type& t = it->second;
+    if (t.a.empty()) return false;                // (a type with no operands: a damaged module)
     if (t.op == OpTypeStruct) {
         if (index >= t.a.size()) return false;
         const auto ms = m.members.find(p.type);
         if (ms == m.members.end()) return false;
         const auto mm = ms->second.find(index);
         if (mm == ms->second.end() || mm->second.offset == 0xFFFFFFFFu) return false;
-        p.offset += mm->second.offset;
+        if (!advance(p.offset, mm->second.offset)) return false;
         p.matrixStride = mm->second.matrixStride;
         p.rowMajor = mm->second.rowMajor;
         p.type = t.a[index];
@@ -104,20 +114,20 @@ inline bool step(const Module& m, Ptr& p, uint32_t index) {
     if (t.op == OpTypeArray) {
         const auto st = m.arrayStride.find(p.type);
         if (st == m.arrayStride.end()) return false;
-        p.offset += index * st->second;
+        if (!advance(p.offset, uint64_t(index) * st->second)) return false;
         p.type = t.a[0];
         return true;
     }
     if (t.op == OpTypeMatrix) {
         if (!p.matrixStride || p.rowMajor) return false;
-        p.offset += index * p.matrixStride;
+        if (!advance(p.offset, uint64_t(index) * p.matrixStride)) return false;
         p.type = t.a[0];
         return true;
     }
     if (t.op == OpTypeVector) {
         const uint32_t b = scalarBytes(m, t.a[0]);
         if (!b) return false;
-        p.offset += index * b;
+        if (!advance(p.offset, uint64_t(index) * b)) return false;
         p.type = t.a[0];
         return true;
     }
@@ -125,25 +135,33 @@ inline bool step(const Module& m, Ptr& p, uint32_t index) {
 }
 
 // The bytes a value of type `type` at `p` spans (0 when it can't be built as a constant).
-inline uint32_t extent(const Module& m, const Ptr& p) {
+// (depth: a damaged module's type may contain itself, which would recurse until the stack runs out; budget: arrays of
+// arrays of ... each 1024 long would visit 1024^depth members. build() walks only what an extent here walked.)
+constexpr int kMaxDepth = 32;
+inline uint32_t extent(const Module& m, const Ptr& p, int depth = 0, uint32_t* budget = nullptr) {
+    uint32_t mine = 1u << 16;
+    if (!budget) budget = &mine;
+    if (depth > kMaxDepth || !*budget) return 0;
+    --*budget;
     const auto it = m.types.find(p.type);
     if (it == m.types.end()) return 0;
     const Type& t = it->second;
     if (t.op == OpTypeFloat || t.op == OpTypeInt) return scalarBytes(m, p.type);
-    if (t.op == OpTypeVector) return scalarBytes(m, t.a[0]) * (t.a.size() >= 2 ? t.a[1] : 0);
+    if (t.op == OpTypeVector) return t.a.size() >= 2 && t.a[1] <= 4 ? scalarBytes(m, t.a[0]) * t.a[1] : 0;
     uint32_t end = 0, n = 0;
     if (t.op == OpTypeMatrix) n = t.a.size() >= 2 ? t.a[1] : 0;
     else if (t.op == OpTypeArray) { const auto c = m.constU32.find(t.a.size() >= 2 ? t.a[1] : 0); n = c == m.constU32.end() ? 0 : c->second; }
     else if (t.op == OpTypeStruct) n = static_cast<uint32_t>(t.a.size());
     else return 0;
+    if (n > 1024) return 0;                   // (as build: no constant that large is made, and a huge count hangs)
     for (uint32_t k = 0; k < n; ++k) {
         Ptr q = p;
         if (!step(m, q, k)) return 0;
-        const uint32_t e = extent(m, q);
+        const uint32_t e = extent(m, q, depth + 1, budget);
         if (!e) return 0;
         end = std::max(end, q.offset - p.offset + e);
     }
-    return end;
+    return end <= kMaxOffset ? end : 0;
 }
 }  // namespace detail
 
@@ -174,7 +192,8 @@ inline std::vector<uint32_t> specialize(const std::vector<uint32_t>& code, const
     uint32_t bound = code[3];
     std::vector<uint32_t> consts;                              // new constants, before the first function
     std::map<std::pair<uint32_t, std::vector<uint32_t>>, uint32_t> made;   // (type, words) -> id
-    std::function<uint32_t(const Ptr&, const BlockBytes&)> build = [&](const Ptr& p, const BlockBytes& bb) -> uint32_t {
+    std::function<uint32_t(const Ptr&, const BlockBytes&, int)> build = [&](const Ptr& p, const BlockBytes& bb, int depth) -> uint32_t {
+        if (depth > kMaxDepth) return 0;
         const auto it = m.types.find(p.type);
         if (it == m.types.end()) return 0;
         const Type& t = it->second;
@@ -200,7 +219,7 @@ inline std::vector<uint32_t> specialize(const std::vector<uint32_t>& code, const
             for (uint32_t k = 0; k < n; ++k) {
                 Ptr q = p;
                 if (!step(m, q, k)) return 0;
-                const uint32_t id = build(q, bb);
+                const uint32_t id = build(q, bb, depth + 1);
                 if (!id) return 0;
                 parts.push_back(id);
             }
@@ -243,7 +262,7 @@ inline std::vector<uint32_t> specialize(const std::vector<uint32_t>& code, const
                     const BlockBytes& bb = blocks[sb];
                     const uint32_t ext = have[sb] ? extent(m, p) : 0;
                     if (ext && p.offset + ext <= bb.size && (!bb.foldable || bb.foldable(p.offset, ext))) {
-                        if (const uint32_t id = build(p, bb)) {
+                        if (const uint32_t id = build(p, bb, 0)) {
                             body.insert(body.end(), {(4u << 16) | OpCopyObject, w[1], w[2], id});
                             ++*folded;
                             i += words;

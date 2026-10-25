@@ -76,16 +76,19 @@ public:
 
     int beginFrame() { const int k = static_cast<int>(next_); next_ = (next_ + 1) % envshare::kSlots; return k; }
 
-    void publish(int k, const float viewProj[2][16], const float eyePos[2][3]) {
-        envshare::Slot& s = state_->slot[k];
+    void publish(int k, const float viewProj[2][16], const float eyePos[2][3], const envshare::Motion& motion) {
+        envshare::Slot s;
         s.frame = ++frame_;
         s.generation = generation_;
         std::memcpy(s.viewProj, viewProj, sizeof s.viewProj);
         for (int e = 0; e < 2; ++e) { for (int c = 0; c < 3; ++c) s.eyePos[e][c] = eyePos[e][c]; s.eyePos[e][3] = 1; }
+        envshare::writeSlot(state_, static_cast<uint32_t>(k), s, motion);   // (under its sequence count: env_share.h)
         state_->published.store(frame_);
         state_->latest.store(static_cast<uint32_t>(k), std::memory_order_release);
         state_->publishNs.store(envshare::nowNs());
     }
+
+    void still() { const uint32_t k = state_->latest.load(); if (k < envshare::kSlots) envshare::writeMotion(state_, k, envshare::Motion()); }
 
     uint32_t refusedFlags() const { return 0; }   // (Windows frames carry no Vulkan create flags for the layer to refuse)
 
@@ -282,16 +285,22 @@ public:
     int beginFrame() { const int k = static_cast<int>(next_); next_ = (next_ + 1) % envshare::kSlots; return k; }
 
     // The frame in slot k is done on the GPU: hand it to the layer with the eye poses it was rendered from.
-    void publish(int k, const float viewProj[2][16], const float eyePos[2][3]) {
-        envshare::Slot& s = state_->slot[k];
+    void publish(int k, const float viewProj[2][16], const float eyePos[2][3], const envshare::Motion& motion) {
+        envshare::Slot s;
         s.frame = ++frame_;
         s.generation = generation_;
         std::memcpy(s.viewProj, viewProj, sizeof s.viewProj);
-        for (int e = 0; e < 2; ++e) { for (int k = 0; k < 3; ++k) s.eyePos[e][k] = eyePos[e][k]; s.eyePos[e][3] = 1; }
+        for (int e = 0; e < 2; ++e) { for (int c = 0; c < 3; ++c) s.eyePos[e][c] = eyePos[e][c]; s.eyePos[e][3] = 1; }
+        // Under the slot's sequence count (env_share.h): after a resize this rewrites the slot the layer may still be
+        // showing from the old images, and it must never read half of this pose and half of the old one.
+        envshare::writeSlot(state_, static_cast<uint32_t>(k), s, motion);
         state_->published.store(frame_);
         state_->latest.store(static_cast<uint32_t>(k), std::memory_order_release);
         state_->publishNs.store(envshare::nowNs());
     }
+
+    // The newest frame stays as it is (the home stops for a game): no turning or walking carried on from it.
+    void still() { const uint32_t k = state_->latest.load(); if (k < envshare::kSlots) envshare::writeMotion(state_, k, envshare::Motion()); }
 
     // The layer couldn't import the images with these create flags (0: none refused).
     uint32_t refusedFlags() const { return state_->refusedFlags.load() & flags_; }

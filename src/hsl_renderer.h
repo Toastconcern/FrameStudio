@@ -6,13 +6,15 @@
 //   set2  per material: matParams (cooked constants bound by MurmurHash3 name), lightprobesParams,
 //         lightBakerParams, instance, skinning, samplers, and textures routed by name
 // Both eyes render in ONE multiview pass into a 2-layer target, then go to vrcompositor as layers 0/1.
+#include <unordered_map>
 #include <unordered_set>
 #include "guide_geom.h"
 #include "hsl_scene.h"
 #include "shader_bake.h"
+#include "splat_sort.h"
 #include "spv_reflect.h"
 
-#ifdef _WIN32
+#if defined(_WIN32) && !defined(VK_USE_PLATFORM_WIN32_KHR)   // (Frame Studio's build defines it for every file)
 #define VK_USE_PLATFORM_WIN32_KHR       // the Win32 external-memory structs (system mode imports D3D11 textures)
 #endif
 #ifdef FH_USE_VOLK
@@ -25,6 +27,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <deque>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -55,8 +58,17 @@ public:
     bool loadStep(double budgetMs);
     float loadProgress() const;
     void unload();
+    // Frame Studio's paste: a mesh appended to the loaded scene (scene.meshes[sceneIndex]) uploaded now, drawn alone
+    // (never batched). Its index here, or -1 when it can't be drawn. reloadSplats: the scene's splat objects uploaded
+    // again (one was added).
+    int addMesh(int sceneIndex);
+    void reloadSplats();
     // Renders both eyes; the result is left in `colorImage()` layers 0 (left) / 1 (right), TRANSFER_SRC layout.
     void render(const EyeView eyes[2], float timeSec);
+    // Late pose (system mode): asked inside render() for the eyes to draw from, just before the frame's view goes to
+    // the GPU (after it's recorded, and after the GPU finished the frame before). True: those eyes are drawn instead
+    // of render()'s (which culled and sorted: the projection's widened edge covers the head's turn in between).
+    std::function<bool(EyeView out[2])> latePose;
     // Copies one eye layer of the last frame to RGBA8 (sRGB-encoded) — headless snapshots / tests.
     bool readback(uint32_t layer, std::vector<u8>& rgba);
     void shutdown();
@@ -92,7 +104,10 @@ public:
     bool meshDynamic(size_t i) const { return meshes_[i].dynamic; }
     // The home isn't on screen (faded out, nobody looking): textures stream in big steps.
     void setUploadsUnseen(bool unseen) { uploadsUnseen_ = unseen; }
-    void setMeshVisible(size_t i, bool visible) { meshes_[i].visible = visible; }
+    void setMeshVisible(size_t i, bool visible) {
+        if (meshes_[i].visible != visible && meshes_[i].batch >= 0) batches_[meshes_[i].batch].active = false;   // (its parts drawn one by one again)
+        meshes_[i].visible = visible;
+    }
     // Scene meshes whose vertices change every frame (HslScene::animatedMeshes). Set before beginLoad().
     void setDynamicMeshes(const std::vector<int>& sceneIndices);
     // Highlight one mesh (its faces tinted, every triangle edge drawn) on the GPU; -1 clears. Built once per call,
@@ -111,6 +126,12 @@ public:
     void setEarlyRecord(bool on) { earlyRecord_ = on; }
     bool guideAvailable() const { return guide_.visible != VK_NULL_HANDLE; }
     const std::string& meshProgram(size_t i) const { return programs_[meshes_[i].program].path; }
+    // Gaussian splats (hsl_renderer_splat.cpp): the scene's splat objects (HslScene::splats) go to the GPU once its meshes
+    // are in (loadStep), and draw after the solid meshes and the sky, before the see-through ones, each blended back to
+    // front in an order sorted on a thread of its own as you move. Where each is and whether it shows are read from the
+    // scene every frame (Frame Studio moves and hides them there).
+    size_t splatObjectCount() const { return splatObjs_.size(); }
+    size_t splatsDrawn() const { return splatsDrawn_; }    // last frame, all objects
 
     // Debug views (Frame Studio's View > Debug View, the Environments panel's Debug page): how a home is put together
     // and what it costs, drawn from each mesh's positions alone (skinned meshes in their rest pose).
@@ -279,7 +300,31 @@ private:
         float uvXform[6] = {1, 0, 0, 0, 1, 0};      // MeshData::uvXform (pushed as uvTransformU / V)
         bool debug = false;                         // FH_DEBUG matched: cull state logged once
         std::string debugName;
+        int dupOf = -1;                             // an exact copy of that (earlier) mesh: not drawn while it shows
+        uint64_t lookHash = 0;                      // its shader, material values and textures (0: never batched)
+        int batch = -1;                             // the batches_ entry drawing it with its neighbours (-1: drawn alone)
     };
+    // Static batching (Clay homes): solid meshes that look alike (one shader, the same textures and tint) and sit near
+    // one another, drawn as one mesh with their vertices placed in the world. The hand tutorials' hundreds of plants
+    // were hundreds of draws, each a fixed cost on the GPU. A batch stops (its parts drawn one by one) as soon as an
+    // edit hides or moves one of them.
+    // See-through batches keep the parts' own back-to-front order: each frame the parts in view are sorted as they
+    // would be one by one, and when that order (or what's in view) changes, their indices are rewritten in it into
+    // the index buffer of the command buffer being recorded (host-visible, one per command buffer).
+    struct Batch {
+        GpuMesh gm;                                 // its own vertices and indices; set2 borrowed from its first part
+        std::vector<size_t> members;
+        bool active = true;
+        bool sorted = false;                        // see-through: drawn through sortIbo[], the parts in view, in order
+        std::vector<u32> indices;                   // (sorted) every part's indices, in members order...
+        std::vector<std::pair<u32, u32>> ranges;    // ...each part's first index and count in them
+        Buffer sortIbo[2];
+        std::vector<u32> written[2];                // the parts (members positions) each sortIbo holds, in order
+        u32 writtenCount[2] = {0, 0};
+    };
+    void sortBatch(Batch& b, const float head[3]);
+    std::vector<Batch> batches_;
+    void buildBatches();
 
     // Vulkan plumbing
     uint32_t memoryType(uint32_t bits, VkMemoryPropertyFlags flags);
@@ -395,7 +440,6 @@ private:
     void destroyExportFramebuffers();
     void densityTexels(float cx, float cy, std::vector<float>& dens) const;   // two per texel: across, down
     void packDensity(const std::vector<float>& dens, uint8_t* dst) const;   // in the map's format
-    std::vector<bool> exportInited_;
 #ifdef _WIN32
     std::vector<VkDeviceMemory> importMem_;      // importWin32Images: the imported memories, freed on shutdown
     uint8_t deviceLUID_[8] = {};
@@ -426,6 +470,34 @@ private:
     void createGuidePipelines();
     void destroyGuide();
     void drawGuide(const EyeView eyes[2]);
+    // Splat objects (hsl_renderer_splat.cpp, splat_spirv.h): per object its splats (32 bytes each: centre, covariance
+    // as halves, colour) in video memory, and per command buffer an order buffer and its matrices (host-visible: written
+    // while the other command buffer may still be read).
+    struct SplatGpu {
+        Buffer splats;
+        Buffer order[2], ubo[2];
+        uint64_t orderSerial[2] = {0, 0};           // the sort each order buffer holds (0: none)
+        VkDescriptorSet set[2] = {};
+        uint32_t count = 0;
+        float localMin[3] = {0, 0, 0}, localMax[3] = {0, 0, 0};   // the centres' box, in its own frame
+        std::unique_ptr<SplatSorter> sorter;
+        bool sorted = false;                        // a sort was asked for: sortEye / sortWorld say where from
+        float sortEye[3] = {0, 0, 0}, sortWorld[16] = {};
+    };
+    std::vector<SplatGpu> splatObjs_;
+    VkDescriptorSetLayout splatSetLayout_ = VK_NULL_HANDLE;
+    VkPipelineLayout splatLayout_ = VK_NULL_HANDLE;
+    VkPipeline splatPipe_ = VK_NULL_HANDLE;
+    VkDescriptorPool splatPool_ = VK_NULL_HANDLE;
+    bool splatsUploaded_ = false;                   // this load's splat objects are in (or it has none)
+    float splatHead_[3] = {0, 0, 0};                // the head last frame: a jump is a teleport (sorted at once)
+    bool splatHeadSet_ = false;
+    size_t splatsDrawn_ = 0;
+    void createSplatPipeline();
+    void uploadSplats();
+    void drawSplats(const EyeView eyes[2], const float head[3], const float planes[2][5][4]);
+    void destroySplats();
+    void destroySplatPipeline();
     void destroySelection();
     // Debug views (setDebugView): one pipeline per vertex layout and mode, and the draws' matrices and colours in
     // one host-visible buffer (indexed by firstInstance), rewritten each frame after the fence.
@@ -513,7 +585,8 @@ private:
     std::vector<GpuMesh> meshes_;
     std::map<uint64_t, Image> textureCache_;        // content hash -> shared texture (freed on unload)
     const HslScene* scene_ = nullptr;
-    size_t loadNext_ = 0, loadSkipped_ = 0;
+    size_t loadNext_ = 0, loadSkipped_ = 0, loadDuplicates_ = 0;
+    std::unordered_map<uint64_t, size_t> dedupe_;                // an opaque mesh's whole-look hash -> its meshes_ index
     bool loadDone_ = true;
     std::chrono::steady_clock::time_point loadStart_;
     float ambient_[3] = {1, 1, 1};

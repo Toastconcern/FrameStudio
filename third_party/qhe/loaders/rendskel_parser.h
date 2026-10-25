@@ -82,8 +82,8 @@ inline void rs_buildBind(RendSkel& s) {
 //   i16 parent, u32 nameLen, name, T f32x3, Q(w,x,y,z) f32x4, S f32x1. HIERARCHICAL (parents precede children),
 //   e.g. whale01: global_jnt(-1)->root->chest->{head, l/r_shoulder->elbow->wrist} + tailStart->tail1->tail2->tailEnd.
 inline bool parseRendSkelV203(const std::vector<u8>& d, RendSkel& s) {
-    auto rd32=[&](size_t o)->u32{ return o+4<=d.size()? *(const u32*)(d.data()+o):0u; };
-    auto rd16=[&](size_t o)->u16{ return o+2<=d.size()? *(const u16*)(d.data()+o):(u16)0; };
+    auto rd32=[&](size_t o)->u32{ return o+4<=d.size()? loadUnaligned<u32>(d.data()+o):0u; };   // (any offset: no aligned casts)
+    auto rd16=[&](size_t o)->u16{ return o+2<=d.size()? loadUnaligned<u16>(d.data()+o):(u16)0; };
     auto rdf =[&](size_t o){ float f=0; if(o+4<=d.size()) memcpy(&f,d.data()+o,4); return f; };
     size_t o = 8;                              // after magic + version
     u32 nameLen = rd32(o); o += 4 + nameLen;   // skeleton name ("Skeleton_0")
@@ -119,8 +119,8 @@ inline bool parseRendSkel(const std::vector<u8>& d, RendSkel& s) {
     // V203 vista format (parent-first, u16 jointCount) — the whale/turtle skeletons. Try it first; it
     // returns false cleanly if the bytes are the older nuxd layout, which the code below then handles.
     { RendSkel v; if (parseRendSkelV203(d, v) && v.joints.size() >= 2) { s = std::move(v); return true; } }
-    auto rd32=[&](size_t o)->u32{ return o+4<=d.size()? *(const u32*)(d.data()+o):0u; };
-    auto rd16=[&](size_t o)->u16{ return o+2<=d.size()? *(const u16*)(d.data()+o):(u16)0; };
+    auto rd32=[&](size_t o)->u32{ return o+4<=d.size()? loadUnaligned<u32>(d.data()+o):0u; };
+    auto rd16=[&](size_t o)->u16{ return o+2<=d.size()? loadUnaligned<u16>(d.data()+o):(u16)0; };
     auto rdf=[&](size_t o){ float f=0; if(o+4<=d.size()) memcpy(&f,d.data()+o,4); return f; };
     size_t o = 8;                          // after magic+ver
     u32 nameLen = rd32(o); o += 4 + nameLen; // skeleton name
@@ -175,7 +175,7 @@ inline bool parseRendClip(const std::vector<u8>& d, int nJoints, RendClip& c) {
         return true;
     }
     if (d.size() < 200) return false;
-    auto rd32=[&](size_t o)->u32{ return o+4<=d.size()? *(const u32*)(d.data()+o):0u; };
+    auto rd32=[&](size_t o)->u32{ return o+4<=d.size()? loadUnaligned<u32>(d.data()+o):0u; };
     auto rdf=[&](size_t o){ float f=0; if(o+4<=d.size()) memcpy(&f,d.data()+o,4); return f; };
     if (rd32(0) != 0xA34912B6u) return false;                 // hzanim clip magic
     int hdrJoints = (int)rd32(8);

@@ -21,6 +21,7 @@
 #include "overlays.h"
 #include "perf_settings.h"
 #include "home_platform.h"
+#include "dashboard_icon.h"
 
 #include <openvr.h>
 
@@ -41,6 +42,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <map>
 #include <mutex>
 #include <set>
@@ -177,7 +179,9 @@ std::vector<Env> scanEnvs() {
             std::vector<uint8_t> thumb;
             if (!fenvReadManifest(p.string(), m, &thumb)) continue;
             e.name = m.name.empty() ? pretty(p.stem().string()) : m.name;
-            e.kind = m.sources.size() > 1 ? "Frame environment, footprint + vista" : "Frame environment";
+            e.kind = std::string(m.sources.size() > 1 ? "Frame environment, footprint + vista" : "Frame environment") + " \u00b7 " +
+                     (m.studioVersion.empty() ? "made before v0.2" : "made with Studio " + m.studioVersion);
+            if (!fenvMissingFeatures(m).empty()) e.kind = "Needs a newer Frame Home: update it from this panel";   // (it won't load)
             e.thumb = decodeBytes(thumb);
         } else {
             e.name = pretty(p.stem().string());
@@ -205,7 +209,8 @@ bool setCurrent(const Env& e) {
     {
         std::ofstream f(tmp);
         for (const auto& n : e.files) f << n << "\n";
-        if (!f) return false;
+        f.close();                                   // (a full disk shows at the flush: never renamed in half written)
+        if (!f) { std::error_code ec; fs::remove(tmp, ec); return false; }
     }
     std::error_code ec;
     fs::rename(tmp, rootDir() / "current", ec);     // atomic: Frame Home never reads half a file
@@ -233,7 +238,8 @@ bool writeCurrent(const std::vector<std::string>& files) {
     {
         std::ofstream f(tmp);
         for (const auto& n : files) f << n << "\n";
-        if (!f) return false;
+        f.close();                                   // (as setCurrent: checked after the flush)
+        if (!f) { std::error_code ec; fs::remove(tmp, ec); return false; }
     }
     std::error_code ec;
     fs::rename(tmp, rootDir() / "current", ec);
@@ -269,7 +275,8 @@ int removeCacheEntries(const CacheDoomed& c) {
         }
         for (const fs::path& d : doomed) if (fs::remove_all(d, ec) > 0 && !ec) ++n;
     }
-    fs::remove(c.root / (c.key + ".lock"), ec);
+    // (the .lock file stays: removed, a waiter would hold a lock on the gone file while the next opener made a new
+    // one, and both would think they had it to themselves)
     return n;
 }
 
@@ -314,8 +321,12 @@ DeleteResult deleteEnv(const Env& e, const std::vector<Env>& all, bool cacheInBa
     // 2. The files (cache names first: they hash the path of the file as it exists).
     std::vector<CacheDoomed> caches;
     for (const auto& f : e.files) if (fs::path(f).extension() == ".fenv") caches.push_back(cacheEntriesOf(envs / f));
+    // One that won't go doesn't stop the rest: half a pair left behind would still be named in pairs.txt.
     for (const auto& f : e.files) {
-        if (!fs::remove(envs / f, ec) || ec) { r.error = "couldn't delete " + f + (ec ? ": " + ec.message() : ""); return r; }
+        if (!fs::remove(envs / f, ec) || ec) {
+            if (r.error.empty()) r.error = "couldn't delete " + f + (ec ? ": " + ec.message() : "");
+            continue;
+        }
         r.removed.push_back("envs/" + f);
         for (const char* comp : {".world.json", ".edits.json"})
             if (fs::remove(envs / (f + comp), ec)) r.removed.push_back("envs/" + f + comp);
@@ -358,8 +369,8 @@ DeleteResult deleteEnv(const Env& e, const std::vector<Env>& all, bool cacheInBa
         if (cacheInBackground) std::thread([caches] { for (const auto& c : caches) removeCacheEntries(c); }).detach();
         else for (const auto& c : caches) for (int i = removeCacheEntries(c); i > 0; --i) r.removed.push_back("cache/" + c.key + "-*");
     }
-    LOG("deleted %s (%zu files)", e.name.c_str(), r.removed.size());
-    r.ok = true;
+    LOG("deleted %s (%zu files)%s", e.name.c_str(), r.removed.size(), r.error.empty() ? "" : (": " + r.error).c_str());
+    r.ok = r.error.empty();
     return r;
 }
 
@@ -725,6 +736,10 @@ std::string releaseUrl() {
     return u && *u ? std::string(u) : std::string(kReleaseUrl);
 }
 
+#ifndef FRAME_VERSION_BASE
+#define FRAME_VERSION_BASE "?"   // (CMakeLists.txt sets it from VERSION)
+#endif
+
 struct Updates {
     enum class State { Idle, Available, Updating, Failed };
     std::mutex m;
@@ -757,6 +772,10 @@ struct Updates {
     // What's installed, hashed as CI hashes frame/payload.
     static std::string installedHash() {
         int rc = 0;
+        // (the pipeline's exit code is the last cut's: a file sha256sum couldn't read would still give a hash)
+        std::error_code ec;
+        for (const char* f : {"bin/frame-home", "bin/frame-switcher", "bin/fenv-tool", "layer/libframe_home_layer.so", "layer/env_ps.spv"})
+            if (!fs::is_regular_file(rootDir() / f, ec)) return {};
         std::string h = sh("cd " + quoted(rootDir()) + " && sha256sum bin/frame-home bin/frame-switcher bin/fenv-tool "
                            "layer/libframe_home_layer.so layer/env_ps.spv | cut -c1-64 | sha256sum | cut -c1-64", rc);
         while (!h.empty() && (h.back() == '\n' || h.back() == '\r')) h.pop_back();
@@ -795,18 +814,41 @@ struct Updates {
         fs::remove_all(dir, ec);
         fs::create_directories(dir, ec);
         fs::create_directories(log.parent_path(), ec);
-        { std::ofstream(dir / "started") << "1\n"; }   // the new panel says it's updated
         LOG("updating Frame Home from %s", releaseUrl().c_str());
         int rc = 0;
-        sh("curl -fsSL --retry 2 --max-time 1800 -o " + quoted(dir / "FrameHome-installer.zip") + " '" + releaseUrl() +
-           "FrameHome-installer.zip' > " + quoted(log) + " 2>&1", rc);
+        // The installer's SHA-256 as the release lists it (latest.json "sha256-FrameHome-installer.zip", as Frame
+        // Studio checks its own downloads): a download cut short, damaged, or from a release other than the one
+        // latest.json describes is never installed.
+        std::string want;
+        try {
+            const tinyjson::Value v = tinyjson::parse(sh("curl -fsSL --max-time 30 '" + releaseUrl() + "latest.json'", rc));
+            if (rc == 0 && v.isObject()) want = v["sha256-FrameHome-installer.zip"].asString();
+        } catch (...) {}
         if (rc != 0) return "The update didn't download. Check the headset's Wi-Fi and try again.";
-        sh("unzip -q -o " + quoted(dir / "FrameHome-installer.zip") + " -d " + quoted(dir) + " >> " + quoted(log) + " 2>&1", rc);
+        // (a release that doesn't list it can't be checked: not installed)
+        if (want.size() != 64) return "The update can't be checked (the release lists no SHA-256 for it). Try again later.";
+        const fs::path zip = dir / "FrameHome-installer.zip";
+        sh("curl -fsSL --retry 2 --max-time 1800 -o " + quoted(zip) + " '" + releaseUrl() + "FrameHome-installer.zip' > " + quoted(log) + " 2>&1", rc);
+        if (rc != 0) return "The update didn't download. Check the headset's Wi-Fi and try again.";
+        {
+            std::string got = sh("sha256sum " + quoted(zip) + " | cut -c1-64", rc);
+            while (!got.empty() && (got.back() == '\n' || got.back() == '\r')) got.pop_back();
+            if (rc != 0 || got != want) {
+                LOG("update: the installer's SHA-256 is %s, the release says %s", got.c_str(), want.c_str());
+                fs::remove_all(dir, ec);
+                return "The update download was damaged or changed while downloading. Try again in a few minutes.";
+            }
+        }
+        sh("unzip -q -o " + quoted(zip) + " -d " + quoted(dir) + " >> " + quoted(log) + " 2>&1", rc);
+        fs::remove(zip, ec);                             // (unpacked: not kept on the headset's disk)
         const fs::path script = dir / "FrameHome-installer" / "payload" / "install.sh";
         if (rc != 0 || !fs::exists(script, ec)) return "The update couldn't be unpacked.";
+        // The new panel says it's updated: marked only now, so a download or unpack that failed never claims it.
+        { std::ofstream(dir / "started") << "1\n"; }
         // Its own session: install.sh stops this panel, and must carry on without it.
         sh("setsid sh " + quoted(script) + " >> " + quoted(log) + " 2>&1", rc);
-        if (rc == 0) { fs::remove(dir / "started", ec); return {}; }
+        fs::remove(dir / "started", ec);                 // still running: install.sh failed, or SteamVR isn't up
+        if (rc == 0) return {};
         std::string tail = sh("tail -n 1 " + quoted(log), rc);
         tail = tail.substr(0, tail.find('\n'));
         return "The update failed: " + (tail.empty() ? std::string("see logs/update.log") : tail);
@@ -833,8 +875,9 @@ struct Updates {
     }
 
     // The header's Update Frame Home.
-    void install() {
-        if (!kSelfUpdate || busy || get() != State::Available) return;
+    // False when it can't start now (a check still running, or nothing to install).
+    bool install() {
+        if (!kSelfUpdate || busy || get() != State::Available) return false;
         busy = true;
         set(State::Updating);
         std::thread([this] {
@@ -843,6 +886,7 @@ struct Updates {
             else set(State::Failed, err);
             busy = false;
         }).detach();
+        return true;
     }
 };
 Updates g_updates;
@@ -858,6 +902,9 @@ struct Panel {
     int page = 0;                       // 0 environments, 1 settings, 2 debug
     PerfSettings perf;
     std::string stats;                  // a line from Frame Home's stats.json
+    std::future<std::string> buildHash; // the installed files' hash (Updates::installedHash), for the Settings page's
+    std::string buildId;                // last line "Frame Home v0.2 · build 1a2b3c4"; empty: not known
+    bool buildHashDone = false;
     DebugSettings dbg;                  // debug.json: the Debug page's views
     DebugInfo info;                     // ...and what it shows of stats.json and report.json
     static constexpr int kShotId = 9200, kDebugOffId = 9201;
@@ -988,7 +1035,7 @@ struct Panel {
     bool tick(double dt) {
         bool moving = false;
         const float fdt = static_cast<float>(std::min(dt, 0.1));
-        for (int p = 0; p < 2; ++p) {
+        for (int p = 0; p < 3; ++p) {
             Scroll& s = sc[p];
             const float m = maxScroll(p);
             if (!(dragging && p == page)) {
@@ -1016,6 +1063,7 @@ struct Panel {
         }
         if (!switchingKey.empty()) { moving = true; if (now >= switchUntil) switchingKey.clear(); }
         if (!toast.empty()) { moving = true; if (now >= toastUntil) toast.clear(); }
+        if (buildHash.valid()) moving = true;     // the build's hash is being worked out: draw it when it's in
         if (!confirmKey.empty() && now - confirmStart < 0.3) moving = true;   // the question fades in
         return moving;
     }
@@ -1201,6 +1249,14 @@ struct Panel {
         y += 20;
         const std::vector<std::string> note = small.wrap("Anti-aliasing, texture filtering and turning foveation on or off restart Frame Home (a few seconds).", W - 2 * kPad - 8);
         for (const auto& l : note) { small.draw(cv, kPad + 4, kTop + y - sc[1].pos, l, kFaint); y += 26; }
+        // At the bottom: which Frame Home this is (the build: the installed files' hash, as updates compare them).
+        // (the hash reads every program: worked out once, off the panel's thread; the version alone until then)
+        if (!buildHash.valid() && !buildHashDone) buildHash = std::async(std::launch::async, [] { return Updates::installedHash(); });
+        if (buildHash.valid() && buildHash.wait_for(std::chrono::seconds(0)) == std::future_status::ready) { buildId = buildHash.get(); buildHashDone = true; }
+        const std::string version = std::string("Frame Home v") + FRAME_VERSION_BASE + (buildId.size() >= 7 ? "  ·  build " + buildId.substr(0, 7) : "");
+        y += 24;
+        small.draw(cv, kPad + 4, kTop + y - sc[1].pos, version, kFaint);
+        y += 26;
         sc[1].content = y + 40;
     }
 
@@ -1508,7 +1564,8 @@ struct Panel {
     void removeEnv(size_t i) {
         const Env e = envs[i];
         const DeleteResult r = deleteEnv(e, envs, true);
-        if (!r.ok) { say("Couldn't delete " + e.name + (r.error.empty() ? "" : " (" + r.error + ")"), true, 4); return; }
+        confirmKey.clear();                    // (or the same name sent again later would come back asking "Delete?")
+        if (!r.ok && r.removed.empty()) { say("Couldn't delete " + e.name + (r.error.empty() ? "" : " (" + r.error + ")"), true, 4); return; }
         envs = scanEnvs();
         current = currentKey();
         hoverT.assign(envs.size(), 0.0f);
@@ -1516,6 +1573,7 @@ struct Panel {
         sc[0].content = envContent();
         sc[0].target = std::clamp(sc[0].target, 0.0f, maxScroll(0));
         hotHover = -1;
+        if (!r.ok) { say("Partly deleted " + e.name + " (" + r.error + ")", true, 4); return; }
         say("Deleted " + e.name + (r.currentChanged && !r.newCurrent.empty() ? "  ·  now showing " + r.newCurrent : ""), false, 3);
     }
     void click(int id) {
@@ -1531,8 +1589,8 @@ struct Panel {
             return;
         }
         if (id == kUpdateId) {
-            g_updates.install();
-            say("Updating Frame Home: it restarts in a moment", false, 6);
+            if (g_updates.install()) say("Updating Frame Home: it restarts in a moment", false, 6);
+            else say("Still checking for updates: try again in a moment", false, 3);
             return;
         }
         if (id >= 9000 && id < 9003) {
@@ -1682,14 +1740,9 @@ int runPanel() {
     vr::VROverlay()->SetOverlayInputMethod(ov, vr::VROverlayInputMethod_Mouse);
     const vr::HmdVector2_t mouseScale = {{static_cast<float>(W), static_cast<float>(H)}};
     vr::VROverlay()->SetOverlayMouseScale(ov, &mouseScale);
-    {   // dashboard tab icon: a small orange tile
-        std::vector<uint8_t> ic(64 * 64 * 4);
-        for (int y = 0; y < 64; ++y) for (int x = 0; x < 64; ++x) {
-            uint8_t* p = &ic[(y * 64 + x) * 4];
-            const bool on = (x > 10 && x < 54 && y > 14 && y < 50) && !(x > 16 && x < 48 && y > 20 && y < 44 && (y - 20) * 32 > (x - 16) * 24);
-            p[0] = on ? 240 : 0; p[1] = on ? 148 : 0; p[2] = on ? 58 : 0; p[3] = on ? 255 : 0;
-        }
-        vr::VROverlay()->SetOverlayRaw(icon, ic.data(), 64, 64, 4);
+    {   // dashboard tab icon: the app icon's roof and headset (dashboard_icon.h); SetOverlayRaw wants it writable
+        std::vector<uint8_t> ic(kDashIcon, kDashIcon + sizeof kDashIcon);
+        vr::VROverlay()->SetOverlayRaw(icon, ic.data(), kDashIconSize, kDashIconSize, 4);
     }
     Panel panel;
     panel.loadFonts();
@@ -1800,11 +1853,18 @@ int runPanel() {
             return;
         }
         const std::string bin = (rootDir() / "bin" / "frame-home").string();
+        // Its environment made here, before fork: between fork and exec only async-signal-safe calls (setenv
+        // allocates, and another thread may hold the allocator's lock).
+        std::vector<std::string> env = {"STEAMVR_APPKEY=framehome.environment"};   // its own app to SteamVR, not ours (our input is legacy)
+        for (char** e = environ; e && *e; ++e) if (std::strncmp(*e, "STEAMVR_APPKEY=", 15) != 0) env.push_back(*e);
+        std::vector<char*> envp;
+        for (std::string& e : env) envp.push_back(e.data());
+        envp.push_back(nullptr);
+        char* const argv[] = {const_cast<char*>(bin.c_str()), const_cast<char*>("--system"), nullptr};
         const pid_t pid = fork();
         if (pid == 0) {
             setsid();
-            setenv("STEAMVR_APPKEY", "framehome.environment", 1);   // its own app to SteamVR, not ours (our input is legacy)
-            execl(bin.c_str(), bin.c_str(), "--system", static_cast<char*>(nullptr));
+            execve(bin.c_str(), argv, envp.data());
             _exit(127);
         }
         if (pid > 0) { systemPid = pid; LOG("started frame-home --system (pid %d)", static_cast<int>(pid)); }
@@ -1872,6 +1932,9 @@ int runPanel() {
                     fs::remove(rootDir() / "layer" / "off", ec);
                     fs::remove(rootDir() / "layer" / "crashes", ec);
                     LOG("Frame Home turned back on from the panel");
+                    // The layer makes its pipelines as the compositor starts; one that started off has none to draw
+                    // with until SteamVR (the compositor) starts again.
+                    panel.say("Turned on: it shows after SteamVR restarts", false, 6);
                 }
                 if (systemPid > 0 && homeos::alive(systemPid)) {
                     LOG("restarting frame-home --system (pid %d) from the panel", static_cast<int>(systemPid));
@@ -2020,7 +2083,8 @@ int runPanel() {
         const auto now = std::chrono::steady_clock::now();
         if (now - lastPoll > std::chrono::seconds(2)) {
             lastPoll = now;
-            if (rescan()) { dirty = true; panel.sc[0].content = panel.envContent(); }
+            // (a new list: the cards' click targets from the last drawing belong to the old one until it's redrawn)
+            if (rescan()) { dirty = true; panel.sc[0].content = panel.envContent(); panel.hots.clear(); panel.hotHover = panel.pressHot = -1; }
             PerfSettings ps;
             if (ps.fromJson(readText(rootDir() / "settings.json")) && !(ps == panel.perf)) { panel.perf = ps; if (panel.page == 1) dirty = true; }
             const std::string line = statsLine();
@@ -2130,6 +2194,11 @@ bool frameHomeShowing() {
 int runThumbs() {
     std::error_code ec;
     fs::create_directories(homeos::thumbs(), ec);
+#ifndef _WIN32
+    // One at a time (the panel and install.sh both start it): a second one finds the lock held and leaves it be.
+    const int lockFd = ::open((homeos::thumbs() / ".lock").c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+    if (lockFd >= 0 && flock(lockFd, LOCK_EX | LOCK_NB) != 0) { LOG("thumbnails: another --thumbs is making them"); return 0; }
+#endif
     const std::string bin = (rootDir() / "bin" / homeos::exeName("frame-home")).string();
     int made = 0;
     for (const Env& e : scanEnvs()) {

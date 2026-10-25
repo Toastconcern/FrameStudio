@@ -18,7 +18,7 @@ int main() {
     ck(loco.seated() == 0, "landing on a seat sits you in it");
     ck(std::fabs(e[0] - 2) < 1e-3f && std::fabs(e[2] + 1) < 1e-3f, "your head is over the seat", e[0], e[1], e[2]);
     ck(std::fabs(e[1] - (0.45f + 0.78f)) < 1e-3f, "your eyes are at seated height over it (standing in the room)", e[1]);
-    ck(std::fabs(facing()) < 0.02f, "sitting keeps the way you face (no turn to the seat's front)", facing());
+    ck(std::fabs(facing() - 1.5708f) < 0.02f, "sitting turns you to face the seat's front (its yaw)", facing());
     for (int i = 0; i < 30; ++i) loco.update(1.0f / 90, head);
     eye(e);
     ck(loco.seated() == 0 && std::fabs(e[0] - 2) < 1e-3f, "sitting still keeps you in the seat", e[0], e[1], e[2]);
@@ -45,6 +45,11 @@ int main() {
         Locomotion l2; l2.setWorld(w); l2.setOptions(1, 2, 0, 30, 2);
         float hd[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 1.70f, 0, 1};
         l2.testSit(0, hd);
+        l2.testInput(0, 1, 0, 0);                         // still held from before you sat: you stay
+        for (int i = 0; i < 30; ++i) l2.update(1.0f / 90, hd);
+        ck(l2.seated() == 0, "a stick already pushed when you sit doesn't stand you straight back up");
+        l2.testInput(0, 0, 0, 0);
+        l2.update(1.0f / 90, hd);
         l2.testInput(0, 1, 0, 0);
         l2.update(1.0f / 90, hd);
         l2.testInput(0, 0, 0, 0);
@@ -358,6 +363,90 @@ int main() {
         }
         ck(seatAimed, "the teleport arc hits the seat's volume: it targets the seat", static_cast<float>(l3.testTargetSeat()));
     }
+    {   // seats face their way: whichever way your head points (and however the rig was turned), you end up facing the
+        // seat's yaw (0 = -Z, as Studio's arrow), head over the seat; standing up lands at its exit
+        const float kD = 0.0174533f;
+        auto wrap = [](float a) { return std::remainder(a, 6.2831853f); };
+        auto pose = [](float y, float p, float x, float h, float z, float* m) {   // tracking head: yaw y, pitch p (column-major)
+            const float c = std::cos(y), s = std::sin(y), cp = std::cos(p), sp = std::sin(p);
+            const float v[16] = {c, 0, -s, 0, s * sp, cp, c * sp, 0, s * cp, -sp, c * cp, 0, x, h, z, 1};
+            std::copy(v, v + 16, m);
+        };
+        auto headOf = [](Locomotion& l, const float* h, float* e, float& yaw) {
+            float R[16]; l.rig(R);
+            for (int k = 0; k < 3; ++k) e[k] = R[k] * h[12] + R[4 + k] * h[13] + R[8 + k] * h[14] + R[12 + k];
+            float f[3];
+            for (int k = 0; k < 3; ++k) f[k] = -(R[k] * h[8] + R[4 + k] * h[9] + R[8 + k] * h[10]);
+            if (std::hypot(f[0], f[2]) < 0.2f) {   // looking down: the top of the head points the way you face
+                for (int k = 0; k < 3; ++k) f[k] = R[k] * h[4] + R[4 + k] * h[5] + R[8 + k] * h[6];
+            }
+            yaw = std::atan2(-f[0], -f[2]);
+        };
+        HomeWorld w = flat;
+        WorldPoint sp; sp.name = "Spawn"; sp.yaw = 0.7f; w.spawns.push_back(sp);   // the rig starts turned
+        const float seatYaw[4] = {0, 90 * kD, 180 * kD, -90 * kD};
+        for (float y : seatYaw) {
+            WorldPoint st; st.name = "Chair"; st.pos[0] = 2; st.pos[1] = 0.45f; st.pos[2] = -1; st.yaw = y;
+            st.exit[0] = 0.3f; st.exit[2] = -0.6f;
+            w.seats.push_back(st);
+        }
+        const float headYaw[4] = {0, 1.0f, -2.5f, 3.0f}, headPitch[3] = {0, -0.6f, -1.5f};
+        int n = 0, bad = 0;
+        float worst = 0;
+        for (int i = 0; i < 4; ++i)
+            for (float hy : headYaw)
+                for (float hp : headPitch) {
+                    Locomotion l; l.setWorld(w);
+                    float h[16]; pose(hy, hp, 0.4f, 1.7f, -0.3f, h);
+                    l.testSit(i, h);
+                    float e[3], fy;
+                    headOf(l, h, e, fy);
+                    const float d = std::fabs(wrap(fy - seatYaw[i]));
+                    worst = std::max(worst, d);
+                    const bool over = std::fabs(e[0] - 2) < 1e-3f && std::fabs(e[2] + 1) < 1e-3f && l.seated() == i;
+                    l.testWalkOff(h);
+                    float x[3], fy2;
+                    headOf(l, h, x, fy2);
+                    const float c = std::cos(seatYaw[i]), s = std::sin(seatYaw[i]);
+                    const float wx = 2 + c * 0.3f + s * -0.6f, wz = -1 - s * 0.3f + c * -0.6f;
+                    const bool out = l.seated() == -1 && std::fabs(x[0] - wx) < 0.02f && std::fabs(x[2] - wz) < 0.02f && std::fabs(x[1] - 1.7f) < 0.02f;
+                    ++n;
+                    if (d > kD || !over || !out) {
+                        ++bad;
+                        std::printf("      seat %.0f deg, head yaw %.2f pitch %.2f: facing %.1f deg off, head (%.2f %.2f), out (%.2f %.2f) want (%.2f %.2f)\n",
+                                    seatYaw[i] / kD, hy, hp, d / kD, e[0], e[2], x[0], x[2], wx, wz);
+                    }
+                }
+        ck(bad == 0, "seats at 0/90/180/-90 deg, head facing any way (level, down, straight down): you face the seat within 1 deg, over it, and stand up at its exit",
+           static_cast<float>(n), static_cast<float>(bad), worst / kD);
+        // the seat's front is where its exit default goes (half a metre ahead, -Z turned by yaw): sitting faces it
+        {
+            HomeWorld w2 = flat;
+            WorldPoint st; st.name = "Bench"; st.pos[0] = 0; st.pos[1] = 0.45f; st.pos[2] = -3; st.yaw = 90 * kD; w2.seats.push_back(st);
+            float m[12];
+            const float lh[3] = {-0.2f, 1.2f, 0};
+            handPose(lh, 0.2f, -0.65f, -3, m);
+            for (int mode = 1; mode <= 2; ++mode) {   // the trigger: 1 a blink (here: a jump), 2 a dash
+                Locomotion l; l.setWorld(w2); l.setOptions(1, mode, 0, 30, 2);
+                l.testInput(0, 0, 0, 0);
+                l.testButtons(false, false, m); run(l, 1);
+                l.testButtons(false, true, m); run(l, 40);
+                float e[3], fy;
+                headOf(l, hd, e, fy);
+                ck(l.seated() == 0 && std::fabs(wrap(fy - st.yaw)) < kD && std::fabs(e[0]) < 1e-3f && std::fabs(e[2] + 3) < 1e-3f,
+                   mode == 1 ? "the trigger on a seat (blink): you land facing its front" : "the trigger on a seat (dash): you land facing its front",
+                   fy / kD, e[0], e[2]);
+                // the stick: up and out to half a metre in front of it, still facing its way
+                l.testButtons(false, false, nullptr);
+                l.testInput(0, 0, 0, 0); run(l, 1);
+                l.testInput(0, 1, 0, 0); run(l, 1);
+                l.testInput(0, 0, 0, 0); run(l, 60);
+                headOf(l, hd, e, fy);
+                ck(l.seated() == -1 && std::fabs(e[0] + 0.5f) < 0.05f && std::fabs(e[2] + 3) < 0.05f && std::fabs(wrap(fy - st.yaw)) < kD,
+                   "...and the stick stands you up in front of it, facing the same way", e[0], e[2], fy / kD);
+            }
+        }
+    }
     {   // a home with no world layer: floors and walls come from its drawn meshes (walkWorld -> geometryColliders)
         HslScene sc;
         auto mesh = [&](const char* name, std::vector<float> p) {
@@ -404,6 +493,96 @@ int main() {
         const float o[3] = {0.2f, 1.2f, 0}, d[3] = {-0.2f / 4.05f, -0.65f / 4.05f, -4 / 4.05f};
         float t;
         ck(l.seatOnRay(o, d, 10, t) == 0 && t < 3.0f, "a ray stopped by the chair's own (big) collider points at the chair", t);
+    }
+    // ── What the compositor layer carries a repeated frame on by (env_share.h Motion), and the system-mode blink ──
+    {   // the turn rate: a smooth turn's, never a snap's
+        Locomotion l; l.setWorld(flat); l.setOptions(1, 1, 1, 30, 2);
+        l.testInput(0, 0, 1, 0); run(l, 1);
+        const float smooth = l.turnRate();
+        l.testInput(0, 0, 0, 0); run(l, 1);
+        const float stopped = l.turnRate();
+        Locomotion s; s.setWorld(flat); s.setOptions(1, 1, 0, 30, 2);
+        float R0[16], R1[16]; s.rig(R0);
+        s.testInput(0, 0, -1, 0); run(s, 1); s.rig(R1);
+        ck(std::fabs(smooth + 2.0944f) < 1e-4f && stopped == 0 && s.turnRate() == 0 && std::fabs(R1[0] - R0[0]) > 0.1f,
+           "turn rate: a full smooth turn right is -120 degrees/s, let go 0; a snap turns but carries no rate", smooth, stopped, s.turnRate());
+    }
+    {   // a frame's yaw is linear in its target time: two 60 Hz steps turn as far as four 120 Hz ones
+        Locomotion a; a.setWorld(flat); a.setOptions(1, 1, 1, 30, 2);
+        Locomotion b; b.setWorld(flat); b.setOptions(1, 1, 1, 30, 2);
+        a.testInput(0, 0, 1, 0); b.testInput(0, 0, 1, 0);
+        for (int i = 0; i < 2; ++i) a.update(1.0f / 60, hd);
+        for (int i = 0; i < 4; ++i) b.update(1.0f / 120, hd);
+        float Ra[16], Rb[16]; a.rig(Ra); b.rig(Rb);
+        ck(std::fabs(std::atan2(Ra[8], Ra[10]) - std::atan2(Rb[8], Rb[10])) < 1e-5f, "smooth turn: half rate steps land where full rate's do",
+           std::atan2(Ra[8], Ra[10]), std::atan2(Rb[8], Rb[10]));
+    }
+    {   // system mode's own blink: fades out over 80 ms, jumps while black, fades back in over 120 ms
+        const float aim[12] = {1, 0, 0, 0.2f, 0, 0.866f, 0.5f, 1.2f, 0, -0.5f, 0.866f, 0};
+        Locomotion l; l.setWorld(flat); l.setOptions(1, 1, 0, 30, 2); l.setOwnFade(true);
+        float t[3], e0[3], e1[3];
+        l.testInput(0, 0, 0, 1, aim); run(l, 3); l.testTarget(t); eyeOf(l, e0);
+        ck(l.blinkLevel() == 1, "aiming: the view is open", l.blinkLevel());
+        l.testInput(0, 0, 0, 0); run(l, 1);                                  // released
+        float lv = l.blinkLevel(), lowest = lv;
+        bool fell = true;
+        int frames = 1;
+        eyeOf(l, e1);
+        bool stayed = std::hypot(e1[0] - e0[0], e1[2] - e0[2]) < 1e-4f;
+        while (l.blinkLevel() > 0 && frames < 20) {
+            run(l, 1); ++frames;
+            fell &= l.blinkLevel() <= lv;
+            lv = l.blinkLevel();
+            lowest = std::min(lowest, lv);
+            eyeOf(l, e1);
+            if (lv > 0) stayed &= std::hypot(e1[0] - e0[0], e1[2] - e0[2]) < 1e-4f;
+        }
+        eyeOf(l, e1);
+        const bool landedBlack = l.blinkLevel() == 0 && std::fabs(e1[0] - t[0]) < 1e-3f && std::fabs(e1[2] - t[2]) < 1e-3f;
+        ck(fell && stayed && landedBlack && frames >= 6 && frames <= 8,
+           "own blink: darkens over ~80 ms, you stay put until it's black, and land then", frames * dt, e1[0] - t[0], e1[2] - t[2]);
+        int back = 0;
+        while (l.blinkLevel() < 1 && back < 30) { run(l, 1); ++back; }
+        ck(back >= 9 && back <= 11, "own blink: back to full brightness ~120 ms after landing", back * dt);
+    }
+    {   // the layer's carry-on (env_ps.frag) matches the rig: a point seen now, turned back by turnRate * dt and walked
+        // back by the rig's walk (main.cpp's velocity, the rig's rotation transposed), is where the last frame saw it
+        Locomotion l; l.setWorld(flat); l.setOptions(1, 1, 1, 30, 2);
+        l.testInput(0.3f, 1, -0.8f, 0); run(l, 30);                             // walking forward-right, turning right
+        float R0[16], R1[16];
+        l.rig(R0); run(l, 1); l.rig(R1);
+        const float P[3] = {1.0f, 1.2f, -2.5f};                                // a point in the home
+        auto toTracking = [&](const float* R, const float* w, float* o) {       // R^-1 * w (rigid)
+            const float d[3] = {w[0] - R[12], w[1] - R[13], w[2] - R[14]};
+            for (int k = 0; k < 3; ++k) o[k] = R[k * 4] * d[0] + R[k * 4 + 1] * d[1] + R[k * 4 + 2] * d[2];
+        };
+        float p0[3], p1[3];
+        toTracking(R0, P, p0); toTracking(R1, P, p1);
+        const float* eyeT = &hd[12];
+        float now[3], then[3];
+        for (int k = 0; k < 3; ++k) { now[k] = p1[k] - eyeT[k]; then[k] = p0[k] - eyeT[k]; }
+        const float D = std::sqrt(now[0] * now[0] + now[1] * now[1] + now[2] * now[2]);
+        // the rig's walk this frame, as main.cpp works it out (where the head's spot in the room went)
+        float dw[3], v[3];
+        for (int k = 0; k < 3; ++k)
+            dw[k] = R1[k] * eyeT[0] + R1[4 + k] * eyeT[1] + R1[8 + k] * eyeT[2] + R1[12 + k] - (R0[k] * eyeT[0] + R0[4 + k] * eyeT[1] + R0[8 + k] * eyeT[2] + R0[12 + k]);
+        for (int k = 0; k < 3; ++k) v[k] = R0[k * 4] * dw[0] + R0[k * 4 + 1] * dw[1] + R0[k * 4 + 2] * dw[2];   // (the shown frame's rig)
+        const float a = l.turnRate() * dt, c = std::cos(a), s = std::sin(a);
+        float d[3] = {now[0] / D, now[1] / D, now[2] / D};
+        const float rd[3] = {c * d[0] + s * d[2], d[1], -s * d[0] + c * d[2]};
+        float q[3] = {rd[0] * D + v[0], rd[1] * D + v[1], rd[2] * D + v[2]};
+        const float ql = std::sqrt(q[0] * q[0] + q[1] * q[1] + q[2] * q[2]), tl = std::sqrt(then[0] * then[0] + then[1] * then[1] + then[2] * then[2]);
+        const float err = std::acos(std::clamp((q[0] * then[0] + q[1] * then[1] + q[2] * then[2]) / (ql * tl), -1.0f, 1.0f));
+        const float moved = std::acos(std::clamp((now[0] * then[0] + now[1] * then[1] + now[2] * then[2]) / (D * tl), -1.0f, 1.0f));
+        ck(l.turnRate() != 0 && moved > 0.01f && err < 1e-3f, "carry-on: turning back and walking back a frame lands on where it was seen (radians)", moved, err);
+    }
+    {   // the depth guess: what's in front of the eyes
+        HomeWorld w = flat;
+        w.colliders.push_back(quadC(WorldCollider::Wall, {-5, 0, -3, 5, 0, -3, 5, 3, -3, -5, 3, -3}));
+        Locomotion l; l.setWorld(w);
+        Locomotion o; o.setWorld(flat);
+        ck(std::fabs(l.viewDepth(hd) - 3) < 0.05f && o.viewDepth(hd) == 8.0f, "view depth: a wall 3 m ahead is 3 m; nothing ahead, 8",
+           l.viewDepth(hd), o.viewDepth(hd));
     }
     std::printf("%d failed\n", fails);
     return fails;

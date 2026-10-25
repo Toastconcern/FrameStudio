@@ -1,0 +1,2 @@
+// Frame Studio's Windows resources: the app icon (Explorer, the taskbar, Alt+Tab; the window loads it as icon 1).
+1 ICON "../art/icon/frame-studio.ico"

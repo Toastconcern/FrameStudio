@@ -43,7 +43,8 @@ public:
     std::string asString() const { return strVal; }
     int64_t asInt() const {
         if (type == Type::Int) return intVal;
-        if (type == Type::Float) return (int64_t)floatVal;
+        if (type == Type::Float)   // (NaN / out of range: undefined as a cast; 0 or the nearest end instead)
+            return floatVal >= 9.2e18 ? INT64_MAX : floatVal <= -9.2e18 ? INT64_MIN : floatVal == floatVal ? (int64_t)floatVal : 0;
         // Asset IDs may be quoted ("targetId": "2719744159" in community shellconfig/HSTF) —
         // parse unsigned so u32 targetIds above INT_MAX survive the (u32) cast at call sites.
         if (type == Type::String) return (int64_t)std::strtoull(strVal.c_str(), nullptr, 10);
@@ -154,6 +155,7 @@ private:
             floatVal = (double)intVal + frac;
         }
         if (peek() == 'e' || peek() == 'E') {
+            if (!isFloat) floatVal = (double)intVal;   // "1e0": no '.', so the value so far is the integer part
             isFloat = true;
             next();
             bool eNeg = (peek() == '-');
@@ -161,7 +163,6 @@ private:
             double exp = 0;
             while (p < end && *p >= '0' && *p <= '9') { exp = exp * 10 + (*p - '0'); ++p; }
             floatVal = floatVal * std::pow(10.0, eNeg ? -exp : exp);
-            if (!isFloat) { floatVal = (double)intVal; isFloat = true; }
         }
         if (p == start) throw std::runtime_error("Expected number");
 

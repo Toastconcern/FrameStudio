@@ -7,12 +7,16 @@
 //     compute every position bit for bit alike)
 //   - alphaOnly: the fragment shader writing only its alpha (the cut-out depth pass)
 //   - specialize: per material, the uniform values that never change baked in as constants (spv_specialize.h)
+//   - optimized: each of those through spv_opt.h when it's switched on, so a .fenv's home loads without making them;
+//     the shipped vertex and fragment shaders stay as they are (the renderer lays a program out from them, and a
+//     variant the bake didn't make is specialized from them)
 // The set-2 (material) uniform buffers are filled here too, by the same code for both, so the bytes a baked shader
 // assumes are the bytes the renderer uploads.
 #include "core/types.h"
 #include "hsl_scene.h"
 #include "spv_reflect.h"
 #include "spv_specialize.h"
+#include "spv_opt.h"
 
 #include <algorithm>
 #include <cctype>
@@ -327,6 +331,14 @@ inline spvspec::Fetch fetchFor(const SceneConstants& sc, const std::vector<spv::
     };
 }
 
+// Whether a baked shader can be used as it is: made with the optimizer flags this run has (spv_opt.h), or by a build
+// from before it (the renderer makes that one as it loads). One made otherwise (an A/B run with FH_SPV_OPT or
+// FH_SPV_HALF against a .fenv baked without them, or the other way round) is made again from the shipped shader.
+inline bool bakedUsable(const std::vector<u32>& code) {
+    const int m = spvopt::markOf(code);
+    return m < 0 || m == spvopt::flags();
+}
+
 // Which float values specialize bakes in: 0 none, 1 zeros, 2 zeros and +-1 (the default; FH_SPEC_FLOATS).
 inline int floatsMode() {
     static const int m = std::getenv("FH_SPEC_FLOATS") ? std::atoi(std::getenv("FH_SPEC_FLOATS")) : 2;
@@ -364,8 +376,9 @@ inline void bakePrograms(const std::vector<MeshData>& meshes, const std::functio
     std::map<std::string, Info> info;
     for (auto& kv : programs) {
         ShaderProgramSrc& p = kv.second;
-        p.vertInvariant = invariantPosition(p.vert);
+        p.vertInvariant = spvopt::run(invariantPosition(p.vert));
         p.fragAlpha = alphaOnly(p.frag);
+        if (!p.fragAlpha.empty()) p.fragAlpha = spvopt::run(p.fragAlpha);
         p.variants.clear();
         p.prepared = true;
         Info& in = info[kv.first];
@@ -400,7 +413,9 @@ inline void bakePrograms(const std::vector<MeshData>& meshes, const std::functio
         v.key = key;
         v.frag = spvspec::specialize(p.frag, fetch, &folded, -1, floats);
         if (!folded) v.frag.clear();                 // (nothing to bake in: the shader as shipped)
-        else v.fragAlpha = alphaOnly(v.frag);
+        else v.fragAlpha = alphaOnly(v.frag);   // (from the specialized shader as it is: its whole-colour stores)
+        if (!v.frag.empty()) v.frag = spvopt::run(v.frag);
+        if (!v.fragAlpha.empty()) v.fragAlpha = spvopt::run(v.fragAlpha);
         p.variants.push_back(std::move(v));
     }
 }

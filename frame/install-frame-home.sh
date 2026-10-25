@@ -26,6 +26,20 @@ $1"; shift ;;
 done
 case "$HOST" in *@*) ;; *) HOST="steamos@$HOST" ;; esac
 say() { echo "frame-home: $*"; }
+# The name a file gets on the headset: lowercase, spaces as dashes, only [a-z0-9._-] (as Studio names them). When
+# that drops characters (accents, other scripts) a short hash of the real name is added, so two such names don't
+# become the same file, and an all-non-Latin one doesn't become a bare ".fenv".
+frame_name() {
+    base=$(basename "$1")
+    low=$(printf '%s' "$base" | tr 'A-Z ' 'a-z-')
+    n=$(printf '%s' "$low" | tr -cd 'a-z0-9._-')
+    if [ "$n" != "$low" ] || [ -z "${n%.*}" ]; then
+        h=$(printf '%s' "$base" | cksum | cut -d' ' -f1)
+        stem=${n%.*}
+        n="${stem:-environment}-$h.${n##*.}"
+    fi
+    printf '%s' "$n"
+}
 [ -f "$PAYLOAD/install.sh" ] || { say "the headset files are missing: expected $PAYLOAD/install.sh"; exit 1; }
 
 say "connecting to $HOST"
@@ -40,17 +54,18 @@ if [ "$MODE" = install ]; then
     printf '%s\n' "$ENVS" | while IFS= read -r f; do
         [ -n "$f" ] || continue
         [ -f "$f" ] || { say "no such file: $f"; continue; }
-        # the name it gets on the headset: lowercase, spaces as dashes, only [a-z0-9._-] (as Studio names them)
-        name=$(basename "$f" | tr 'A-Z ' 'a-z-' | tr -cd 'a-z0-9._-')
+        name=$(frame_name "$f")
         say "copying $(basename "$f") -> $name"
-        scp -q "$f" "$HOST:frame-home/envs/$name.part" && ssh "$HOST" "mv -f frame-home/envs/$name.part frame-home/envs/$name"
+        scp -q "$f" "$HOST:frame-home/envs/$name.part" && ssh "$HOST" "mv -f frame-home/envs/$name.part frame-home/envs/$name" || {
+            ssh "$HOST" "rm -f frame-home/envs/$name.part" || true; say "couldn't copy $(basename "$f") (the headset's disk is full, or the connection dropped)"; }
     done
     ssh "$HOST" "sed -i 's/\r\$//' frame-home/.install/frame/install.sh; sh frame-home/.install/frame/install.sh"
     # the first environment given is the one shown (a bundle's are only known once the headset unpacks it: skipped)
     FIRST=$(printf '%s\n' "$ENVS" | grep -i '\.fenv$' | sed -n '1p')
     if [ -n "$FIRST" ] && [ -f "$FIRST" ]; then
-        name=$(basename "$FIRST" | tr 'A-Z ' 'a-z-' | tr -cd 'a-z0-9._-')
-        ssh "$HOST" "printf '%s\n' '$name' > frame-home/current"
+        name=$(frame_name "$FIRST")
+        # (only when it got there: a copy that failed leaves the one shown as it was)
+        ssh "$HOST" "if [ -f 'frame-home/envs/$name' ]; then printf '%s\n' '$name' > frame-home/current; fi"
     fi
 else
     # (never installed from a copy like this one: Frame Home itself puts SteamVR's environment back)

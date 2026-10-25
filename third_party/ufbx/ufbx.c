@@ -3480,7 +3480,7 @@ static ufbxi_noinline void ufbxi_clean_string_utf8(char *str, size_t length)
 {
 	size_t pos = 0;
 	for (;;) {
-		pos += ufbxi_utf8_valid_length(str + pos, length);
+		pos += ufbxi_utf8_valid_length(str + pos, length - pos);   // (Frame Studio: what's left, not the whole length: read past the string)
 		if (pos == length) break;
 		str[pos++] = '?';
 	}

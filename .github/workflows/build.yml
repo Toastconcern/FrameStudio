@@ -44,6 +44,8 @@ jobs:
     steps:
       - name: Check out source
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # all of main: the version shown is VERSION + its commit count
       - name: Restore compiler cache
         uses: actions/cache@v5
         with:
@@ -90,6 +92,8 @@ jobs:
     steps:
       - name: Check out source
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # all of main: the version shown is VERSION + its commit count
       - name: Download Frame Home payload
         uses: actions/download-artifact@v4
         with:
@@ -131,6 +135,8 @@ jobs:
     steps:
       - name: Check out source
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # all of main: the version shown is VERSION + its commit count
       - name: Restore compiler cache
         uses: actions/cache@v5
         with:
@@ -182,8 +188,9 @@ jobs:
         uses: actions/cache@v5
         with:
           path: .apt-cache/archives
-          key: apt-ubuntu-24.04-arm64-${{ hashFiles('.github/workflows/build.yml') }}
-          restore-keys: apt-ubuntu-24.04-arm64-
+          # (its own key: the Linux arm64 Studio job caches other packages, and the first to save a key keeps it)
+          key: apt-frame-home-ubuntu-24.04-arm64-${{ hashFiles('.github/workflows/build.yml') }}
+          restore-keys: apt-frame-home-ubuntu-24.04-arm64-
       - name: Install Frame Home build dependencies
         run: |
           set -euo pipefail
@@ -194,6 +201,11 @@ jobs:
           sudo chown -R "$(id -u):$(id -g)" "$APT_CACHE_DIR/archives"
       - name: Build payload and installer
         run: sh scripts/build-frame-home.sh --ci
+      - name: Tests (tests_loco, ctest)
+        run: |
+          cmake -S . -B build/frame-home-cmake-ci -DFRAME_TESTS=ON
+          cmake --build build/frame-home-cmake-ci --target frame-tests --parallel
+          ctest --test-dir build/frame-home-cmake-ci --output-on-failure
       - name: Show compiler cache statistics
         run: ccache --show-stats
       - name: Upload Frame Home payload
@@ -225,7 +237,8 @@ jobs:
       GH_TOKEN: ${{ github.token }}
       REPO: ${{ github.repository }}
     steps:
-      # Every push to main is also a numbered release: VERSION (major.minor) and the number of commits on main.
+      # Every push to main is also a numbered release: VERSION (major.minor) and the commits since VERSION last
+      # changed, so the commit that bumps it is .0 (cmake/frame_version.cmake works out the same for the apps).
       - name: Check out history (for the version number)
         if: github.ref == 'refs/heads/main'
         uses: actions/checkout@v4
@@ -235,7 +248,8 @@ jobs:
       - name: Version
         if: github.ref == 'refs/heads/main'
         run: |
-          version="v$(tr -d ' \r\n' < src/VERSION).$(git -C src rev-list --count HEAD)"
+          bump=$(git -C src log -1 --format=%H -- VERSION)
+          version="v$(tr -d ' \r\n' < src/VERSION).$(git -C src rev-list --count "$bump..HEAD")"
           echo "VERSION_TAG=$version" >> "$GITHUB_ENV"
           echo "$version"
       - name: Download Studio build artifacts
@@ -302,9 +316,12 @@ jobs:
       # and the files in this release.
       - name: latest.json
         run: |
+          set -euo pipefail   # (a payload file missing must fail here, not hash what's left)
           home=$(cd "$RUNNER_TEMP/frame-home-payload" && sha256sum bin/frame-home bin/frame-switcher bin/fenv-tool layer/libframe_home_layer.so layer/env_ps.spv | cut -c1-64 | sha256sum | cut -c1-64)
           files=$(ls dist | python3 -c 'import json, sys; print(json.dumps([l.strip() for l in sys.stdin if l.strip()]))')
-          printf '{"build": "%s", "home": "%s", "date": "%s", "files": %s}\n' "$GITHUB_SHA" "$home" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$files" > dist/latest.json
+          # Each file's SHA-256 as "sha256-<file>": Frame Studio checks its download against it before installing.
+          hashes=$(cd dist && for f in *; do if [ -f "$f" ] && [ "$f" != latest.json ]; then printf ', "sha256-%s": "%s"' "$f" "$(sha256sum "$f" | cut -c1-64)"; fi; done)
+          printf '{"build": "%s", "home": "%s", "date": "%s", "files": %s%s}\n' "$GITHUB_SHA" "$home" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$files" "$hashes" > dist/latest.json
           cat dist/latest.json
       - name: Attest Studio release archives
         uses: actions/attest-build-provenance@v2
@@ -316,21 +333,53 @@ jobs:
           subject-path: dist/FrameHome-installer.zip
       - name: Version release (tag v*)
         if: ${{ startsWith(github.ref, 'refs/tags/v') && !contains(needs.*.result, 'failure') }}
-        run: gh release create "${{ github.ref_name }}" dist/* --repo "$REPO" --title "Frame Studio ${{ github.ref_name }}" --generate-notes
+        run: |
+          # A version release has every platform: this job doesn't wait for macOS (see above), so without its build
+          # here it stops; run this job again once the macOS build has finished.
+          if ! ls dist/FrameStudio-macos-*.zip > /dev/null 2>&1; then
+            echo "::error::the macOS build isn't here yet: re-run this job once it has finished"; exit 1
+          fi
+          gh release create "${{ github.ref_name }}" dist/* --repo "$REPO" --title "Frame Studio ${{ github.ref_name }}" --generate-notes
       # The numbered release (push to main): GitHub's "Latest release", with the changes since the previous numbered
       # one. Only when no build failed; a re-run of the same commit finds it there and leaves it.
       - name: Numbered release (push to main)
         if: ${{ github.ref == 'refs/heads/main' && !contains(needs.*.result, 'failure') }}
         run: |
-          if gh release view "$VERSION_TAG" --repo "$REPO" > /dev/null 2>&1; then echo "$VERSION_TAG is already released"; exit 0; fi
+          if gh release view "$VERSION_TAG" --repo "$REPO" > /dev/null 2>&1; then
+            # A re-run of this commit: done already. The tag on another commit (pushed by hand, the same name as this
+            # number): say so rather than skip, or this push would never be released.
+            if [ "$(git -C src rev-list -n 1 "$VERSION_TAG" 2>/dev/null)" = "$GITHUB_SHA" ]; then echo "$VERSION_TAG is already released"; exit 0; fi
+            echo "::error::$VERSION_TAG already exists on another commit (a tag made by hand?): bump VERSION or remove that tag"; exit 1
+          fi
           previous=$(gh release list --repo "$REPO" --exclude-pre-releases --limit 1 --json tagName --jq '.[0].tagName // empty')
+          # The notes open with CHANGELOG.md's top section when the changelog changed since the previous release
+          # (whatever number this push gets), then GitHub's list of changes. They're also what the Discord's #releases
+          # channel gets (the repository's release webhook).
+          : > "$RUNNER_TEMP/notes.md"
+          if [ -z "$previous" ] || ! git -C src diff --quiet "$previous" HEAD -- CHANGELOG.md 2>/dev/null; then
+            awk '/^## / { if (on) exit; on = 1; next } on' src/CHANGELOG.md > "$RUNNER_TEMP/notes.md"
+          fi
+          cat "$RUNNER_TEMP/notes.md"
           gh release create "$VERSION_TAG" dist/* --repo "$REPO" --target "${{ github.sha }}" --latest \
-            --title "Frame Studio $VERSION_TAG" --generate-notes ${previous:+--notes-start-tag "$previous"}
+            --title "Frame Studio $VERSION_TAG" --notes-file "$RUNNER_TEMP/notes.md" --generate-notes ${previous:+--notes-start-tag "$previous"}
       # The rolling "latest" pre-release: where installed Studios and headsets look for updates (latest.json).
+      # Updated in place, never deleted first: a run cancelled midway (a newer push) or an update check meanwhile
+      # always finds a whole release. The files go up first and latest.json last, so it never names files that aren't
+      # there yet; then what this build no longer makes is removed and the tag moved to this commit.
       - name: Latest build (push to main)
         if: github.ref == 'refs/heads/main'
         run: |
-          gh release delete latest --repo "$REPO" --yes --cleanup-tag 2>/dev/null || true
-          gh release create latest dist/* --repo "$REPO" --prerelease --target "${{ github.sha }}" \
-            --title "Latest build (${GITHUB_SHA::7})" \
-            --notes "Built automatically from ${{ github.sha }} on $(date -u '+%Y-%m-%d %H:%M UTC'). Replaced by every push to main."
+          set -euo pipefail
+          title="Latest build (${GITHUB_SHA::7})"
+          notes="Built automatically from ${{ github.sha }} on $(date -u '+%Y-%m-%d %H:%M UTC'). Replaced by every push to main."
+          if ! gh release view latest --repo "$REPO" > /dev/null 2>&1; then
+            gh release create latest dist/* --repo "$REPO" --prerelease --target "${{ github.sha }}" --title "$title" --notes "$notes"
+            exit 0
+          fi
+          find dist -maxdepth 1 -type f ! -name latest.json -print0 | xargs -0 gh release upload latest --repo "$REPO" --clobber
+          gh release upload latest dist/latest.json --repo "$REPO" --clobber
+          for asset in $(gh release view latest --repo "$REPO" --json assets --jq '.assets[].name'); do
+            [ -e "dist/$asset" ] || gh release delete-asset latest "$asset" --repo "$REPO" --yes
+          done
+          gh api -X PATCH "repos/$REPO/git/refs/tags/latest" -f sha="$GITHUB_SHA" -F force=true > /dev/null
+          gh release edit latest --repo "$REPO" --title "$title" --notes "$notes"

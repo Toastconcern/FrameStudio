@@ -5,7 +5,7 @@ Turn Meta Quest homes and 3D models into native environments for the Steam Frame
 | | Runs on | What it does |
 |---|---|---|
 | **Frame Home** | The Steam Frame | Draws your environment in SteamVR's compositor in place of its own: at boot, behind the Steam menu and while games load |
-| **Frame Studio** | Windows, Linux, macOS | Opens Meta homes (HSL, Clay `.opa`, glTF), `.fenv` environments and models (glTF, FBX, OBJ), shows them with the same renderer the headset runs, and lets you edit, save and send them to the headset |
+| **Frame Studio** | Windows, Linux, macOS, the Steam Frame | Opens Meta homes (HSL, Clay `.opa`, glTF), `.fenv` environments and models (glTF, FBX, OBJ), shows them with the same renderer the headset runs, and lets you edit, save and send them to the headset |
 
 **Help and news:** the [Frame Studio Discord](https://discord.gg/yJDn59ErgK) for help, bug reports, feature requests,
 new releases and environments people have made. What changed in each version: [CHANGELOG.md](CHANGELOG.md).
@@ -13,6 +13,7 @@ new releases and environments people have made. What changed in each version: [C
 ## Contents
 
 - [Quick start](#quick-start)
+- [Install only Frame Home](#install-only-frame-home)
 - [Downloads](#downloads)
 - [Features](#features)
 - [Guides](#guides)
@@ -29,6 +30,26 @@ new releases and environments people have made. What changed in each version: [C
 4. **Open a home**: **File > Open...** and pick a Meta home `.apk`, a `.fenv` or a model.
 5. **Send it**: **Headset > Send to Frame**. Put the headset on: you are standing in it.
 
+## Install only Frame Home
+
+You don't need Frame Studio to run Frame Home. On the Steam Frame:
+
+1. Switch to **Desktop Mode** and open **Konsole**.
+2. Run:
+
+   ```sh
+   curl -fsSL https://raw.githubusercontent.com/Toastconcern/FrameStudio/main/frame/install-frame-home-online.sh | bash
+   ```
+
+   This downloads Frame Home from the **Latest build** release, checks it and installs it. No SSH or computer needed.
+3. Put your `.fenv` environments in `~/frame-home/envs`.
+4. Switch back to Game Mode. Your environment shows at boot and behind the Steam menu; switch between environments
+   in the **Environments** panel.
+
+To install from a computer instead, download `FrameHome-installer.zip` and run **Install Frame Home.bat** (Windows)
+or `install-frame-home.sh` (Linux, macOS). That way needs SSH on the headset. Every method, plus updating and
+uninstalling: [Installing Frame Home](docs/install-frame-home.md).
+
 ## Downloads
 
 Every release on the Releases page (**Latest build**, or a numbered `v*` version) contains Frame Studio for each
@@ -39,7 +60,8 @@ computer below and the matching Frame Home payload.
 | Windows, 64-bit PCs | `FrameStudio-windows-x64.zip` |
 | Windows on ARM (Snapdragon, Surface Pro X...) | `FrameStudio-windows-arm64.zip` |
 | Linux, 64-bit PCs | `FrameStudio-linux-x64.tar.gz` |
-| Linux on ARM (Raspberry Pi 5, ARM laptops, the Steam Frame's desktop) | `FrameStudio-linux-arm64.tar.gz` |
+| Linux on ARM (Raspberry Pi 5, ARM laptops) | `FrameStudio-linux-arm64.tar.gz` |
+| Steam Frame (SteamOS ARM64) | `FrameStudio-linux-arm64.tar.gz` |
 | Mac with Apple Silicon (M1 and later) | `FrameStudio-macos-arm64.zip` |
 | Frame Home only, installed from any computer | `FrameHome-installer.zip` |
 

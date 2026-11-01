@@ -746,7 +746,26 @@ struct Studio {
     std::string savedEnvironment;           // the last .fenv written (recent list, Send to Frame)
     std::atomic<bool> saveFailed{false};    // the last Save didn't make it: still unsaved
     bool fastPack = true;                   // File > Faster Saving: parallel LZMA chunks (~1% bigger; fast-pack.txt), on unless turned off
-    bool optimizeMeshes = true;             // File > Leave Out What Can't Be Seen (visibility_bake.h; optimize-meshes.txt), on unless turned off
+    // World > Trim What Can't Be Seen (visibility_bake.h). The pass runs in the background on a copy of the home as it
+    // is; what it finds is applied to the open home (index lists shrink, solid meshes get cullBack: their backs aren't
+    // drawn) and saved with it. Put Back undoes it. Show what was trimmed: the triangles it took out, red. Saving trims
+    // the file the same way (Trim when saving) unless the home is trimmed as it is already.
+    struct TrimJob {
+        std::atomic<bool> done{false};
+        uint64_t sig = 0;                   // walkSignature() when it started: anything else when it ends, and it's stale
+        VisibilityResult vis;
+        bool ran = false;
+        std::string error;                  // why it didn't run
+    };
+    struct UntrimmedMesh { int scene; std::vector<u32> indices; std::vector<float> normals; bool cullBack; };
+    std::shared_ptr<TrimJob> trimJob;       // detached: closing the home or Studio never waits for it
+    uint64_t trimmedSig = 0;                // walkSignature() of the home the last trim was of
+    bool trimOnSave = true;                 // World > Trim when saving (trim-on-save.txt), on unless turned off
+    bool trimWanted = false;                // (FS_TRIM: run once the home is up)
+    std::vector<UntrimmedMesh> untrimmed;   // the meshes trimming changed, as they were before it
+    std::vector<GuideVertex> trimmedGuide;  // what it took out
+    bool showTrimmed = false;
+    std::string trimStatus;
     // Edit > Settings: this PC's (studio-settings.txt) and the headset's (frame-home/settings.json over ssh).
     struct StudioPerf { float viewScale = 1.0f; int msaa = 4; int textureCap = 2048; int anisotropy = 8; };
     StudioPerf studioPerf, studioPerfAtStart;
@@ -827,6 +846,7 @@ struct Studio {
 
     void loadSettings() {
         loadHost();
+        if (FILE* f = platform::openFile((dataDir() / L"trim-on-save.txt").c_str(), "rb")) { trimOnSave = std::fgetc(f) != '0'; std::fclose(f); }
         if (FILE* f = platform::openFile((dataDir() / L"studio-settings.txt").c_str(), "rb")) {
             char line[128];
             while (std::fgets(line, sizeof line, f)) {
@@ -845,7 +865,6 @@ struct Studio {
         studioPerfAtStart = studioPerf;
         setTextureCap(static_cast<uint32_t>(studioPerf.textureCap));
         if (FILE* f = platform::openFile((dataDir() / L"fast-pack.txt").c_str(), "rb")) { fastPack = std::fgetc(f) == '1'; std::fclose(f); }
-        if (FILE* f = platform::openFile((dataDir() / L"optimize-meshes.txt").c_str(), "rb")) { optimizeMeshes = std::fgetc(f) == '1'; std::fclose(f); }
     }
 
     void saveStudioPerf() {
@@ -1907,6 +1926,7 @@ struct Studio {
         scene.reset();
         walkShown.reset(); walkReport = WalkReport{}; walkSig = 0; walkPending = walkSaveNext = walkAsStored = false;
         renderer.setStaticGuide({}); walkGuideOn = false;
+        trimJob.reset(); untrimmed.clear(); trimmedGuide.clear(); trimStatus.clear();
         objects.clear();
         splatItems.clear();
         splatSel = -1;
@@ -2212,7 +2232,7 @@ struct Studio {
         const std::tm tm = platform::localTime(t);
         wchar_t stamp[64];
         std::wcsftime(stamp, 64, L"%Y-%m-%d %H-%M-%S", &tm);
-        saveEnvironment(narrow((versionsDir() / (std::wstring(stamp) + L".fenv")).wstring()), false);
+        saveEnvironment(narrow((versionsDir() / (std::wstring(stamp) + L".fenv")).wstring()), false, false);
         const std::vector<fs::path> v = versions();
         for (size_t i = 10; i < v.size(); ++i)   // (not one opened and saved as the environment itself: that's yours now)
             if (envFile.empty() || !fs::equivalent(v[i], fs::path(widen(envFile)), ec)) fs::remove(v[i], ec);
@@ -2250,7 +2270,9 @@ struct Studio {
     }
 
     // remember: list it under Open Recent (not for the installer's own copies). False when it couldn't start.
-    bool saveEnvironment(const std::string& out, bool remember = true) {
+    // trim: what nobody can see is left out of the file (when Trim When Saving is on; the home open stays as it is).
+    // Not for the autosaved versions, nor in the self-test (a minute or more each).
+    bool saveEnvironment(const std::string& out, bool remember = true, bool trim = true) {
         // Everything the file needs is gathered and baked here, on the UI thread: the worker only packs and writes,
         // from its own copies, so editing, loading another home or closing this one meanwhile can't pull the scene
         // out from under it. Baking is a memory copy (well under a second); packing is the slow part.
@@ -2277,19 +2299,19 @@ struct Studio {
         const FenvPacking packing = fastPack ? FenvPacking::Fast : FenvPacking::Smallest;
         std::string bakeErr;
         std::vector<u8> blob;
-        // The mesh optimizer (what nobody can see from anywhere they can be is left out) takes a while: it runs on the
-        // worker, on a copy of the scene taken now, and bakes there; otherwise the bake is here (a memory copy).
-        std::shared_ptr<HslScene> toOptimize;
+        // Trimming takes a while: it runs on the worker, on a copy of the scene taken now, which it bakes. Not when the
+        // World panel's Trim has trimmed the home as it is now (nothing more to find): that's baked here, as it stands.
+        std::shared_ptr<HslScene> toTrim;
         std::vector<ObjectEdit> objectEdits = e.objects;
         bool baked = false;
-        if (optimizeMeshes) {
-            toOptimize = std::make_shared<HslScene>(*scene);
-            // A Clay / glTF home's animation: read here (this thread plays it), the copy keeps that and plays nothing
-            if (scene->saveAnimation) {
+        const bool trimmedAsIs = !untrimmed.empty() && trimmedSig == walkSignature();
+        if (trim && trimOnSave && !trimmedAsIs && !g_selfTestRun) {
+            toTrim = std::make_shared<HslScene>(*scene);
+            if (scene->saveAnimation) {   // a Clay / glTF home's animation: read here (this thread plays it); the copy plays nothing
                 std::vector<u8> anim;
                 scene->saveAnimation(anim);
-                toOptimize->saveAnimation = [anim = std::move(anim)](std::vector<u8>& out) { out = anim; };
-                toOptimize->animate = nullptr;
+                toTrim->saveAnimation = [anim = std::move(anim)](std::vector<u8>& out) { out = anim; };
+                toTrim->animate = nullptr;
             }
             baked = true;
         } else {
@@ -2302,26 +2324,28 @@ struct Studio {
         const std::string soundFile = sound.s.file;
         std::vector<HslSplatObject> splatObjs;                         // (their splats shared, not copied: written out on the worker)
         for (size_t i = 0; i < splatItems.size() && i < scene->splats.size(); ++i) if (!splatItems[i].deleted) splatObjs.push_back(scene->splats[i]);
-        if (toOptimize) toOptimize->splats = splatObjs;                // (what it bakes says whether it needs splats: only kept ones count)
+        if (toTrim) toTrim->splats = splatObjs;                        // (what it bakes says whether it needs splats: only kept ones count)
         saver = std::thread([this, out, name, worldJson, editsPath, settings, thumb, packing, remember, baked, soundBytes, soundFile, blob = std::move(blob),
                              splatObjs = std::move(splatObjs),
-                             apkPaths = std::move(apkPaths), sources = std::move(sources), sourceFiles = std::move(sourceFiles), toOptimize,
+                             apkPaths = std::move(apkPaths), sources = std::move(sources), sourceFiles = std::move(sourceFiles), toTrim,
                              objectEdits = std::move(objectEdits)]() mutable {
           // (out of memory baking or packing a big home: a failed save, said so, never an exception that ends Studio
           // with the changes unsaved)
           try {
-            if (toOptimize) {
-                { std::lock_guard<std::mutex> l(statusMutex); saveStatus = "Saving: finding what can't be seen from anywhere you can be\u2026"; }
+            if (toTrim) {
+                { std::lock_guard<std::mutex> l(statusMutex); saveStatus = "Saving: trimming what can't be seen from anywhere you can be\u2026"; }
                 VisibilityResult vis;
                 BakeOptions opt;
-                animbake::toStart(*toOptimize);   // its animated meshes as a load has them (the optimizer reads the vertices)
-                const bool optimized = optimizeForBake(*toOptimize, objectEdits.empty() ? nullptr : &objectEdits, vis, opt);
+                VisibilityOptions pass;
+                pass.threads = std::max(1, static_cast<int>(std::thread::hardware_concurrency()) - 1);   // (the shared pool stays free)
+                animbake::toStart(*toTrim);   // its animated meshes as a load has them (the pass reads the vertices)
+                const bool trimmed = optimizeForBake(*toTrim, objectEdits.empty() ? nullptr : &objectEdits, vis, opt, &pass);
                 std::string err;
-                if (!bakeScene(*toOptimize, blob, err, optimized ? &opt : nullptr)) baked = false;
-                toOptimize.reset();
-                if (optimized)
-                    std::fprintf(stderr, "save: %zu of %zu triangles can't be seen from anywhere you can be: left out (%zu meshes emptied, %.1f s)\n",
-                                 vis.trisBefore - vis.trisAfter, vis.trisBefore, vis.meshesEmptied, vis.ms / 1000);
+                if (!bakeScene(*toTrim, blob, err, trimmed ? &opt : nullptr)) baked = false;
+                toTrim.reset();
+                if (trimmed)
+                    std::fprintf(stderr, "save: trimmed %zu of %zu triangles nobody can see, %zu meshes drawn one side only (%.1f s)\n",
+                                 vis.trisBefore - vis.trisAfter, vis.trisBefore, vis.meshesCulled, vis.ms / 1000);
             }
             FenvManifest m;
             m.name = name;
@@ -2459,7 +2483,7 @@ struct Studio {
         worldSettings = keep;
         tuning = true;
         const std::string host8 = hostArg();
-        const u32 needs = sceneBakeVersionFor(*scene);
+        const u32 needs = trimOnSave ? kSceneBakeVersion : sceneBakeVersionFor(*scene);   // (a trimmed save draws meshes one side only: 16)
         tuner = std::thread([this, fenv, host8, needs] {
             const std::wstring ssh = sshTool(L"ssh") + L"-o BatchMode=yes -o ConnectTimeout=8 " + widen(host8) + L" ";
             const std::wstring scp = sshTool(L"scp") + L"-q -o BatchMode=yes -o ConnectTimeout=8 ";
@@ -2661,7 +2685,7 @@ struct Studio {
         std::vector<std::string> old;                                  // the pair as separately sent before
         for (const auto& p : homePaths) old.push_back(frameName(p));
         const std::string editsName = frameName(homePaths.front()), host8 = hostArg();
-        const u32 needs = sceneBakeVersionFor(*scene);
+        const u32 needs = trimOnSave ? kSceneBakeVersion : sceneBakeVersionFor(*scene);   // (a trimmed save draws meshes one side only: 16)
         sender = std::thread([this, fenv, old, editsName, host8, needs] {
             const std::wstring ssh = sshTool(L"ssh") + L"-o BatchMode=yes -o ConnectTimeout=8 ";
             const std::wstring scp = sshTool(L"scp") + L"-q -o BatchMode=yes -o ConnectTimeout=8 ";
@@ -3038,6 +3062,7 @@ struct Studio {
     uint64_t walkSig = 0;
     std::chrono::steady_clock::time_point walkChanged;
     bool walkPending = false, walkSaveNext = false, walkSliding = false, walkGuideDirty = true, walkGuideOn = false;
+    int walkGuideMix = 0;                   // what the guide holds: 1 the walkable area, 2 what trimming took out
     bool walkAsStored = false;              // the next bake is the one on opening the home: a saved area is shown as saved
     float walkBakeMs = 0;
     size_t walkGuideVerts = 0;              // --selftest: what the viewport draws of it
@@ -3153,18 +3178,150 @@ struct Studio {
             if (g_selfTestRun) rebakeWalk();   // (the self-test checks the area the frame after an edit)
             else startWalkBake();
         }
-        const bool on = walkShown && showWorld && (showCat[kShowWalkArea] || showCat[kShowUnreached]) && !(isolating && isoObject < 0 && isoKind >= 0);
-        if (on != walkGuideOn || (on && walkGuideDirty)) {
+        const bool walkOn = walkShown && showWorld && (showCat[kShowWalkArea] || showCat[kShowUnreached]) && !(isolating && isoObject < 0 && isoKind >= 0);
+        const bool trimmedOn = showTrimmed && showWorld && !trimmedGuide.empty();
+        const bool on = walkOn || trimmedOn;
+        const int mix = (walkOn ? 1 : 0) | (trimmedOn ? 2 : 0);   // what's in it: a change rebuilds it
+        if (on != walkGuideOn || mix != walkGuideMix || (on && walkGuideDirty)) {
+            walkGuideMix = mix;
             std::vector<GuideVertex> v;
-            if (on && walkGuideGrid == walkShown && walkGuideWalk == showCat[kShowWalkArea] && walkGuideGrey == showCat[kShowUnreached]) v.swap(walkGuideReady);
-            else if (on) v = walkGuide();
+            if (walkOn && walkGuideGrid == walkShown && walkGuideWalk == showCat[kShowWalkArea] && walkGuideGrey == showCat[kShowUnreached]) v.swap(walkGuideReady);
+            else if (walkOn) v = walkGuide();
             walkGuideGrid.reset();
             walkGuideReady.clear();
+            const size_t xray = v.size();   // (the walkable area shows faintly through things; what was trimmed only where it's in the open)
+            if (trimmedOn) v.insert(v.end(), trimmedGuide.begin(), trimmedGuide.end());
             walkGuideVerts = v.size();
-            renderer.setStaticGuide(v);   // it changes only with the walk area: uploaded once, not every frame
+            renderer.setStaticGuide(v, xray);   // it changes only with the walk area: uploaded once, not every frame
             walkGuideOn = on;
             walkGuideDirty = false;
         }
+    }
+
+    // World > Trim What Can't Be Seen: the pass started on a copy of the home as it is now. maxSpots: fewer eye spots (the
+    // self-test's quick one), else as many as the walkable area needs.
+    void startTrim(size_t maxSpots = 0) {
+        if (!scene || trimJob || uploading || loadState == 1) return;
+        auto job = std::make_shared<TrimJob>();
+        job->sig = walkSignature();
+        auto copy = std::make_shared<HslScene>(*scene);
+        if (scene->saveAnimation) {   // a Clay / glTF home's animation: read here (this thread plays it); the copy plays nothing
+            std::vector<u8> anim;
+            scene->saveAnimation(anim);
+            copy->saveAnimation = [anim = std::move(anim)](std::vector<u8>& out) { out = anim; };
+            copy->animate = nullptr;
+        }
+        VisibilityOptions pass;
+        pass.threads = std::max(1, static_cast<int>(std::thread::hardware_concurrency()) - 1);   // (one core left for Studio)
+        if (maxSpots) pass.maxSpots = maxSpots;
+        std::thread([job, copy, edits = currentObjectEdits(), pass] {
+            try {
+                animbake::toStart(*copy);   // its animated meshes as a load has them (the pass reads the vertices)
+                BakeOptions opt;
+                job->ran = optimizeForBake(*copy, edits.empty() ? nullptr : &edits, job->vis, opt, &pass);
+                if (!job->ran) job->error = job->vis.skipped.empty() ? "the home can't be checked" : job->vis.skipped;
+            } catch (const std::exception& e) {
+                job->error = e.what();
+            }
+            job->done = true;
+        }).detach();
+        trimJob = std::move(job);
+        trimStatus.clear();
+    }
+    // Each frame: a finished pass applied to the open home (unless it changed meanwhile).
+    void updateTrim() {
+        if (trimWanted && scene && !uploading && !texLoading && loadState == 0 && !objects.empty()) { trimWanted = false; showTrimmed = true; startTrim(); }
+        if (!trimJob || !trimJob->done.load()) return;
+        std::shared_ptr<TrimJob> j = std::move(trimJob);
+        if (!scene) return;
+        if (!j->ran) { trimStatus = "Nothing trimmed: " + j->error; return; }
+        if (walkSignature() != j->sig) { trimStatus = "Nothing trimmed: the home changed while it was being checked. Trim again."; return; }
+        applyTrim(j->vis);
+        trimmedSig = j->sig;
+    }
+    void applyTrim(const VisibilityResult& vis) {
+        const std::vector<GuideVertex> took = trimmedGuideOf(*scene, vis);   // (from the meshes as they still are)
+        trimmedGuide.insert(trimmedGuide.end(), took.begin(), took.end());
+        std::vector<int> changed;
+        for (size_t m = 0; m < scene->meshes.size() && m < vis.changed.size(); ++m) {
+            MeshData& md = scene->meshes[m];
+            const bool cull = m < vis.cullBack.size() && vis.cullBack[m];
+            if (!vis.changed[m] && cull == md.cullBack) continue;
+            const bool known = std::any_of(untrimmed.begin(), untrimmed.end(), [&](const UntrimmedMesh& u) { return u.scene == static_cast<int>(m); });
+            if (!known) untrimmed.push_back({static_cast<int>(m), md.indices, md.normals, md.cullBack});   // (the first trim's "before" is the original)
+            if (vis.changed[m]) {
+                md.indices = vis.indices[m];
+                md.nIdx = static_cast<u32>(md.indices.size());
+                if (m < vis.normals.size() && !vis.normals[m].empty()) md.normals = vis.normals[m];   // (shaded as before)
+            }
+            md.cullBack = cull;
+            changed.push_back(static_cast<int>(m));
+        }
+        meshesChanged(changed);
+        char b[200];
+        std::snprintf(b, sizeof b, "Trimmed: %zu of %zu triangles can't be seen from anywhere you can be, %zu meshes drawn one side only",
+                      vis.trisBefore - vis.trisAfter, vis.trisBefore, vis.meshesCulled);
+        trimStatus = b;
+        std::fprintf(stderr, "trim: %s (%.1f s)\n", b, vis.ms / 1000);
+    }
+    // World > Put Back.
+    void putBackTrimmed() {
+        std::vector<int> changed;
+        for (UntrimmedMesh& u : untrimmed) {
+            if (u.scene < 0 || static_cast<size_t>(u.scene) >= scene->meshes.size()) continue;
+            MeshData& md = scene->meshes[u.scene];
+            md.indices = std::move(u.indices);
+            md.normals = std::move(u.normals);
+            md.nIdx = static_cast<u32>(md.indices.size());
+            md.cullBack = u.cullBack;
+            changed.push_back(u.scene);
+        }
+        untrimmed.clear();
+        trimmedGuide.clear();
+        meshesChanged(changed);
+        trimStatus = "Everything trimming took out is back";
+    }
+    // Meshes whose index lists changed: to the GPU, their objects' counts, the guide; the home is edited.
+    void meshesChanged(const std::vector<int>& changed) {
+        if (changed.empty()) return;
+        renderer.setSelection(-1);   // (built from the old triangles: made again next frame)
+        renderer.updateMeshIndices(changed);
+        for (Object& o : objects)
+            if (o.scene >= 0 && static_cast<size_t>(o.scene) < scene->meshes.size()) o.triangles = scene->meshes[o.scene].indices.size() / 3;
+        walkGuideDirty = true;
+        dirty = true;
+        updateTitle();
+    }
+    // The triangles a pass takes out, red where they are (shown with the guides; nothing of the home is there any more).
+    static std::vector<GuideVertex> trimmedGuideOf(const HslScene& sc, const VisibilityResult& vis) {
+        static const float red[4] = {1.0f, 0.08f, 0.05f, 0.6f};
+        std::vector<GuideVertex> v;
+        for (size_t m = 0; m < sc.meshes.size() && m < vis.changed.size(); ++m) {
+            if (m >= vis.removed.size() || vis.removed[m].empty()) continue;
+            const MeshData& md = sc.meshes[m];
+            float wm[16];
+            if (md.hasWorldMatrix) std::memcpy(wm, md.worldMatrix, sizeof wm); else trsToMat4(md.transform, wm);
+            const std::vector<u32>& removed = vis.removed[m];
+            for (size_t t = 0; t + 2 < removed.size(); t += 3) {
+                const u32* tri = &removed[t];
+                float p[3][3];
+                bool ok = true;
+                for (int c = 0; c < 3 && ok; ++c) {
+                    const size_t o = static_cast<size_t>(tri[c]) * 3;
+                    if (o + 2 >= md.positions.size()) { ok = false; break; }
+                    const float* q = &md.positions[o];
+                    for (int j = 0; j < 3; ++j) p[c][j] = wm[j] * q[0] + wm[4 + j] * q[1] + wm[8 + j] * q[2] + wm[12 + j];
+                }
+                if (!ok) continue;
+                for (int c = 0; c < 3; ++c) {
+                    GuideVertex g;
+                    std::memcpy(g.pos, p[c], sizeof g.pos);
+                    std::memcpy(g.rgba, red, sizeof red);
+                    v.push_back(g);
+                }
+            }
+        }
+        return v;
     }
 
     void rebakeWalk() {
@@ -3635,6 +3792,41 @@ struct Studio {
                               "and adds walls along its edges, seats on chairs and sofas and teleport hotspots.\n"
                               "Floors need headroom; furniture, plants, railings and walls block; steps up to the step height connect;\n"
                               "seams are bridged; floors you can't reach from the start are left out. Object Surfaces override it.");
+    }
+
+    // World > What Nobody Can See: the Trim button, what it did, Put Back, the red view, trimming when saving.
+    void trimPanel() {
+        if (!scene) { ImGui::TextDisabled("No home open"); return; }
+        ImGui::PushTextWrapPos(0);
+        ImGui::TextDisabled("The parts of the home nobody can see from anywhere they can walk, sit or teleport to (the backs of walls, "
+                            "under floors, the insides of things), and the back of anything only ever seen from the front.");
+        ImGui::PopTextWrapPos();
+        ImGui::Spacing();
+        ImGui::BeginDisabled(trimJob != nullptr || uploading);
+        if (ImGui::Button(trimJob ? "Trimming\u2026" : "Trim What Can't Be Seen")) startTrim();
+        ImGui::EndDisabled();
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+            ImGui::SetTooltip("Takes them out of the home now (a minute or two): it looks the same from everywhere you can be,\n"
+                              "and the headset draws less. Saved with the home.");
+        if (!untrimmed.empty() && !trimJob) {
+            ImGui::SameLine();
+            if (ImGui::Button("Put Back")) putBackTrimmed();
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Everything trimming took out comes back");
+        }
+        if (trimJob || !trimStatus.empty()) {
+            ImGui::PushTextWrapPos(0);
+            ImGui::TextDisabled("%s", trimJob ? "Finding what can't be seen from anywhere you can be\u2026" : trimStatus.c_str());
+            ImGui::PopTextWrapPos();
+        }
+        if (ImGui::Checkbox("Show what was trimmed", &showTrimmed)) walkGuideDirty = true;
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Red, where it was. None of it shows from anywhere you can stand: fly behind walls, under floors\n"
+                              "or outside the home to see it.");
+        if (ImGui::Checkbox("Trim when saving", &trimOnSave))
+            if (FILE* f = platform::openFile((dataDir() / L"trim-on-save.txt").c_str(), "wb")) { std::fputs(trimOnSave ? "1\n" : "0\n", f); std::fclose(f); }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Each save leaves out what nobody can see, the same way (the home open here stays as it is).\n"
+                              "Saving takes a minute or two longer. Autosaved versions aren't trimmed.");
     }
 
     // Mesh surfaces get their pivot at their centre (Meta's and geometry ones come in world space, which put the
@@ -6386,6 +6578,8 @@ struct Studio {
     void worldTab() {
         section("WALKABLE AREA");
         walkPanel();
+        section("WHAT NOBODY CAN SEE");
+        trimPanel();
 
     }
 
@@ -7493,6 +7687,11 @@ struct Studio {
                 const ImVec2 ts = ImGui::CalcTextSize(b);
                 dl->AddText(ImVec2(end.x - ts.x - 12 * scale, end.y - tlH - ts.y - 10 * scale), col(kDim), b);
             }
+            if (trimJob || !trimStatus.empty()) {   // (a line above the streaming one)
+                const std::string msg = trimJob ? std::string("Trimming: finding what can't be seen from anywhere you can be\u2026") : trimStatus;
+                const ImVec2 ts = ImGui::CalcTextSize(msg.c_str());
+                dl->AddText(ImVec2(end.x - ts.x - 12 * scale, end.y - tlH - 2 * ts.y - 16 * scale), col(trimJob ? kDim : 0xff6a5a), msg.c_str());
+            }
         } else if (loadState != 1) {
             startScreen();
         }
@@ -7764,14 +7963,6 @@ struct Studio {
             }
             if (ImGui::IsItemHovered())
                 ImGui::SetTooltip("Packs environments on all CPU cores: about 3x quicker to save, about 1%% bigger.\nOff: the smallest file. Either way nothing is lost.");
-            if (ImGui::MenuItem("Leave Out What Can't Be Seen", nullptr, optimizeMeshes)) {
-                optimizeMeshes = !optimizeMeshes;
-                if (FILE* f = platform::openFile((dataDir() / L"optimize-meshes.txt").c_str(), "wb")) { std::fputs(optimizeMeshes ? "1\n" : "0\n", f); std::fclose(f); }
-            }
-            if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("When saving: geometry nobody can see from anywhere they can walk, sit or teleport to (the backs of\n"
-                                  "things, what's behind walls) is left out, so the headset draws less. Moved and deleted objects are kept whole.\n"
-                                  "Saving takes up to a minute longer.");
             ImGui::EndMenu();
         }
         ImGui::Separator();
@@ -8062,6 +8253,11 @@ struct Studio {
                 }
                 ImGui::EndMenu();
             }
+            ImGui::Separator();
+            if (ImGui::MenuItem("Show What Was Trimmed", nullptr, showTrimmed, scene != nullptr)) { showTrimmed = !showTrimmed; walkGuideDirty = true; }
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Red: what World > Trim What Can't Be Seen took out, where it was. None of it shows from anywhere you\n"
+                                  "can stand: fly behind walls, under floors or outside the home to see it.");
             ImGui::EndPopup();
         }
     }
@@ -9361,7 +9557,7 @@ struct SelfTest {
     int obj = -1;
     float before[16] = {}, objWorld[16] = {};
     ImVec2 probeHit{-1, -1};
-    size_t collidersBefore = 0, spawnsBefore = 0, splitBefore = 0;
+    size_t collidersBefore = 0, spawnsBefore = 0, splitBefore = 0, trisBeforeTrim = 0;
     int autoCount = 0;
     std::vector<std::string> autoNames;
     std::string firstGrid;
@@ -9605,6 +9801,31 @@ struct SelfTest {
             return 20;
         });
         stages.push_back([this] { screenshot("01_loaded"); return 1; });
+        // World > Trim What Can't Be Seen, then Put Back
+        stages.push_back([this] {
+            trisBeforeTrim = 0;
+            for (const MeshData& md : a.scene->meshes) trisBeforeTrim += md.indices.size();
+            a.showTrimmed = true;
+            a.startTrim(300);   // (a quick one: the same pass from fewer spots)
+            check(a.trimJob != nullptr, "World > Trim What Can't Be Seen starts");
+            return 2;
+        });
+        stages.push_back([this] {
+            if (a.trimJob) return -1;   // (a minute or so)
+            size_t after = 0;
+            for (const MeshData& md : a.scene->meshes) after += md.indices.size();
+            check(!a.untrimmed.empty() && after != trisBeforeTrim && !a.trimmedGuide.empty(), "...takes out what can't be seen, shown red",
+                  std::to_string(trisBeforeTrim / 3) + " -> " + std::to_string(after / 3) + " triangle indices/3; " + a.trimStatus);
+            screenshot("13_trimmed");
+            a.putBackTrimmed();
+            size_t back = 0;
+            for (const MeshData& md : a.scene->meshes) back += md.indices.size();
+            check(back == trisBeforeTrim && a.untrimmed.empty() && a.trimmedGuide.empty(), "...and Put Back What Was Trimmed brings it all back",
+                  std::to_string(back / 3));
+            a.showTrimmed = false;
+            a.dirty = false;
+            return 2;
+        });
         // ── Blender's window: an area dragged by its editor button docks elsewhere; Reset Layout puts it back;
         // workspaces; F3, Shift+A and X open their menus
         stages.push_back([this] {
@@ -10807,7 +11028,7 @@ struct SelfTest {
             const bool needs = std::find(m.needs.begin(), m.needs.end(), "splats") != m.needs.end();
             check(ok && m.splats.size() == 1 && m.splats[0].count == 2000 && m.splats[0].file.rfind("splats/", 0) == 0 && std::fabs(m.splats[0].xform[12] - 1.0f) < 1e-4f && needs,
                   "...with its splats in the .fenv (an .spz each, where they were moved to, \"requires\": splats)", ok && !m.splats.empty() ? m.splats[0].file : "");
-            check(sceneVersionOf(narrow(splatFenv.wstring())) == kSceneBakeVersion, "...and its scene says so to Frame Homes that can't draw them (version 15)",
+            check(sceneVersionOf(narrow(splatFenv.wstring())) == kSceneBakeVersionSplats, "...and its scene says so to Frame Homes that can't draw them (version 15)",
                   std::to_string(sceneVersionOf(narrow(splatFenv.wstring()))));
             a.dirty = false;
             a.open({narrow(splatFenv.wstring())}, false);
@@ -11546,6 +11767,7 @@ int runStudio(StudioWindow& window, const std::vector<std::string>& args) {
     ImGui_ImplVulkan_Init(&ii);
     applyTheme(scale);   // again: window.initImGui() resets ImGui's style, so the saved theme is applied after it
 
+    if (std::getenv("FS_TRIM")) app->trimWanted = true;   // diagnostics / screenshots: trim once the home is up, show what went
     if (const char* tab = std::getenv("FS_INSPECTOR_TAB")) {   // diagnostics / screenshots: start on this Inspector tab
         const std::string t = tab;
         app->showInspectorTab(t == "world" ? Studio::InspectorTab::World : t == "environment" ? Studio::InspectorTab::Environment
@@ -11607,6 +11829,7 @@ int runStudio(StudioWindow& window, const std::vector<std::string>& args) {
         using clk = std::chrono::steady_clock;
         const auto f0 = clk::now();
         app->finishLoad();
+        app->updateTrim();
         app->updateWalk();
         app->sizeViewport();
         const auto f1 = clk::now();

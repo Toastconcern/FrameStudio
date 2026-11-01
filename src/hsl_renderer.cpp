@@ -2492,14 +2492,17 @@ void HslRenderer::createGuidePipelines() {
     if (!guide_.visible) { LOG("guide shaders failed: no teleport arc"); destroyGuide(); }
 }
 
-void HslRenderer::setStaticGuide(const std::vector<GuideVertex>& tris) {
+void HslRenderer::setStaticGuide(const std::vector<GuideVertex>& tris, size_t xray) {
     if (!device_) return;
     if (guide_.staticVbo.buf) { vkDeviceWaitIdle(device_); destroy(guide_.staticVbo); }
-    guide_.staticVertexCount = 0;
+    guide_.staticVertexCount = guide_.staticXrayCount = 0;
     static const bool noGuide = std::getenv("FH_NO_GUIDE") != nullptr;   // diagnostics: the home alone (no walk-area overlay)
     if (tris.empty() || !guide_.visible || noGuide) return;
     guide_.staticVbo = createDeviceBuffer(tris.data(), tris.size() * sizeof(GuideVertex), VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
-    if (guide_.staticVbo.buf) guide_.staticVertexCount = static_cast<uint32_t>(tris.size());
+    if (guide_.staticVbo.buf) {
+        guide_.staticVertexCount = static_cast<uint32_t>(tris.size());
+        guide_.staticXrayCount = static_cast<uint32_t>(std::min(xray, tris.size()));
+    }
 }
 
 void HslRenderer::destroyGuide() {
@@ -2520,7 +2523,7 @@ void HslRenderer::drawGuide(const EyeView eyes[2]) {
         VkDeviceSize zero = 0;
         vkCmdBindVertexBuffers(cmd_, 0, 1, &guide_.staticVbo.buf, &zero);
         vkCmdPushConstants(cmd_, guide_.layout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof vp, vp);
-        if (guide_.hidden) { vkCmdBindPipeline(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, guide_.hidden); vkCmdDraw(cmd_, guide_.staticVertexCount, 1, 0, 0); }
+        if (guide_.hidden && guide_.staticXrayCount) { vkCmdBindPipeline(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, guide_.hidden); vkCmdDraw(cmd_, guide_.staticXrayCount, 1, 0, 0); }
         vkCmdBindPipeline(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, guide_.visible);
         vkCmdDraw(cmd_, guide_.staticVertexCount, 1, 0, 0);
     }
@@ -3084,7 +3087,9 @@ bool HslRenderer::uploadMesh(const MeshData& md, int sceneIndex) {
     // alpha-to-coverage (palm foliage), is a solid, depth-writing cut-out, never a see-through blend.
     bool maskCutout = false;
     for (const auto& r : p.sets[2]) if (has(lower(r.name), "alphamask")) maskCutout = true;
-    gm.cull = false;                                    // HSR Studio: cullMode none for every pipeline
+    // HSR Studio: cullMode none for every pipeline, except a mesh the visibility trim found is only ever seen from its
+    // front (MeshData::cullBack). FH_NO_CULL=1: none at all.
+    gm.cull = md.cullBack && !std::getenv("FH_NO_CULL");
     gm.skybox = md.isSkybox;
     gm.alphaToCoverage = (md.alphaToCoverage || (maskCutout && gm.blend == 0)) && !std::getenv("FH_NO_A2C");
     if (gm.alphaToCoverage && gm.blend == 1) gm.blend = 0;
@@ -3569,6 +3574,36 @@ void HslRenderer::placeMesh(GpuMesh& gm) {
 // the 4 m cell their centre is in, each group of two or more made one mesh: their vertices moved into the world (the
 // shader then places them with an identity matrix), their indices one after another. Big meshes stay alone (one draw
 // is nothing next to their pixels, and they'd be held twice in memory).
+void HslRenderer::updateMeshIndices(const std::vector<int>& sceneIndices) {
+    if (!scene_ || sceneIndices.empty()) return;
+    vkDeviceWaitIdle(device_);
+    const std::set<int> changed(sceneIndices.begin(), sceneIndices.end());
+    for (Batch& b : batches_) {   // (as unload() frees them: a batch's set2 is its first part's)
+        destroy(b.gm.vbo);
+        if (b.sorted) { for (Buffer& sb : b.sortIbo) destroy(sb); } else destroy(b.gm.ibo);
+    }
+    batches_.clear();
+    static const bool noCull = std::getenv("FH_NO_CULL") != nullptr;
+    for (GpuMesh& gm : meshes_) {
+        if (!changed.count(gm.sceneIndex)) continue;
+        const MeshData& md = scene_->meshes[gm.sceneIndex];
+        const u32 nv = meshVerts(md);
+        std::vector<u32> indices = md.indices;
+        indices.resize(indices.size() / 3 * 3);
+        for (u32& i : indices) if (i >= nv) i = 0;            // (as uploadMesh: never past its vertices)
+        gm.indexCount = static_cast<uint32_t>(indices.size());
+        if (indices.empty()) indices.assign(3, 0);           // nothing left: a buffer can't be empty
+        destroy(gm.ibo);
+        gm.ibo = createDeviceBuffer(indices.data(), indices.size() * 4, VK_BUFFER_USAGE_INDEX_BUFFER_BIT);
+        if (!gm.ibo.buf) gm.indexCount = 0;
+        gm.cull = md.cullBack && !noCull;
+        gm.dupOf = -1;                                        // (no longer the copy it was)
+    }
+    for (GpuMesh& gm : meshes_)
+        if (gm.dupOf >= 0 && changed.count(meshes_[gm.dupOf].sceneIndex)) gm.dupOf = -1;
+    buildBatches();
+}
+
 void HslRenderer::buildBatches() {
     batches_.clear();
     static const bool off = std::getenv("FH_NO_BATCH") != nullptr;   // A/B: every mesh its own draw

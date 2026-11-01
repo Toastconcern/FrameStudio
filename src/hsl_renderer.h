@@ -62,6 +62,9 @@ public:
     // (never batched). Its index here, or -1 when it can't be drawn. reloadSplats: the scene's splat objects uploaded
     // again (one was added).
     int addMesh(int sceneIndex);
+    // Frame Studio's trim: these scene meshes' index lists and cullBack changed. Their index buffers are made again
+    // and the static batches rebuilt (waits for the GPU).
+    void updateMeshIndices(const std::vector<int>& sceneIndices);
     void reloadSplats();
     // Renders both eyes; the result is left in `colorImage()` layers 0 (left) / 1 (right), TRANSFER_SRC layout.
     void render(const EyeView eyes[2], float timeSec);
@@ -121,7 +124,8 @@ public:
     //  - setStaticGuide: what stays put for many frames (the walkable area, debug_geom.h's world layer). Uploaded once
     //    into video memory. Waits for the GPU when it replaces geometry (a hitch), so not for every frame.
     void setGuide(const std::vector<GuideVertex>& tris) { guideVerts_ = tris; }
-    void setStaticGuide(const std::vector<GuideVertex>& tris);
+    //    xray: how many of its first vertices also show faintly where the home is in front (the rest only where nothing is).
+    void setStaticGuide(const std::vector<GuideVertex>& tris, size_t xray = static_cast<size_t>(-1));
     // System mode: frames recorded while the GPU finishes the one before (see render()). FH_NO_EARLY_RECORD=1: never.
     void setEarlyRecord(bool on) { earlyRecord_ = on; }
     bool guideAvailable() const { return guide_.visible != VK_NULL_HANDLE; }
@@ -464,7 +468,7 @@ private:
         VkPipeline visible = VK_NULL_HANDLE, hidden = VK_NULL_HANDLE;
         Buffer vbo[2];                              // per command buffer: one is written while the other may be read
         Buffer staticVbo;                           // setStaticGuide's, in video memory
-        uint32_t staticVertexCount = 0;
+        uint32_t staticVertexCount = 0, staticXrayCount = 0;
     } guide_;
     std::vector<GuideVertex> guideVerts_;
     void createGuidePipelines();

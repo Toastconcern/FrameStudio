@@ -1,8 +1,9 @@
 // fenv-tool — convert homes and models into Frame environments (.fenv).
 //
-//   fenv-tool pack out.fenv [--name NAME] [--edits edits.json] [--thumb thumb.png] [--keep-apks] [--fast] [--no-optimize] <input>...
+//   fenv-tool pack out.fenv [--name NAME] [--edits edits.json] [--thumb thumb.png] [--keep-apks] [--fast] [--trim] <input>...
 //       --fast: pack in parallel chunks (several times quicker, ~3% bigger; see fenv_lzma.h)
-//       --no-optimize: keep what can't be seen from anywhere you can be (visibility_bake.h; pack, convert, upgrade)
+//       --trim: leave out what can't be seen from anywhere you can be, and don't draw the backs nobody sees
+//       (visibility_bake.h; pack, convert, upgrade). Never on its own: it's asked for. (--no-optimize: accepted, the default.)
 //       inputs: a home APK (HSL, Clay .opa, glTF .ovrscene), a footprint + its vista, models (.glb .gltf .fbx
 //       .obj). Every home is baked (scene.bin: opens several times faster; a Clay / glTF home's animation goes in as
 //       data, anim_bake.h). --keep-apks stores the source APKs as well.
@@ -40,13 +41,14 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 
 namespace fs = std::filesystem;
 
 namespace {
 
 FenvPacking g_packing = FenvPacking::Smallest;
-bool g_optimize = true;
+bool g_optimize = false;   // --trim
 
 // The mesh optimizer for a bake (the object edits named keep their meshes whole).
 bool optimize(const HslScene& scene, const std::string& editsFile, VisibilityResult& vis, BakeOptions& opt) {
@@ -57,6 +59,25 @@ bool optimize(const HslScene& scene, const std::string& editsFile, VisibilityRes
 }
 
 std::string stem(const std::string& p) { return fs::u8path(p).stem().u8string(); }
+
+// The release this fenv-tool is part of ("v0.2.3"), for the environments it writes: $FRAME_VERSION, else the
+// version.txt Frame Home's installer puts beside bin/, else "" (a build of its own). Read, not compiled in: the update
+// check hashes the programs, which mustn't change from release to release when nothing in them did.
+std::string toolVersion() {
+    if (const char* v = std::getenv("FRAME_VERSION"); v && *v) return v;
+    std::error_code ec;
+#ifdef __linux__
+    const fs::path exe = fs::read_symlink("/proc/self/exe", ec);
+    if (ec) return {};
+    std::ifstream in(exe.parent_path().parent_path() / "version.txt");
+    std::string v;
+    std::getline(in, v);
+    while (!v.empty() && (v.back() == '\r' || v.back() == ' ')) v.pop_back();
+    return v;
+#else
+    return {};
+#endif
+}
 
 std::string displayName(const HslScene& s, const std::vector<std::string>& inputs) {
     std::string n;
@@ -77,6 +98,7 @@ int pack(const std::string& out, const std::vector<std::string>& inputs, std::st
     if (!loadHslScene(inputs, scene, err)) { std::fprintf(stderr, "fenv-tool: %s\n", err.c_str()); return 1; }
     FenvManifest m;
     m.name = name.empty() ? displayName(scene, inputs) : name;
+    m.studioVersion = toolVersion();
     std::vector<FenvMember> members;
     std::vector<u8> blob;
     VisibilityResult vis;
@@ -237,7 +259,7 @@ int upgrade(const std::string& path) {
     }
     VisibilityResult vis;
     BakeOptions opt;
-    const bool optimized = optimize(scene, scene.fenvEdits, vis, opt) && vis.trisAfter < vis.trisBefore;
+    const bool optimized = optimize(scene, scene.fenvEdits, vis, opt) && (vis.trisAfter < vis.trisBefore || vis.meshesCulled > 0);
     if (!want && !optimized && !fromHomes) { std::printf("%s: already up to date\n", path.c_str()); return 0; }
     std::vector<u8> blob;
     if (!bakeScene(scene, blob, err, optimized ? &opt : nullptr)) { std::fprintf(stderr, "fenv-tool: %s: %s\n", path.c_str(), err.c_str()); return 1; }
@@ -269,6 +291,7 @@ int upgrade(const std::string& path) {
         }
         mz_zip_reader_end(&z);
     }
+    if (const std::string v = toolVersion(); !v.empty()) m.studioVersion = v;   // (baked again by this one)
     if (!fenvWrite(path, m, members, err)) { std::fprintf(stderr, "fenv-tool: %s\n", err.c_str()); return 1; }
     std::error_code ec;
     std::printf("%s: %s%zu textures given their smaller levels, %.0f MB, %.1f s\n", path.c_str(), fromHomes ? "baked from its homes, " : "", want, fs::file_size(fs::u8path(path), ec) / 1048576.0,
@@ -482,11 +505,12 @@ int main(int argc, char** argv) {
     if (argc >= 4 && !std::strcmp(argv[1], "unbundle")) return unbundle(argv[2], argv[3]);
     if (argc >= 3 && !std::strcmp(argv[1], "upgrade")) {
         for (int i = 2; i < argc; ++i) {
-            if (!std::strcmp(argv[i], "--no-optimize")) g_optimize = false;
+            if (!std::strcmp(argv[i], "--trim")) g_optimize = true;
             else if (!std::strcmp(argv[i], "--fast")) g_packing = FenvPacking::Fast;
         }
         int rc = 0;
-        for (int i = 2; i < argc; ++i) if (std::strcmp(argv[i], "--no-optimize") && std::strcmp(argv[i], "--fast")) rc = std::max(rc, upgrade(argv[i]));
+        for (int i = 2; i < argc; ++i)
+            if (std::strcmp(argv[i], "--trim") && std::strcmp(argv[i], "--no-optimize") && std::strcmp(argv[i], "--fast")) rc = std::max(rc, upgrade(argv[i]));
         return rc;
     }
     if (argc >= 3 && !std::strcmp(argv[1], "report")) {
@@ -506,7 +530,8 @@ int main(int argc, char** argv) {
             else if (a == "--thumb" && i + 1 < argc) thumb = argv[++i];
             else if (a == "--keep-apks") keep = true;
             else if (a == "--fast") g_packing = FenvPacking::Fast;
-            else if (a == "--no-optimize") g_optimize = false;
+            else if (a == "--trim") g_optimize = true;
+            else if (a == "--no-optimize") continue;
             else inputs.push_back(a);
         }
         if (inputs.empty()) { std::fprintf(stderr, "fenv-tool pack: no inputs\n"); return 2; }
@@ -518,7 +543,8 @@ int main(int argc, char** argv) {
         fs::create_directories(fs::u8path(argv[2]), ec);
         for (int i = 3; i < argc; ++i) {
             const std::string a = argv[i];
-            if (a == "--no-optimize") { g_optimize = false; continue; }
+            if (a == "--trim") { g_optimize = true; continue; }
+            if (a == "--no-optimize") continue;
             if (a == "--fast") { g_packing = FenvPacking::Fast; continue; }
             const std::vector<std::string> group = homeFiles(a);
             std::string base;
@@ -558,12 +584,12 @@ int main(int argc, char** argv) {
     }
 #endif
     std::fprintf(stderr,
-                 "usage:\n  fenv-tool pack out.fenv [--name NAME] [--edits edits.json] [--thumb thumb.png] [--keep-apks] [--fast] <home.apk|vista.apk|model>...\n"
+                 "usage:\n  fenv-tool pack out.fenv [--name NAME] [--edits edits.json] [--thumb thumb.png] [--keep-apks] [--fast] [--trim] <home.apk|vista.apk|model>...\n"
                  "  fenv-tool info <file.fenv | file.fbundle>\n"
                  "  fenv-tool bundle out.fbundle [--name NAME] file.fenv...   several environments in one file\n"
                  "  fenv-tool unbundle file.fbundle outdir   its environments as .fenv files\n"
                  "  fenv-tool convert outdir <home.apk | footprint.apk+vista.apk | model>...\n"
-                 "  fenv-tool upgrade file.fenv...   re-bake with this build (keeps world, edits, sound, picture)\n"
+                 "  fenv-tool upgrade [--trim] file.fenv...   re-bake with this build (keeps world, edits, sound, picture)\n"
                  "  fenv-tool report [--json] <home.apk | home.fenv | footprint.apk+vista.apk>...   what it costs and what's wrong with it\n"
                  "  fenv-tool settings <home.fenv | home.apk> [JSON | --clear]   a world's own settings, shown or set\n"
                  "  fenv-tool tune [--seconds 30] [--late 0.01] [--cool 80] [--dry-run] <home.fenv | home.apk>   its best settings on this headset, stored in it\n"

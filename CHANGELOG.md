@@ -4,6 +4,31 @@ Newest first. When this file changed since the last release, the next release's 
 and the notes post to the Discord's #releases channel: add a section at the top in the push you want announced.
 The version: VERSION (major.minor) and the commits since VERSION changed, so the commit that bumps VERSION is .0.
 
+## v0.2.1
+
+### Frame Studio and Frame Home
+- The walkable area's edge is smooth all the way round: no more square chunks of floor sticking out past it beside
+  furniture and walls, and no knobs of floor poking into gaps too narrow to stand in (under a sofa, between slats).
+  Walking along furniture and walls judders and sticks less.
+- New: World › Trim What Can't Be Seen. It takes out every part of the home nobody can see from anywhere they can walk,
+  sit or teleport to: the backs of walls, under floors, the insides of things, a second copy of a surface drawn in the
+  same place, and stray triangles that only ever showed where another surface covers the same spot. It also stops
+  drawing the back of anything only ever seen from the front, and rebuilds flat areas with fewer triangles where
+  nothing would look different. Homes lose 2–30% of their triangles and look the same from everywhere you can stand. Thin things far off, like branches and
+  rails, are kept. The trim shows up right away; Put Back undoes it. It takes a minute or two.
+- Show what was trimmed (in the World panel, and Viewport Shading) draws what the trim took out in red. None of it
+  shows from where you can stand: fly behind walls, under floors or outside to see it.
+- Saving trims the file the same way (World › Trim when saving, on by default; autosaved versions aren't trimmed).
+  The home open in Studio stays untrimmed unless you pressed Trim. `fenv-tool pack`, `convert` and `upgrade` trim
+  only with `--trim`.
+- A trimmed home needs this Frame Home (it draws one side of the trimmed meshes). Homes saved untrimmed open in older
+  Frame Homes as before.
+- Frame Home: each environment's picture says which version made it ("Made with v0.2.3"), and "Untested on this
+  version" when that isn't the Frame Home you have. One this Frame Home can't open says "Needs a newer Frame Home".
+  Frame Home knows its own version from the installer (version.txt), and fenv-tool stamps the environments it writes.
+- Frame Home: an Import card on the Environments page lists the environments in Downloads, on the desktop and on USB
+  drives (.fenv, .fbundle and home APKs). Tap one to copy it in; ones already there are marked.
+
 ## v0.2.0
 
 ### Frame Studio

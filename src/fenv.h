@@ -65,6 +65,7 @@ struct FenvManifest {
     std::string scene;                  // the baked scene (scene_bake.h): when present it IS the home, sources are info
     std::string world;                  // world.json (core/world.h): spawns, seats, walls, walkable areas
     std::string studioVersion;          // "studio": the Frame Studio that saved it ("v0.2.3"; "" for files from before v0.2)
+    uint32_t sceneVersion = 0;          // "sceneVersion": the baked scene's format (scene_bake.h; 0: not written, before 2026-11)
     WorldSettings settings;             // the world's own render settings (world_settings.h): none set = the headset's
     // What it needs a reader to understand ("splats", ...): a reader that doesn't know one refuses the file with "needs
     // a newer Frame Home" instead of showing it wrong. Written only when something is needed (older readers ignore it,
@@ -143,6 +144,7 @@ inline std::string manifestJson(const FenvManifest& m) {
     if (!m.scene.empty()) j += ",\n  \"scene\": " + quote(m.scene);
     if (!m.world.empty()) j += ",\n  \"world\": " + quote(m.world);
     if (!m.studioVersion.empty()) j += ",\n  \"studio\": " + quote(m.studioVersion);
+    if (m.sceneVersion) j += ",\n  \"sceneVersion\": " + std::to_string(m.sceneVersion);
     if (!m.settings.empty() || !m.settings.tuned.empty()) j += ",\n  \"settings\": " + m.settings.toJson();
     if (!m.needs.empty()) {
         j += ",\n  \"requires\": [";
@@ -414,10 +416,11 @@ inline bool fenvParseManifest(const std::string& json, FenvManifest& m) {
         if (doc.has("world") && fenv_detail::safeMember(doc["world"].asString())) m.world = doc["world"].asString();
         if (doc.has("settings")) m.settings.fromValue(doc["settings"]);
         m.studioVersion = doc["studio"].asString();
+        if (doc.has("sceneVersion")) m.sceneVersion = static_cast<uint32_t>(std::max<int64_t>(0, doc["sceneVersion"].asInt()));
         for (size_t i = 0; i < doc["requires"].size(); ++i) m.needs.push_back(doc["requires"][i].asString());
         m.version = std::max<int64_t>(1, doc["version"].asInt());
         static const char* kKnown[] = {"format", "version", "name", "sources", "models", "splats", "edits", "thumbnail", "scene", "world",
-                                       "settings", "requires", "studio"};
+                                       "settings", "requires", "studio", "sceneVersion"};
         for (const auto& kv : doc.objVal)
             if (std::none_of(std::begin(kKnown), std::end(kKnown), [&](const char* k) { return kv.first == k; }))
                 m.unknown += ",\n  " + fenv_detail::quote(kv.first) + ": " + fenv_detail::toJson(kv.second);
@@ -429,7 +432,8 @@ inline bool fenvParseManifest(const std::string& json, FenvManifest& m) {
 
 // The features this build reads (FenvManifest::needs), and the ones a manifest asks for that it doesn't ("" none).
 inline const std::vector<std::string>& fenvFeatures() {
-    static const std::vector<std::string> known = {"splats"};   // (sky panoramas, ... join as they're written)
+    // splats: Gaussian splat members; one-sided: a trimmed scene (meshes drawn one side only, scene format 16)
+    static const std::vector<std::string> known = {"splats", "one-sided"};
     return known;
 }
 // Who made it, as shown: "Frame Studio v0.2.3", or "made before v0.2" (the version wasn't written then).
@@ -619,6 +623,24 @@ struct FenvMember {
     FenvPacking packing = FenvPacking::Smallest;
 };
 
+namespace fenv_detail {
+// What the manifest says of the members themselves: the baked scene's (m.scene) format, and from format 16 on that its
+// meshes may be drawn one side only ("one-sided": a Frame Home before that can't open it, and says so).
+inline FenvManifest withNeeds(const FenvManifest& m, const std::vector<FenvMember>& members) {
+    FenvManifest out = m;
+    for (const FenvMember& f : members) {
+        if (f.name != m.scene || f.bytes.size() < 8) continue;
+        uint32_t magic = 0, version = 0;
+        std::memcpy(&magic, f.bytes.data(), 4);
+        std::memcpy(&version, f.bytes.data() + 4, 4);
+        if (magic == 0x4E435346u) out.sceneVersion = version;
+        if (magic == 0x4E435346u && version >= 16 && std::find(out.needs.begin(), out.needs.end(), "one-sided") == out.needs.end())   // "FSCN"
+            out.needs.push_back("one-sided");
+    }
+    return out;
+}
+}  // namespace fenv_detail
+
 // progress(done, total): LZMA members, as they are packed (from the packing threads).
 inline bool fenvWrite(const std::string& outPath, const FenvManifest& m, const std::vector<FenvMember>& members, std::string& error,
                       const std::function<void(size_t, size_t)>& progress = {}) {
@@ -640,7 +662,7 @@ inline bool fenvWrite(const std::string& outPath, const FenvManifest& m, const s
     const mz_uint zip64 = total + (uint64_t(1) << 20) >= 0xFFFFFFFFull ? MZ_ZIP_FLAG_WRITE_ZIP64 : 0;
     mz_zip_archive z = {};
     if (!mz_zip_writer_init_file_v2(&z, tmp.c_str(), 0, zip64)) { error = "can't write " + outPath; return false; }
-    const std::string json = fenv_detail::manifestJson(m);
+    const std::string json = fenv_detail::manifestJson(fenv_detail::withNeeds(m, members));
     bool ok = mz_zip_writer_add_mem(&z, "fenv.json", json.data(), json.size(), MZ_DEFAULT_COMPRESSION);
     for (const FenvMember& f : members) {
         if (!ok) break;

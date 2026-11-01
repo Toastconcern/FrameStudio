@@ -2,7 +2,8 @@
 // Steam Frame ~/frame-home/envs; on a PC, Frame Studio's My Environments: home_platform.h) — Frame environments .fenv,
 // home APKs, and footprint + vista pairs from pairs.txt — with thumbnails. Point and click one: `current` changes and
 // Frame Home switches to it live. A bundle of environments (.fbundle) put there is unpacked into its .fenv files,
-// which the panel then lists one by one.
+// which the panel then lists one by one. Its Import card lists the environments in Downloads, on the desktop and on
+// USB drives, and copies the one tapped into envs.
 //
 //   frame-switcher                 the dashboard panel (SteamVR starts it: see --install)
 //   frame-switcher --install       register with SteamVR and start it with SteamVR from now on
@@ -15,8 +16,10 @@
 //   frame-switcher --check-update  is there a newer Frame Home on GitHub? (exit 10: yes)
 //   frame-switcher --update        download it and install it now (the panel's Update Frame Home)
 //   frame-switcher --test-delete DIR   self-check of deleting, in a fake root made in DIR (must not exist yet)
+//   frame-switcher --test-import DIR   self-check of importing (Downloads, a USB drive and envs faked in DIR, new)
 #include "fenv.h"
 #include "fenv_bundle.h"
+#include "scene_bake.h"
 #include "overlay_texture.h"
 #include "overlays.h"
 #include "perf_settings.h"
@@ -53,6 +56,10 @@
 
 extern "C" unsigned char* stbi_load_from_memory(const unsigned char* buffer, int len, int* x, int* y, int* comp, int req_comp);
 extern "C" void stbi_image_free(void* retval_from_stbi_load);
+
+#ifndef FRAME_VERSION_BASE
+#define FRAME_VERSION_BASE "?"   // (CMakeLists.txt sets it from VERSION)
+#endif
 
 #define LOG(...) do { std::fprintf(stderr, "[frame-switcher] " __VA_ARGS__); std::fputc('\n', stderr); } while (0)
 
@@ -115,8 +122,16 @@ Image decodeBytes(const std::vector<uint8_t>& b) {
 
 // ── The environments ──
 
+// Whether this Frame Home can open a Frame environment: not when it asks for something this one doesn't have.
+bool tooNew(const FenvManifest& m) { return !fenvMissingFeatures(m).empty() || m.sceneVersion > kSceneBakeVersion; }
+
+// "v0.2.3" as shown (no " (local)")
+std::string shortVersion(const std::string& v) { return v.substr(0, v.find(' ')); }
+
 struct Env {
     std::string name, kind;             // shown
+    bool tooNew = false;                // this Frame Home can't open it
+    std::string madeWith;               // the version that made it ("v0.2.3"; "?" when it didn't say); "" for an APK
     std::vector<std::string> files;     // what goes into `current` (names in envs/)
     std::string key;                    // `current` contents, one file per line
     Image thumb;
@@ -179,9 +194,9 @@ std::vector<Env> scanEnvs() {
             std::vector<uint8_t> thumb;
             if (!fenvReadManifest(p.string(), m, &thumb)) continue;
             e.name = m.name.empty() ? pretty(p.stem().string()) : m.name;
-            e.kind = std::string(m.sources.size() > 1 ? "Frame environment, footprint + vista" : "Frame environment") + " \u00b7 " +
-                     (m.studioVersion.empty() ? "made before v0.2" : "made with Studio " + m.studioVersion);
-            if (!fenvMissingFeatures(m).empty()) e.kind = "Needs a newer Frame Home: update it from this panel";   // (it won't load)
+            e.madeWith = m.studioVersion.empty() ? "?" : shortVersion(m.studioVersion);
+            e.tooNew = tooNew(m);
+            e.kind = m.sources.size() > 1 ? "Frame environment, footprint + vista" : "Frame environment";
             e.thumb = decodeBytes(thumb);
         } else {
             e.name = pretty(p.stem().string());
@@ -372,6 +387,144 @@ DeleteResult deleteEnv(const Env& e, const std::vector<Env>& all, bool cacheInBa
     LOG("deleted %s (%zu files)%s", e.name.c_str(), r.removed.size(), r.error.empty() ? "" : (": " + r.error).c_str());
     r.ok = r.error.empty();
     return r;
+}
+
+// ── Importing an environment ──
+// The environments lying in the usual places files arrive (Downloads, the desktop, USB drives), listed so one can be
+// copied into envs/ from the panel. It's copied to envs/.importing first and renamed into envs/ once whole, so the
+// panel and Frame Home never see half a file. A bundle (.fbundle) arrives as one and is unpacked by unpackBundles.
+struct ImportFile {
+    fs::path path;
+    std::string name, where;            // the file's name; the place it's in, shown ("Downloads", "USB drive SANDISK")
+    uintmax_t size = 0;
+    bool present = false;               // envs/ has one of the same name and size
+};
+
+bool importable(const fs::path& p) {
+    std::string ext = p.extension().string();
+    for (char& c : ext) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return ext == ".fenv" || ext == ".fbundle" || ext == ".apk";
+}
+
+// Where to look, with the name shown for each and how many folders down. FRAME_HOME_IMPORT_FROM (folders split by
+// ';'): those instead (tests).
+struct ImportPlace { fs::path dir; std::string label; int depth; };
+std::vector<ImportPlace> importPlaces() {
+    std::vector<ImportPlace> out;
+    if (const char* from = std::getenv("FRAME_HOME_IMPORT_FROM")) {
+        std::istringstream in(from);
+        for (std::string d; std::getline(in, d, ';');)
+            if (!d.empty()) out.push_back({fs::u8path(d), fs::u8path(d).filename().u8string(), 2});
+        return out;
+    }
+#ifdef _WIN32
+    out.push_back({homeos::knownFolder(FOLDERID_Downloads), "Downloads", 2});
+    out.push_back({homeos::knownFolder(FOLDERID_Desktop), "Desktop", 1});
+    const DWORD drives = GetLogicalDrives();
+    for (int d = 0; d < 26; ++d) {
+        if (!(drives & (1u << d))) continue;
+        const wchar_t root[4] = {static_cast<wchar_t>(L'A' + d), L':', L'\\', 0};
+        if (GetDriveTypeW(root) == DRIVE_REMOVABLE) out.push_back({fs::path(root), std::string("USB drive ") + static_cast<char>('A' + d) + ":", 3});
+    }
+#else
+    const char* home = std::getenv("HOME");
+    const fs::path h = home && *home ? home : "/home/steamos";
+    out.push_back({h / "Downloads", "Downloads", 2});
+    out.push_back({h / "Desktop", "Desktop", 1});
+    const char* user = std::getenv("USER");
+    std::error_code ec;
+    for (const fs::path media : {fs::path("/run/media"), fs::path("/media")}) {   // each mounted drive
+        const fs::path mine = user && *user ? media / user : media;
+        for (const auto& e : fs::directory_iterator(mine, ec))
+            if (e.is_directory(ec)) out.push_back({e.path(), "USB drive " + e.path().filename().string(), 3});
+    }
+#endif
+    return out;
+}
+
+// Whether envs/ has it already: a file of its name and size, or of "<name> 2" (3, ...), as a second import named it.
+bool alreadyImported(const fs::path& envs, const fs::path& name, uintmax_t size) {
+    std::error_code ec;
+    for (int n = 1; n <= 20; ++n) {
+        const fs::path p = envs / (n == 1 ? name : fs::u8path(name.stem().u8string() + " " + std::to_string(n) + name.extension().u8string()));
+        if (!fs::is_regular_file(p, ec)) { if (n > 1) break; continue; }
+        if (fs::file_size(p, ec) == size) return true;
+    }
+    return false;
+}
+
+// The environments in those places (hidden folders skipped; a few hundred at most), newest first.
+std::vector<ImportFile> scanImports() {
+    std::vector<ImportFile> out;
+    std::vector<std::pair<fs::file_time_type, size_t>> order;
+    std::set<std::string> seen;
+    const fs::path envs = homeos::envs();
+    std::error_code ec;
+    for (const ImportPlace& place : importPlaces()) {
+        fs::recursive_directory_iterator it(place.dir, fs::directory_options::skip_permission_denied, ec), end;
+        for (; !ec && it != end && out.size() < 300; it.increment(ec)) {
+            const fs::path& p = it->path();
+            const std::string n = p.filename().string();
+            if (it->is_directory(ec)) {
+                if ((!n.empty() && n[0] == '.') || it.depth() + 1 >= place.depth) it.disable_recursion_pending();
+                continue;
+            }
+            if (!it->is_regular_file(ec) || !importable(p) || !seen.insert(fs::weakly_canonical(p, ec).string()).second) continue;
+            ImportFile f;
+            f.path = p;
+            f.name = p.filename().u8string();
+            f.size = it->file_size(ec);
+            const fs::path rel = p.parent_path().lexically_relative(place.dir);
+            f.where = place.label + (rel.empty() || rel == "." ? "" : " / " + rel.generic_u8string());
+            f.present = alreadyImported(envs, p.filename(), f.size);
+            order.push_back({it->last_write_time(ec), out.size()});
+            out.push_back(std::move(f));
+        }
+        ec.clear();
+    }
+    std::sort(order.begin(), order.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+    std::vector<ImportFile> sorted;
+    for (const auto& o : order) sorted.push_back(std::move(out[o.second]));
+    return sorted;
+}
+
+// The name it gets in envs/: its own, or "<name> 2.<ext>" (3, ...) while another file has that name.
+fs::path importTarget(const fs::path& envs, const fs::path& name) {
+    std::error_code ec;
+    fs::path to = envs / name;
+    for (int n = 2; fs::exists(to, ec); ++n) to = envs / (name.stem().u8string() + " " + std::to_string(n) + name.extension().u8string());
+    return to;
+}
+
+// Copies f into envs/ (copied: bytes so far, for the progress). Its name in envs/ in `name`; "" and `error` when it failed.
+bool importFile(const ImportFile& f, std::atomic<uintmax_t>& copied, std::string& name, std::string& error) {
+    std::error_code ec;
+    const fs::path envs = homeos::envs(), staging = envs / ".importing";
+    fs::create_directories(staging, ec);
+    const fs::path part = staging / (f.path.filename().u8string() + ".part");
+    bool ok = true;
+    {
+        std::ifstream in(f.path, std::ios::binary);
+        std::ofstream out(part, std::ios::binary | std::ios::trunc);
+        if (!in) { error = "can't read it"; ok = false; }
+        else if (!out) { error = "can't write to " + envs.u8string(); ok = false; }
+        std::vector<char> buf(4 << 20);
+        while (ok && in) {
+            in.read(buf.data(), static_cast<std::streamsize>(buf.size()));
+            const std::streamsize n = in.gcount();
+            if (n > 0 && !out.write(buf.data(), n)) { error = "the headset is full, or " + envs.u8string() + " can't be written"; ok = false; }
+            copied += static_cast<uintmax_t>(std::max<std::streamsize>(n, 0));
+        }
+        if (ok && in.bad()) { error = "reading it failed (the drive taken out?)"; ok = false; }
+        if (ok) { out.flush(); if (!out) { error = "writing it failed"; ok = false; } }
+    }
+    if (ok && fs::file_size(part, ec) != f.size) { error = "it changed while it was copied"; ok = false; }
+    const fs::path to = ok ? importTarget(envs, f.path.filename()) : fs::path();
+    if (ok) { fs::rename(part, to, ec); if (ec) { error = ec.message(); ok = false; } }
+    if (!ok) fs::remove(part, ec);
+    fs::remove(staging, ec);                            // (only when empty)
+    name = ok ? to.filename().u8string() : std::string();
+    return ok;
 }
 
 // ── Drawing (software, into the overlay's RGBA buffer) ──
@@ -736,9 +889,6 @@ std::string releaseUrl() {
     return u && *u ? std::string(u) : std::string(kReleaseUrl);
 }
 
-#ifndef FRAME_VERSION_BASE
-#define FRAME_VERSION_BASE "?"   // (CMakeLists.txt sets it from VERSION)
-#endif
 
 struct Updates {
     enum class State { Idle, Available, Updating, Failed };
@@ -899,7 +1049,7 @@ struct Panel {
     std::string toast;
     bool toastError = false;
     double toastUntil = 0;
-    int page = 0;                       // 0 environments, 1 settings, 2 debug
+    int page = 0;                       // 0 environments, 1 settings, 2 debug, 3 import (from the Environments page)
     PerfSettings perf;
     std::string stats;                  // a line from Frame Home's stats.json
     std::future<std::string> buildHash; // the installed files' hash (Updates::installedHash), for the Settings page's
@@ -913,6 +1063,18 @@ struct Panel {
     Home home = Home::Running;
     bool restartAsked = false;          // the button was clicked: the loop restarts or starts it
     static constexpr int kHomeId = 9100, kUpdateId = 9102;
+    // Import (page 3): its card on the Environments page, Back, Look Again, and its rows kImportRowId + index.
+    static constexpr int kImportCardId = 9300, kImportBackId = 9301, kImportAgainId = 9302, kImportRowId = 100000;
+    std::vector<ImportFile> imports;    // what was found
+    std::future<std::vector<ImportFile>> importScan;   // looking (off the panel's thread: a USB drive can be slow)
+    struct ImportJob {                  // the one being copied (off the panel's thread)
+        ImportFile file;
+        std::atomic<uintmax_t> copied{0};
+        std::atomic<bool> done{false};
+        bool ok = false;
+        std::string name, error;        // its name in envs/; why it failed
+    };
+    std::shared_ptr<ImportJob> importing;
 
     // Layout
     static constexpr int kCols = 3, kPad = 40, kTop = 112, kGap = 24, kThumbH = 216, kInfoH = 84, kCardH = kThumbH + kInfoH;
@@ -945,7 +1107,7 @@ struct Panel {
     // Fling after a drag: speed gain, top speed (px/s) and how fast it slows (1/s; lower coasts further).
     // FH_SCROLL_FLING_GAIN / _MAX / _DECAY override.
     float kFlingGain = 1.0f, kFlingMax = 12000.0f, kFlingDecay = 2.2f;
-    Scroll sc[3];
+    Scroll sc[4];
     float viewH() const { return static_cast<float>(H - kTop); }
     float maxScroll(int p) const { return std::max(0.0f, sc[p].content - viewH()); }
     std::vector<float> hoverT;          // per card, 0..1, eased
@@ -1035,7 +1197,7 @@ struct Panel {
     bool tick(double dt) {
         bool moving = false;
         const float fdt = static_cast<float>(std::min(dt, 0.1));
-        for (int p = 0; p < 3; ++p) {
+        for (int p = 0; p < 4; ++p) {
             Scroll& s = sc[p];
             const float m = maxScroll(p);
             if (!(dragging && p == page)) {
@@ -1065,6 +1227,19 @@ struct Panel {
         if (!toast.empty()) { moving = true; if (now >= toastUntil) toast.clear(); }
         if (buildHash.valid()) moving = true;     // the build's hash is being worked out: draw it when it's in
         if (!confirmKey.empty() && now - confirmStart < 0.3) moving = true;   // the question fades in
+        if (importScan.valid()) {
+            moving = true;
+            if (importScan.wait_for(std::chrono::seconds(0)) == std::future_status::ready) imports = importScan.get();
+        }
+        if (importing) {
+            moving = true;                      // its progress
+            if (importing->done) {
+                const std::shared_ptr<ImportJob> j = std::move(importing);
+                if (!j->ok) say("Couldn't import " + j->file.name + " (" + j->error + ")", true, 4);
+                else say("Imported " + j->name + (isFenvBundlePath(j->name) ? ": unpacking its environments" : ""), false, 3);
+                if (j->ok) for (ImportFile& f : imports) if (f.path == j->file.path) f.present = true;
+            }
+        }
         return moving;
     }
 
@@ -1332,9 +1507,9 @@ struct Panel {
     }
 
     // ── Environments ──
-    float envContent() const {
-        const int rows = (static_cast<int>(envs.size()) + kCols - 1) / kCols;
-        return rows ? 8 + rows * (kCardH + kGap) - kGap + 40 : 0;
+    float envContent() const {   // (the cards, and the Import card after them)
+        const int rows = (static_cast<int>(envs.size()) + 1 + kCols - 1) / kCols;
+        return 8 + rows * (kCardH + kGap) - kGap + 40;
     }
     void card(size_t i) {
         Env& e = envs[i];
@@ -1355,6 +1530,17 @@ struct Panel {
             const std::vector<int> cs = Font::codes(e.name);
             std::string letter = cs.empty() ? "?" : std::string(1, static_cast<char>(cs[0] < 0x80 ? std::toupper(cs[0]) : '?'));
             glyphFont.draw(cv, (x0 + x1) * 0.5f - glyphFont.width(letter) * 0.5f, (y0 + imgB) * 0.5f - glyphFont.size * 0.5f, letter, kFaint);
+        }
+        if (!e.madeWith.empty()) {   // top left of the picture: what version made it
+            float ly = y0 + 14;
+            const auto tag = [&](const std::string& text, uint32_t fill, uint32_t ink, float alpha) {
+                const float lx = x0 + 14, h = 34;
+                cv.rect(lx, ly, lx + small.width(text) + 24, ly + h, 6, fill, alpha);
+                small.drawMid(cv, lx + 12, ly + h * 0.5f, text, ink);
+                ly += h + 6;
+            };
+            if (e.tooNew) tag("Needs a newer Frame Home", kError, 0xffffff, 0.95f);
+            tag(e.madeWith == "?" ? "Made with an unknown version" : "Made with " + e.madeWith, 0x0c0d0e, kText, 0.78f);
         }
         if (switching) {   // switching: darken the picture, spin
             cv.rect(x0, y0, x1, imgB, kR, 0x000000, 0.55f, 0);
@@ -1406,14 +1592,108 @@ struct Panel {
     }
     void renderEnvs() {
         sc[0].content = envContent();
-        if (envs.empty()) {
-            const float cy = kTop + (H - kTop) * 0.42f;
-            const std::string a = "No environments yet", b = "Send one from Frame Studio: Headset > Install on Steam Frame.";
+        for (size_t i = 0; i < envs.size(); ++i) card(i);
+        importCard(envs.size());
+        if (envs.empty()) {   // under the Import card
+            const float cy = kTop + 8 + kCardH + 110;
+            const std::string a = "No environments yet", b = "Import one, or send one from Frame Studio: Headset > Install on Steam Frame.";
             head.draw(cv, (W - head.width(a)) * 0.5f, cy - 40, a, kText);
             small.draw(cv, (W - small.width(b)) * 0.5f, cy + 8, b, kMuted);
+        }
+    }
+    // The card after the environments: Import (opens the Import page).
+    void importCard(size_t slot) {
+        const int cw = cardW();
+        const float x0 = static_cast<float>(kPad + (slot % kCols) * (cw + kGap));
+        const float y0 = kTop + 8 + static_cast<float>(slot / kCols) * (kCardH + kGap) - sc[0].pos;
+        const float x1 = x0 + cw, y1 = y0 + kCardH, imgB = y0 + kThumbH;
+        if (y0 > H + 4 || y1 < kTop - 4) return;
+        const bool hov = hotHover == kImportCardId;
+        cv.rect(x0, y0, x1, y1, kR, hov ? kSurfaceHi : kSurface);
+        const float cx = (x0 + x1) * 0.5f, cy = (y0 + imgB) * 0.5f;   // a plus
+        cv.rect(cx - 26, cy - 3, cx + 26, cy + 3, 2, hov ? kText : kMuted);
+        cv.rect(cx - 3, cy - 26, cx + 3, cy + 26, 2, hov ? kText : kMuted);
+        body.draw(cv, x0 + 20, imgB + 14, "Import", kText, x1 - 18);
+        small.draw(cv, x0 + 20, imgB + 50, "From Downloads or a USB drive", kMuted, x1 - 18);
+        cv.ring(x0, y0, x1, y1, kR, 1, hov ? 0x5c5e63 : kLine);
+        addHot(x0, y0, x1, y1, kImportCardId, true);
+    }
+
+    // ── Import ──
+    static std::string sizeText(uintmax_t bytes) {
+        char b[32];
+        if (bytes >= (1ull << 30)) std::snprintf(b, sizeof b, "%.1f GB", static_cast<double>(bytes) / (1ull << 30));
+        else if (bytes >= (1ull << 20)) std::snprintf(b, sizeof b, "%.0f MB", static_cast<double>(bytes) / (1ull << 20));
+        else std::snprintf(b, sizeof b, "%.0f KB", std::max(1.0, static_cast<double>(bytes) / 1024));
+        return b;
+    }
+    void openImport() {
+        page = 3;
+        hotHover = -1;
+        sc[3] = Scroll();
+        sc[3].active = now - 10;
+        lookForImports();
+    }
+    void lookForImports() { if (!importScan.valid()) importScan = std::async(std::launch::async, scanImports); }
+    void startImport(size_t i) {
+        if (i >= imports.size()) return;
+        const ImportFile& f = imports[i];
+        if (importing) { say("Still importing " + importing->file.name); return; }
+        if (f.present) { say(f.name + " is in Frame Home already"); return; }
+        auto job = std::make_shared<ImportJob>();
+        job->file = f;
+        std::thread([job] { job->ok = importFile(job->file, job->copied, job->name, job->error); job->done = true; }).detach();
+        importing = job;
+    }
+    void renderImport() {
+        const float x0 = kPad, x1 = W - kPad;
+        float y = 12;
+        const float bw = button(x0, y, "Back", kImportBackId, true);
+        head.drawMid(cv, x0 + bw + 24, kTop + y + 24 - sc[3].pos, "Import an environment", kText);
+        const char* again = importScan.valid() ? "Looking\u2026" : "Look Again";
+        button(x1 - label.width(again) - 40, y, again, kImportAgainId, !importScan.valid());
+        y += 48 + 22;
+        small.draw(cv, x0 + 4, kTop + y - sc[3].pos, "Frame environments (.fenv, .fbundle) and home APKs in Downloads, on the desktop and on USB drives.", kFaint, x1);
+        y += 46;
+        if (imports.empty()) {
+            const float cy0 = kTop + y - sc[3].pos;
+            cv.rect(x0, cy0, x1, cy0 + 116, kR, kSurface);
+            body.draw(cv, x0 + 28, cy0 + 22, importScan.valid() ? "Looking\u2026" : "Nothing to import", kText, x1 - 28);
+            if (!importScan.valid())
+                small.draw(cv, x0 + 28, cy0 + 64, "Put one in Downloads or on a USB drive, then Look Again.", kMuted, x1 - 28);
+            sc[3].content = y + 116 + 40;
             return;
         }
-        for (size_t i = 0; i < envs.size(); ++i) card(i);
+        constexpr float kRowH = 96;
+        const float cy0 = kTop + y - sc[3].pos;
+        cv.rect(x0, cy0, x1, cy0 + kRowH * imports.size(), kR, kSurface);
+        for (size_t i = 0; i < imports.size(); ++i) {
+            const ImportFile& f = imports[i];
+            const float ry = kTop + y + kRowH * i - sc[3].pos;
+            if (ry > H || ry + kRowH < kTop) continue;
+            const int id = kImportRowId + static_cast<int>(i);
+            const bool busy = importing && importing->file.path == f.path, hov = hotHover == id && !f.present && !importing;
+            if (i) cv.rect(x0 + 28, ry, x1 - 28, ry + 1, 0, kLine);
+            if (hov) cv.rect(x0 + 4, ry + 4, x1 - 4, ry + kRowH - 4, kR - 2, kSurfaceHi);
+            const float right = x1 - 28 - 260;
+            body.draw(cv, x0 + 28, ry + 18, f.name, f.present ? kMuted : kText, right - 16);
+            small.draw(cv, x0 + 28, ry + 56, sizeText(f.size) + "  \u00b7  " + f.where, kFaint, right - 16);
+            const float cy = ry + kRowH * 0.5f;
+            if (busy) {   // how far the copy is
+                const float t = f.size ? static_cast<float>(static_cast<double>(importing->copied.load()) / static_cast<double>(f.size)) : 0.0f;
+                small.drawMid(cv, right, cy - 16, "Importing\u2026 " + std::to_string(static_cast<int>(std::clamp(t, 0.0f, 1.0f) * 100)) + "%", kText);
+                cv.rect(right, cy + 10, x1 - 28, cy + 16, 3, kSunken);
+                cv.rect(right, cy + 10, right + (x1 - 28 - right) * std::clamp(t, 0.0f, 1.0f), cy + 16, 3, kText);
+            } else if (f.present) {
+                small.drawMid(cv, x1 - 28 - small.width("In Frame Home already"), cy, "In Frame Home already", kFaint);
+            } else {
+                const float iw = label.width("Import") + 40;
+                cv.rect(x1 - 28 - iw, cy - 24, x1 - 28, cy + 24, kR, hov ? 0x34363b : kSurfaceHi);
+                label.drawMid(cv, x1 - 28 - iw + 20, cy, "Import", importing ? kFaint : kText);
+            }
+            if (!f.present) addHot(x0, ry, x1, ry + kRowH, id, true);
+        }
+        sc[3].content = y + kRowH * imports.size() + 40;
     }
 
     // ── The whole panel ──
@@ -1423,7 +1703,7 @@ struct Panel {
         cv.clear(kBg);
         // Content, scrolled, under the header.
         cv.clip(0, kTop, W, H);
-        if (page == 0) renderEnvs(); else if (page == 1) renderSettings(); else renderDebug();
+        if (page == 0) renderEnvs(); else if (page == 1) renderSettings(); else if (page == 2) renderDebug(); else renderImport();
         cv.fade(0, H - 28, W, H, kBg, 0.0f, maxScroll(page) - sc[page].pos > 2 ? 0.9f : 0.0f);   // more below
         cv.fade(0, kTop, W, kTop + 22, 0x000000, sc[page].pos > 1 ? 0.35f : 0.0f, 0.0f);      // shadow under the header
         scrollbar();
@@ -1434,7 +1714,7 @@ struct Panel {
             const float y0 = 30, y1 = 84, cy = (y0 + y1) * 0.5f;
             float x = kPad;
             for (int t = 0; t < 3; ++t) {
-                const bool on = page == t, hov = hotHover == 9000 + t;
+                const bool on = page == t || (page == 3 && t == 0), hov = hotHover == 9000 + t;   // (Import is the Environments page's)
                 const float w = head.width(names[t]);
                 head.drawMid(cv, x, cy - 2, names[t], on ? kText : hov ? 0xc4c2bd : kFaint);
                 if (on) cv.rect(x, y1 - 6, x + w, y1 - 3, 1, kText);
@@ -1593,6 +1873,10 @@ struct Panel {
             else say("Still checking for updates: try again in a moment", false, 3);
             return;
         }
+        if (id == kImportCardId) { openImport(); return; }
+        if (id == kImportBackId) { page = 0; hotHover = -1; return; }
+        if (id == kImportAgainId) { lookForImports(); return; }
+        if (id >= kImportRowId) { if (page == 3) startImport(static_cast<size_t>(id - kImportRowId)); return; }
         if (id >= 9000 && id < 9003) {
             if (page != id - 9000) { page = id - 9000; hotHover = -1; sc[page].active = now - 10; if (page == 2) info = readDebugInfo(); }
             return;
@@ -1608,6 +1892,10 @@ struct Panel {
             const size_t i = static_cast<size_t>(id - kCardId);
             if (page != 0 || i >= envs.size()) return;
             const Env& e = envs[i];
+            if (e.tooNew) {   // (it wouldn't load)
+                say("Made with " + (e.madeWith == "?" ? std::string("an unknown version") : e.madeWith) + ": update Frame Home to open it", true, 5);
+                return;
+            }
             if (!switchingKey.empty() && switchingKey == e.key) return;
             if (e.key == current && switchingKey.empty()) { say("Already showing " + e.name); return; }
             if (!setCurrent(e)) { say("Couldn't switch (is ~/frame-home writable?)", true, 3); return; }
@@ -2220,6 +2508,65 @@ int runThumbs() {
     return 0;
 }
 
+// Self-check of importing (scanImports, importFile) in a made-up Frame Home, Downloads and USB drive under `dir`.
+int runTestImport(const fs::path& dirIn) {
+    std::error_code ec;
+    if (fs::exists(dirIn, ec)) { std::fprintf(stderr, "test-import: %s exists; give a new folder\n", dirIn.string().c_str()); return 2; }
+    fs::create_directories(dirIn, ec);
+    const fs::path dir = fs::canonical(dirIn, ec), envs = dir / "frame-home" / "envs", dl = dir / "Downloads", usb = dir / "usb";
+    homeos::setEnv("FRAME_HOME_ROOT", (dir / "frame-home").u8string().c_str());
+    homeos::setEnv("FRAME_HOME_ENVS", envs.u8string().c_str());
+    homeos::setEnv("FRAME_HOME_IMPORT_FROM", (dl.u8string() + ";" + usb.u8string()).c_str());
+    for (const fs::path& d : {envs, dl / "sub" / "deeper", dl / ".hidden", usb}) fs::create_directories(d, ec);
+    auto put = [](const fs::path& p, const std::string& s) { std::ofstream(p, std::ios::binary) << s; };
+    auto text = [](const fs::path& p) { std::ifstream in(p, std::ios::binary); return std::string((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>()); };
+    put(dl / "alpha.fenv", "alpha environment");
+    put(dl / "sub" / "pack.fbundle", "a bundle");
+    put(dl / "sub" / "deeper" / "deep.apk", "too deep");
+    put(dl / ".hidden" / "hidden.fenv", "hidden");
+    put(dl / "notes.txt", "not an environment");
+    put(usb / "HOME.APK", "an apk from a drive");
+    put(dl / "same.fenv", "the same"); put(envs / "same.fenv", "the same");
+    put(dl / "clash.fenv", "the new one"); put(envs / "clash.fenv", "the old one, longer");
+    int fails = 0, checks = 0;
+    auto check = [&](bool ok, const std::string& what) { ++checks; if (!ok) ++fails; std::printf("%s  %s\n", ok ? "ok  " : "FAIL", what.c_str()); };
+    auto find = [](const std::vector<ImportFile>& v, const std::string& n) -> const ImportFile* {
+        for (const ImportFile& f : v) if (f.name == n) return &f;
+        return nullptr;
+    };
+
+    std::vector<ImportFile> found = scanImports();
+    std::string names;
+    for (const ImportFile& f : found) names += " " + f.name;
+    check(found.size() == 5 && find(found, "alpha.fenv") && find(found, "pack.fbundle") && find(found, "HOME.APK") && find(found, "same.fenv") &&
+              find(found, "clash.fenv"), "scan: the five environments (" + std::to_string(found.size()) + ":" + names + ")");
+    check(!find(found, "deep.apk") && !find(found, "hidden.fenv") && !find(found, "notes.txt"), "scan: not too deep, hidden or other files");
+    check(find(found, "same.fenv") && find(found, "same.fenv")->present && !find(found, "clash.fenv")->present && !find(found, "alpha.fenv")->present,
+          "scan: the one already there is marked, a different one of the same name isn't");
+    check(find(found, "pack.fbundle") && find(found, "pack.fbundle")->where == "Downloads / sub", "scan: where it is (" + (find(found, "pack.fbundle") ? find(found, "pack.fbundle")->where : "") + ")");
+
+    std::atomic<uintmax_t> copied{0};
+    std::string name, err;
+    const bool a = importFile(*find(found, "alpha.fenv"), copied, name, err);
+    check(a && name == "alpha.fenv" && text(envs / "alpha.fenv") == "alpha environment" && copied == fs::file_size(dl / "alpha.fenv", ec),
+          "imports alpha.fenv (" + name + err + ")");
+    check(!fs::exists(envs / ".importing", ec), "nothing left half-copied");
+    copied = 0;
+    const bool c = importFile(*find(found, "clash.fenv"), copied, name, err);
+    check(c && name == "clash 2.fenv" && text(envs / "clash 2.fenv") == "the new one" && text(envs / "clash.fenv") == "the old one, longer",
+          "a different one of the same name comes in as \"clash 2.fenv\" (" + name + ")");
+    check(find(scanImports(), "alpha.fenv") && find(scanImports(), "alpha.fenv")->present, "scan again: alpha.fenv is there now");
+    check(find(scanImports(), "clash.fenv") && find(scanImports(), "clash.fenv")->present, "...and clash.fenv, as \"clash 2.fenv\"");
+    ImportFile gone = *find(found, "HOME.APK");
+    fs::remove(gone.path, ec);
+    err.clear();
+    const bool g = importFile(gone, copied, name, err);
+    check(!g && !err.empty() && name.empty() && !fs::exists(envs / "HOME.APK", ec) && !fs::exists(envs / ".importing", ec),
+          "a file that went away fails cleanly (" + err + ")");
+    std::printf("%d of %d checks passed\n", checks - fails, checks);
+    return fails ? 1 : 0;
+}
+
 // Self-check of deleteEnv in a made-up ~/frame-home under `dir` (HOME and the .fenv cache are pointed there).
 int runTestDelete(const fs::path& dirIn) {
     std::error_code ec;
@@ -2335,6 +2682,7 @@ int main(int argc, char** argv) {
         return 0;
     }
     if (a == "--test-delete" && argc > 2) return runTestDelete(argv[2]);
+    if (a == "--test-import" && argc > 2) return runTestImport(argv[2]);
     if (a == "--render" && argc > 2) {   // the panel as it looks now, to a PPM (no SteamVR needed)
         // frame-switcher --render out.ppm [hover] [page] [scroll px] [switching card]
         //   (FH_RENDER_CONFIRM=n: card n asks "Delete?"; FH_RENDER_TOAST=text: a toast; FH_RENDER_UPDATE=1|2: an update
@@ -2345,7 +2693,8 @@ int main(int argc, char** argv) {
         panel.current = currentKey();
         panel.now = Panel::clockNow();
         const int hover = argc > 3 ? std::atoi(argv[3]) : -1;
-        if (argc > 4) panel.page = std::clamp(std::atoi(argv[4]), 0, 2);
+        if (argc > 4) panel.page = std::clamp(std::atoi(argv[4]), 0, 3);
+        if (panel.page == 3) panel.imports = scanImports();
         panel.perf.fromJson(readText(rootDir() / "settings.json"));
         panel.dbg.fromJson(readText(rootDir() / "debug.json"));
         panel.info = readDebugInfo();
@@ -2392,7 +2741,8 @@ int main(int argc, char** argv) {
         const std::string cur = currentKey();
         if (a == "--list") {
             for (size_t i = 0; i < envs.size(); ++i)
-                std::printf("%c %2zu  %-40s %-28s %s\n", envs[i].key == cur ? '*' : ' ', i + 1, envs[i].name.c_str(), envs[i].kind.c_str(),
+                std::printf("%c %2zu  %-40s %-28s %-26s %s\n", envs[i].key == cur ? '*' : ' ', i + 1, envs[i].name.c_str(), envs[i].kind.c_str(),
+                            (envs[i].madeWith.empty() ? std::string() : "[made with " + envs[i].madeWith + (envs[i].tooNew ? ", needs a newer Frame Home]" : "]")).c_str(),
                             [&] { std::string f; for (const auto& x : envs[i].files) f += (f.empty() ? "" : " + ") + x; return f; }().c_str());
             return 0;
         }

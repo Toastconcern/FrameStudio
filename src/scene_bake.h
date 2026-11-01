@@ -11,11 +11,19 @@
 #include <string>
 #include <vector>
 
-constexpr u32 kSceneBakeVersion = 15;  // 2: world; 3: HDR maps as ASTC, binary world; 4: roles; 5: mesh refs; 6: gravity; 7: mesh paths; 8: ambience name; 9: compressed 8-bit lightmaps; 10: reflection cube as ASTC; 11: walkable area (and simplified colliders); 12: prepared and specialized shaders; 13: Clay / glTF CPU animation; 14: wall spots removed; 15: the environment has splats (nothing new in here: they're .fenv members, and a reader older than splats must refuse it rather than show it without them)
-// What a scene is written as: the oldest version that holds it, so one without splats stays 14 (older Frame Homes still
-// open it). A reader of a file needs at least this.
+constexpr u32 kSceneBakeVersion = 16;  // 2: world; 3: HDR maps as ASTC, binary world; 4: roles; 5: mesh refs; 6: gravity; 7: mesh paths; 8: ambience name; 9: compressed 8-bit lightmaps; 10: reflection cube as ASTC; 11: walkable area (and simplified colliders); 12: prepared and specialized shaders; 13: Clay / glTF CPU animation; 14: wall spots removed; 15: the environment has splats (nothing new in here: they're .fenv members, and a reader older than splats must refuse it rather than show it without them); 16: meshes' cullBack (the visibility trim's one-sided meshes)
+// What a scene is written as: the oldest version that holds it, so one without splats or one-sided meshes stays 14
+// (older Frame Homes still open it). A reader of a file needs at least this.
 constexpr u32 kSceneBakeVersionNoSplats = 14;
-inline u32 sceneBakeVersionFor(const HslScene& scene) { return scene.splats.empty() ? kSceneBakeVersionNoSplats : kSceneBakeVersion; }
+constexpr u32 kSceneBakeVersionSplats = 15;
+inline u32 sceneBakeVersionFor(const HslScene& scene, bool cullBack) {
+    return cullBack ? kSceneBakeVersion : scene.splats.empty() ? kSceneBakeVersionNoSplats : kSceneBakeVersionSplats;
+}
+inline u32 sceneBakeVersionFor(const HslScene& scene) {
+    bool cullBack = false;
+    for (const MeshData& m : scene.meshes) cullBack = cullBack || m.cullBack;
+    return sceneBakeVersionFor(scene, cullBack);
+}
 
 struct VisibilityResult;
 struct ObjectEdit;
@@ -33,6 +41,8 @@ bool bakeScene(const HslScene& scene, std::vector<u8>& out, std::string& error, 
 // The mesh optimizer for a save: the visibility pass over the scene's walkable area (Frame Studio's object edits kept
 // whole), its result in `vis` and the options for bakeScene in `options` (the walkable area it was worked out from
 // goes with it: Frame Home must not bake one from the thinned meshes). False when it didn't run (`vis.skipped`).
-// FH_NO_VIS_CULL=1: never.
-bool optimizeForBake(const HslScene& scene, const std::vector<ObjectEdit>* edits, VisibilityResult& vis, BakeOptions& options);
+// FH_NO_VIS_CULL=1: never. pass: the visibility pass's options (its pinned meshes are added to).
+struct VisibilityOptions;
+bool optimizeForBake(const HslScene& scene, const std::vector<ObjectEdit>* edits, VisibilityResult& vis, BakeOptions& options,
+                     const VisibilityOptions* pass = nullptr);
 bool unbakeScene(const u8* data, size_t size, HslScene& scene, std::string& error);

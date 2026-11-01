@@ -39,7 +39,10 @@ template <typename T> struct Table {
     }
 };
 
-void writeMesh(Writer& w, const MeshData& m, Table<TexSource>& tex, Table<std::vector<u16>>& half, const std::vector<u32>* indices = nullptr) {
+// cullBack: written (version 16 on) when the scene holds any one-sided mesh; otherwise the file stays readable by older
+// versions, and none is.
+void writeMesh(Writer& w, const MeshData& m, Table<TexSource>& tex, Table<std::vector<u16>>& half, const std::vector<u32>* indices, int cullBack,
+               const std::vector<float>* normals) {
     w.str(m.name);
     w.str(m.path);
     w.u(static_cast<u32>(m.components.size()));
@@ -81,10 +84,11 @@ void writeMesh(Writer& w, const MeshData& m, Table<TexSource>& tex, Table<std::v
     w.b(m.useBlend); w.b(m.additive); w.b(m.alphaTest); w.f(m.alphaCutoff); w.pod(m.srcAlphaMode); w.f(m.srcFactorA);
     w.pod(m.overlayKind); w.b(m.doubleSided); w.b(m.dynamicVerts); w.pod(m.gltfMeshIndex);
     w.b(m.iblLit); w.b(m.iblFullSpec); w.b(m.bakeLightmapVtx);
-    w.vec(m.uvs2); w.b(m.alphaToCoverage); w.vec(m.normals); w.vec(m.tangents);
+    w.vec(m.uvs2); w.b(m.alphaToCoverage); w.vec(normals ? *normals : m.normals); w.vec(m.tangents);
     w.fa(m.lightmapPower, 3); w.f(m.metallic); w.f(m.roughness); w.f(m.speciblDiffScale); w.f(m.speciblSpecScale);
     w.fa(m.albedoFactor, 3); w.fa(m.curTint, 4); w.b(m.animatedTintAlpha);
     w.fa(m.animXform, 16); w.fa(m.uvXform, 6); w.vec(m.skinBindPos); w.vec(m.skinJoints); w.fa(m.skinBox, 6);
+    if (cullBack >= 0) w.b(cullBack != 0);
 }
 
 void readMesh(Reader& r, MeshData& m, const std::vector<std::shared_ptr<const TexSource>>& tex,
@@ -141,6 +145,7 @@ void readMesh(Reader& r, MeshData& m, const std::vector<std::shared_ptr<const Te
     r.fa(m.lightmapPower, 3); m.metallic = r.f(); m.roughness = r.f(); m.speciblDiffScale = r.f(); m.speciblSpecScale = r.f();
     r.fa(m.albedoFactor, 3); r.fa(m.curTint, 4); m.animatedTintAlpha = r.b();
     if (version >= 13) { r.fa(m.animXform, 16); r.fa(m.uvXform, 6); m.skinBindPos = r.vec<float>(); m.skinJoints = r.vec<float>(); r.fa(m.skinBox, 6); }
+    if (version >= 16) m.cullBack = r.b();
 }
 
 // The world layer in binary (world.json is the editable form): mesh colliders and walkable surfaces are
@@ -281,10 +286,19 @@ bool bakeScene(const HslScene& scene, std::vector<u8>& out, std::string& error, 
     Writer mw{meshBytes};
     Table<TexSource> tex;
     Table<std::vector<u16>> half;
-    for (size_t i = 0; i < s.meshes.size(); ++i) writeMesh(mw, *meshes[i], tex, half, vis && vis->changed[i] ? &vis->indices[i] : nullptr);
+    // one-sided meshes: the scene's own, or the visibility pass's
+    std::vector<char> cull(s.meshes.size(), 0);
+    bool anyCull = false;
+    for (size_t i = 0; i < s.meshes.size(); ++i) {
+        cull[i] = vis && i < vis->cullBack.size() ? vis->cullBack[i] : meshes[i]->cullBack;
+        anyCull = anyCull || cull[i];
+    }
+    for (size_t i = 0; i < s.meshes.size(); ++i)
+        writeMesh(mw, *meshes[i], tex, half, vis && vis->changed[i] ? &vis->indices[i] : nullptr, anyCull ? cull[i] : -1,
+                  vis && vis->changed[i] && i < vis->normals.size() && !vis->normals[i].empty() ? &vis->normals[i] : nullptr);
 
     Writer w{out};
-    w.u(kMagic); w.u(sceneBakeVersionFor(s));
+    w.u(kMagic); w.u(sceneBakeVersionFor(s, anyCull));
     w.u(static_cast<u32>(s.apkPaths.size()));
     for (size_t i = 0; i < s.apkPaths.size(); ++i) {
         w.str(s.apkPaths[i]);
@@ -379,17 +393,20 @@ bool bakeScene(const HslScene& scene, std::vector<u8>& out, std::string& error, 
     return true;
 }
 
-bool optimizeForBake(const HslScene& scene, const std::vector<ObjectEdit>* edits, VisibilityResult& vis, BakeOptions& options) {
+bool optimizeForBake(const HslScene& scene, const std::vector<ObjectEdit>* edits, VisibilityResult& vis, BakeOptions& options,
+                     const VisibilityOptions* pass) {
     vis = VisibilityResult();
     options = BakeOptions();
     if (std::getenv("FH_NO_VIS_CULL")) { vis.skipped = "turned off (FH_NO_VIS_CULL)"; return false; }
     if (scene.animate && !scene.saveAnimation) { vis.skipped = "the home's animation can't be stored (it isn't baked)"; return false; }
     // Everything a CPU animation writes stays whole (and hides nothing): its motion isn't in what's seen from where.
-    VisibilityOptions vo;
+    VisibilityOptions vo = pass ? *pass : VisibilityOptions();
+    if (const char* e = std::getenv("FH_VIS_SPECK")) vo.speck = std::atoi(e);   // diagnostics: the speck limit
     if (scene.saveAnimation) {
         std::vector<u8> anim;
         scene.saveAnimation(anim);
-        vo.pinned = animbake::targets(anim);
+        const std::vector<int> animated = animbake::targets(anim);
+        vo.pinned.insert(vo.pinned.end(), animated.begin(), animated.end());
     }
     const HomeWorld w = walkWorld(scene);
     if (!bakeVisibility(scene, w, w.walkGridCache.get(), edits, vis, vo)) {
@@ -402,9 +419,9 @@ bool optimizeForBake(const HslScene& scene, const std::vector<ObjectEdit>* edits
         vis.changed.assign(vis.changed.size(), 0);
         vis.trisAfter = vis.trisBefore;
     }
-    std::fprintf(stderr, "[optimize] from %zu eye spots: %zu of %zu triangles left out (%.1f%%), %zu meshes emptied, %zu thinned, %.1f s\n",
+    std::fprintf(stderr, "[optimize] from %zu eye spots: %zu of %zu triangles left out (%.1f%%), %zu meshes emptied, %zu thinned, %zu one-sided (%zu triangles turned), %zu merged away, %.1f s\n",
                  vis.samples, vis.trisBefore - vis.trisAfter, vis.trisBefore, vis.trisBefore ? 100.0 * (vis.trisBefore - vis.trisAfter) / vis.trisBefore : 0.0,
-                 vis.meshesEmptied, vis.meshesTouched, vis.ms / 1000);
+                 vis.meshesEmptied, vis.meshesTouched, vis.meshesCulled, vis.trisFlipped, vis.trisMerged, vis.ms / 1000);
     return true;
 }
 

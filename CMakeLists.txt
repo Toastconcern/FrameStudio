@@ -50,6 +50,8 @@ target_include_directories(miniz PUBLIC "${TP}/miniz")
 target_compile_definitions(miniz PRIVATE MINIZ_DISABLE_ZIP_READER_CRC32_CHECKS)
 add_library(smolv STATIC "${TP}/smolv/smolv.cpp")
 target_include_directories(smolv PUBLIC "${TP}/smolv")
+add_library(meshoptimizer STATIC "${TP}/meshoptimizer/simplifier.cpp" "${TP}/meshoptimizer/allocator.cpp")
+target_include_directories(meshoptimizer PUBLIC "${TP}/meshoptimizer")
 
 # astcenc: decoder for the homes' ASTC textures (LDR + HDR lightmaps).
 set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
@@ -104,7 +106,7 @@ target_include_directories(frame-scene PUBLIC
 if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
     set_source_files_properties("${TP}/qhe/cook/hzanim_acl.cpp" PROPERTIES COMPILE_OPTIONS "-flax-vector-conversions")
 endif()
-target_link_libraries(frame-scene PUBLIC miniz lzma zstd smolv ${ASTCENC_LIB} pthread)
+target_link_libraries(frame-scene PUBLIC miniz lzma zstd smolv meshoptimizer ${ASTCENC_LIB} pthread)
 # The SPIRV-Tools optimizer for src/spv_opt.h (FH_SPV_OPT=1 at run time). Off: on the Frame it made no shader any
 # cheaper (Turnip's compiler already does what it does), and it is a large library to build everywhere.
 option(FRAME_SPV_OPT "Build in the SPIRV-Tools shader optimizer (third_party/spirv-tools)" OFF)

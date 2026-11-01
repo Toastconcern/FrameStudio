@@ -81,6 +81,9 @@ for x in frame-home frame-switcher fenv-tool; do
     [ -f "$H/bin/$x.new" ] || continue
     mv -f "$H/bin/$x.new" "$H/bin/$x" || { say "couldn't install $x"; exit 1; }
 done
+# Which Frame Home this is ("v0.2.3"): the panel shows it and tells the environments made with another one apart. A
+# file of its own, not in the programs: the update check's hash of them stays the same from release to release.
+if [ -f "$P/version.txt" ]; then cp -f "$P/version.txt" "$H/version.txt"; else rm -f "$H/version.txt"; fi
 # The compositor layer and its shader (renamed over the old ones: a running compositor keeps its copy).
 layerChanged=0
 if [ -f "$P/layer/libframe_home_layer.so" ]; then

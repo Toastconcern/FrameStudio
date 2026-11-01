@@ -223,7 +223,10 @@ struct WalkGrid {
         auto distAt = [&](int i, int j, float& v) { const WalkSpan* q = walkNear(i, j, y, p.step); if (q) v = q->dist * 0.01f; return q != nullptr; };
         // A cell that isn't floor, beside one that is: the floor's distance to the edge carried on across it (2a - b
         // from the two floor cells in a row towards it), so the edge falls where the distances say — on the straight
-        // line along a wall at an angle, not on the cells' staircase.
+        // line along a wall at an angle, not on the cells' staircase. The fall is at least kMinFall per metre: in a gap
+        // narrower than a cell or two the distances (to its sides) hardly change along it, and carried on as they are
+        // they'd say the floor runs on past the gap's end, a knob of floor poking into the furniture.
+        constexpr float kMinFall = 0.4f;          // a wall more than ~24 degrees off the direction still carries on as it is
         auto outside = [&](int ci, int cj) {
             static const int dirs[8][2] = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}, {1, 1}, {1, -1}, {-1, 1}, {-1, -1}};
             float sum = 0;
@@ -232,7 +235,7 @@ struct WalkGrid {
                 float a, b;
                 if (!distAt(ci + d[0], cj + d[1], a)) continue;
                 const float stepLen = d[0] && d[1] ? p.cell * 1.41421f : p.cell;
-                const float est = distAt(ci + 2 * d[0], cj + 2 * d[1], b) && b > a + 1e-4f ? 2 * a - b : a - stepLen;
+                const float est = distAt(ci + 2 * d[0], cj + 2 * d[1], b) && b > a + 1e-4f ? a - std::max(b - a, kMinFall * stepLen) : a - stepLen;
                 sum += std::min(est, 0.5f * p.cell);
                 ++n;
             }
@@ -537,13 +540,20 @@ struct WalkGrid {
             }
             runs.clear();
         };
+        // The cells whose floors can reach into a quad: its 4 corners, then the ring of 12 round them (field() reads
+        // the 3 x 3 cells round the nearest centre, so the area can run into a quad none of whose corners is floor;
+        // without the ring that quad went undrawn and the floor beside it ended on a straight cell side).
+        static const int kReach[16][2] = {{0, 0}, {1, 0}, {1, 1}, {0, 1},
+                                          {-1, -1}, {0, -1}, {1, -1}, {2, -1}, {2, 0}, {2, 1}, {2, 2}, {1, 2}, {0, 2}, {-1, 2}, {-1, 1}, {-1, 0}};
         for (int z = 0; z + 1 < nz; drawRuns(z), ++z)
             for (int x = 0; x + 1 < nx; ++x)
-                for (int k0 = 0; k0 < 4; ++k0)
-                    for (const WalkSpan* s0 = begin(x + kx[k0], z + kz[k0]); s0 != end(x + kx[k0], z + kz[k0]); ++s0) {
+                for (int k0 = 0; k0 < 16; ++k0) {
+                    const int sx = x + kReach[k0][0], sz = z + kReach[k0][1];
+                    if (!inside(sx, sz)) continue;
+                    for (const WalkSpan* s0 = begin(sx, sz); s0 != end(sx, sz); ++s0) {
                         if (!(s0->flags & (kWalkOk | kWalkNear))) continue;
-                        bool earlier = false;                      // this level is drawn from an earlier corner
-                        for (int j = 0; j < k0 && !earlier; ++j) earlier = walkNear(x + kx[j], z + kz[j], s0->hi, p.step) != nullptr;
+                        bool earlier = false;                      // this level is drawn from an earlier cell
+                        for (int j = 0; j < k0 && !earlier; ++j) earlier = walkNear(x + kReach[j][0], z + kReach[j][1], s0->hi, p.step) != nullptr;
                         if (earlier) continue;
                         float h[4];
                         bool bridged = false, all = true;
@@ -610,6 +620,7 @@ struct WalkGrid {
                                     if (cut[q] && leaves[q] && cut[(q + 1) % n]) edge(poly[q], poly[(q + 1) % n]);
                             }
                     }
+                }
     }
 
 private:
@@ -1186,7 +1197,7 @@ inline std::shared_ptr<WalkGrid> buildWalkGrid(const std::vector<WalkSource>& so
             std::vector<uint32_t> fill(cellStart.begin(), cellStart.end() - 1);
             for (uint32_t i = 0; i < sites.size(); ++i) byCell[fill[cellOfSite(sites[i])]++] = i;
         }
-        std::vector<uint32_t> near;
+        std::vector<uint32_t> nearby;   // (not "near": windows.h defines that away)
         std::vector<Site> fitted = sites;
         constexpr float kR = 3.5f;
         std::vector<uint32_t> mark(nsp, 0);                            // floors within 4 cells of the point's own, over the floor
@@ -1208,7 +1219,7 @@ inline std::shared_ptr<WalkGrid> buildWalkGrid(const std::vector<WalkSource>& so
                 ring.swap(nextRing);
             }
             double n = 0, mx = 0, mz = 0;
-            near.clear();
+            nearby.clear();
             for (int bz = std::max(0, static_cast<int>(std::floor(a.z - kR))); bz <= std::min(nz - 1, static_cast<int>(std::floor(a.z + kR))); ++bz)
                 for (int bx = std::max(0, static_cast<int>(std::floor(a.x - kR))); bx <= std::min(nx - 1, static_cast<int>(std::floor(a.x + kR))); ++bx) {
                     const size_t c = static_cast<size_t>(bz) * nx + bx;
@@ -1217,13 +1228,13 @@ inline std::shared_ptr<WalkGrid> buildWalkGrid(const std::vector<WalkSource>& so
                         const Site& b = sites[j];
                         if ((b.x - a.x) * (b.x - a.x) + (b.z - a.z) * (b.z - a.z) > kR * kR || std::fabs(cs_[b.s].hi - ha) > P.step) continue;
                         if (mark[b.s] != epoch || b.nx * a.nx + b.nz * a.nz < 0) continue;   // another edge (past a wall)
-                        near.push_back(j); n += 1; mx += b.x; mz += b.z;
+                        nearby.push_back(j); n += 1; mx += b.x; mz += b.z;
                     }
                 }
             if (n < 6) continue;
             mx /= n; mz /= n;
             double sxx = 0, szz = 0, sxz = 0;
-            for (uint32_t j : near) { const double dx = sites[j].x - mx, dz = sites[j].z - mz; sxx += dx * dx; szz += dz * dz; sxz += dx * dz; }
+            for (uint32_t j : nearby) { const double dx = sites[j].x - mx, dz = sites[j].z - mz; sxx += dx * dx; szz += dz * dz; sxz += dx * dz; }
             const double tr = sxx + szz, det = sxx * szz - sxz * sxz, disc = std::sqrt(std::max(0.0, tr * tr / 4 - det));
             const double l1 = tr / 2 + disc, l2 = tr / 2 - disc;          // spread along the line, and across it
             if (l1 <= 1e-9 || l2 / l1 > 0.06 || l2 / n > 0.2) continue; // not a line (a corner, a curve), or not a thin one
@@ -1339,7 +1350,25 @@ inline std::shared_ptr<WalkGrid> buildWalkGrid(const std::vector<WalkSource>& so
             if (keep[r]) { ++rep.areas; rep.walkArea += area[r]; } else { ++rep.unreached; rep.unreachedArea += area[r]; }
         }
     }
-    // The floors round a kept area that are too near its edge to stand on: the edge runs over them.
+    // The floors round a kept area that are too near its edge to stand on: the edge runs over them. Only those a body
+    // standing in the area can cover: inside the clear disc round some standing spot (a core floor's distance to the
+    // edge), so the area runs right up to a wall but a sliver of floor seen through a gap narrower than the body (under
+    // furniture, between slats) is left out, not drawn as a knob poking into it.
+    const int coverReach = static_cast<int>(std::ceil((P.radius + 1.5f * cs) / cs));
+    const float coverSlack = 0.25f * cs;   // the cells' centres don't sit on the edge: a quarter cell either way
+    auto covered = [&](size_t s) {
+        const float h = cs_[s].hi;
+        for (int dz = -coverReach; dz <= coverReach; ++dz)
+            for (int dx = -coverReach; dx <= coverReach; ++dx) {
+                const int x = spanX[s] + dx, z = spanZ[s] + dz;
+                if (x < 0 || z < 0 || x >= nx || z >= nz) continue;
+                const float apart = std::sqrt(static_cast<float>(dx * dx + dz * dz)) * cs;
+                const size_t cell = static_cast<size_t>(z) * nx + x;
+                for (uint32_t c = cstart[cell]; c < cstart[cell + 1]; ++c)
+                    if (core[c] && keep[region[c]] && std::fabs(cs_[c].hi - h) <= P.step && apart <= dist[c] + coverSlack) return true;
+            }
+        return false;
+    };
     std::vector<uint8_t> nearEdge(nsp, 0);
     {
         std::vector<int32_t> ring, nextRing;
@@ -1350,7 +1379,7 @@ inline std::shared_ptr<WalkGrid> buildWalkGrid(const std::vector<WalkSource>& so
             for (int32_t s : ring)
                 for (int d = 0; d < 4; ++d) {
                     const int32_t b = con[s][d];
-                    if (b >= 0 && cand[b] && !core[b] && !nearEdge[b]) { nearEdge[b] = 1; nextRing.push_back(b); }
+                    if (b >= 0 && cand[b] && !core[b] && !nearEdge[b] && covered(static_cast<size_t>(b))) { nearEdge[b] = 1; nextRing.push_back(b); }
                 }
             ring.swap(nextRing);
         }

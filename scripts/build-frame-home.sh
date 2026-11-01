@@ -55,6 +55,9 @@ compile_layer -O2 -shared -fPIC -std=c++17 -fvisibility=hidden \
     "$ROOT/layer/frame_home_layer.cpp" -o "$PAYLOAD/layer/libframe_home_layer.so" -lpthread
 glslc "$ROOT/layer/env_ps.frag" -o "$PAYLOAD/layer/env_ps.spv"
 cp "$ROOT/frame/payload/install.sh" "$PAYLOAD/install.sh"
+# Its version, as the release is named ($FRAME_VERSION; else as cmake/frame_version.cmake works it out)
+VERSION_NAME=${FRAME_VERSION:-$(cmake -P "$ROOT/cmake/frame_version.cmake" 2>&1 | sed -n 's/^-- Version: //p')}
+printf '%s\n' "${VERSION_NAME:-v$(cat "$ROOT/VERSION")}" > "$PAYLOAD/version.txt"
 chmod +x "$PAYLOAD/install.sh" "$PAYLOAD/bin/"*
 
 for binary in "$PAYLOAD/bin/"* "$PAYLOAD/layer/libframe_home_layer.so"; do
@@ -110,6 +113,7 @@ import zipfile
 required = {
     "FrameHome-installer/payload/install.sh",
     "FrameHome-installer/payload/build-info.txt",
+    "FrameHome-installer/payload/version.txt",
     "FrameHome-installer/payload/bin/frame-home",
     "FrameHome-installer/payload/bin/frame-switcher",
     "FrameHome-installer/payload/bin/fenv-tool",

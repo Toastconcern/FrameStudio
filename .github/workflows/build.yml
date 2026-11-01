@@ -238,7 +238,8 @@ jobs:
       REPO: ${{ github.repository }}
     steps:
       # Every push to main is also a numbered release: VERSION (major.minor) and the commits since VERSION last
-      # changed, so the commit that bumps it is .0 (cmake/frame_version.cmake works out the same for the apps).
+      # changed, not counting "[skip ci]" ones (never released), so the commit that bumps it is .0 and each release is
+      # one more than the last (cmake/frame_version.cmake works out the same for the apps).
       - name: Check out history (for the version number)
         if: github.ref == 'refs/heads/main'
         uses: actions/checkout@v4
@@ -249,7 +250,7 @@ jobs:
         if: github.ref == 'refs/heads/main'
         run: |
           bump=$(git -C src log -1 --format=%H -- VERSION)
-          version="v$(tr -d ' \r\n' < src/VERSION).$(git -C src rev-list --count "$bump..HEAD")"
+          version="v$(tr -d ' \r\n' < src/VERSION).$(git -C src rev-list --count --invert-grep --fixed-strings '--grep=[skip ci]' "$bump..HEAD")"
           echo "VERSION_TAG=$version" >> "$GITHUB_ENV"
           echo "$version"
       - name: Download Studio build artifacts

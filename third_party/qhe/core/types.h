@@ -333,6 +333,9 @@ struct MeshData {
     // solid blob that covers the whole interior ("fully dark"); culled, it shows only edge rims.
     // (OPA meshes keep the default true => CULL_NONE, unchanged.)
     bool doubleSided = true;
+    // Only its front is ever seen from anywhere the player can be (Frame Studio's visibility trim, visibility_bake.h):
+    // the renderer culls its back faces. Separate from doubleSided, which is the material's own say (glTF).
+    bool cullBack = false;
 
     // Dynamic vertices: positions are rewritten every frame (glTF skeletal animation).
     // The renderer keeps this mesh's VBO persistently mapped so an external animator can

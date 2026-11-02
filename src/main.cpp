@@ -18,6 +18,7 @@
 #include "locomotion.h"
 #include "panorama.h"
 #include "core/audio.h"
+#include "video_screens.h"
 #include "env_export.h"
 #include "perf_settings.h"
 #include "thermal.h"
@@ -172,7 +173,7 @@ bool homeEditsFor(const HslScene& scene, const std::string& apk, HomeEdits& edit
 }
 
 // Applies Frame Studio's "<home>.edits.json" (moved / deleted objects), when the home has one.
-void applyEdits(HslRenderer& r, const HslScene& scene, const std::string& apk) {
+void applyEdits(HslRenderer& r, HslScene& scene, const std::string& apk) {
     HomeEdits edits;
     std::string path;
     if (!homeEditsFor(scene, apk, edits, path)) return;
@@ -184,6 +185,10 @@ void applyEdits(HslRenderer& r, const HslScene& scene, const std::string& apk) {
             r.setMeshWorld(i, e.world);
             r.setMeshVisible(i, !e.deleted);
             ++applied;
+        }
+        if (e.hasVideo) {   // a video screen's sound, as set in Studio
+            MeshData& md = scene.meshes[e.index];
+            md.videoNear = e.video[0]; md.videoFar = e.video[1]; md.videoVolume = e.video[2];
         }
     }
     LOG("applied %zu of %zu object edits", applied, edits.objects.size());
@@ -1207,6 +1212,7 @@ int runVr(const std::vector<std::string>& apks, bool system = false) {
     HomeWorld pendingWalk;                           // the loaded home's world with its walkable area (worker-made)
     HomeSounds pendingSounds;                        // ...and its sounds, decoded
     HomeReport pendingReport;                        // ...and its report (report.json, for the Debug page)
+    VideoScreens videos;                            // the home's video screens: their pictures and their sound
     AudioPlayer ambience, addedSound;               // the home's own ambience; a background sound added in Frame Studio
     std::string playingSound;                        // the added sound's file + stamp, as playing
     float soundBase[2] = {1, 1};                     // the home's and the added sound's own volumes (times g_volume)
@@ -1278,6 +1284,7 @@ int runVr(const std::vector<std::string>& apks, bool system = false) {
         } else if (edits != shownEdits && scene) {   // only the edits changed: re-apply in place
             resetMeshes(r, *scene);
             applyEdits(r, *scene, want.front());
+            videos.sync(r, *scene);                        // (restarted only if a screen was hidden, shown or changed)
             shownEdits = edits;
             // The sounds: volumes change as they play; a new sound (or the home's own back on) is decoded aside.
             HomeEdits e;
@@ -1333,9 +1340,16 @@ int runVr(const std::vector<std::string>& apks, bool system = false) {
     ThermalGovernor heat;
     auto lastHeat = std::chrono::steady_clock::now();
     auto applyFoveation = [&] { r.setFoveationStrength(std::min(3.0f, fovBase() + fovExtra + heat.extra())); };
+    // How far the GPU budget may push foveation: a level past the setting, never past 2.5 (at 3 the coarse rings come
+    // close in round where you look and the edges go to a quarter of the resolution: plain to see, gaze or not). Past
+    // that, auto resolution lowers the resolution; a fixed one drops the odd frame rather than look blocky.
+    auto fovGpuRoom = [&] { return fovBase() + fovExtra < std::min(2.5f, fovBase() + 1.0f) - 1e-3f; };
+    int overWindows = 0;                             // budget windows over in a row (one alone: a hitch, not a heavy home)
+    int tuneFrames = 0, tuneLate = 0;                // frames shown since the last tuning, and how many came late (stutter)
     auto lastDown = lastTune;
     bool gazeOk = false;
     float gazeSmooth[2][2] = {{-1, -1}, {-1, -1}};   // pixels: restarted when the resolution changes
+    std::chrono::steady_clock::time_point gazeLost;   // when the eye tracker last stopped answering (0: it answers)
     uint32_t gazeW = 0;
     uint64_t gpuSeen = 0;
     bool restart = false, lostDevice = false, quitAsked = false;
@@ -1452,6 +1466,7 @@ int runVr(const std::vector<std::string>& apks, bool system = false) {
             worker.join();
             if (loadState == 2) {
                 r.setDynamicMeshes(pending->animatedMeshes);   // Clay / glTF animation: re-uploaded each frame
+                videos.stop();                                 // (the last home's screens: their meshes are going)
                 r.beginLoad(*pending);
                 scene.reset();                                 // the old home's meshes are gone from the GPU now
                 uploading = true;
@@ -1517,6 +1532,7 @@ int runVr(const std::vector<std::string>& apks, bool system = false) {
                     }
                 }
                 applyEdits(r, *scene, shown.front());
+                videos.start(r, *scene);
                 if (perf.autoResolution) {   // where this home settled last time, else 100%
                     const auto it = autoScales.find(homeKey());
                     const float start = it != autoScales.end() ? it->second : 1.0f;
@@ -1622,6 +1638,11 @@ int runVr(const std::vector<std::string>& apks, bool system = false) {
             gpuN = 0;
             const double p95 = gpuWindow.pct(0.95);
             gpuWindow.clear();
+            // Frames you'd see stutter: more than 1 in 100 late in the window. The GPU time alone isn't the signal (it
+            // swings with the GPU's clocks and the compositor's own work: a light home read as "busy" and got coarser
+            // edges for nothing); coarser edges are for when frames are really being missed.
+            const bool stuttering = tuneFrames > 0 && tuneLate * 100 > tuneFrames;
+            tuneFrames = tuneLate = 0;
             if (perf.autoResolution && avg > 0 && now > settleUntil) {
                 // Every new size is new images for the compositor (a hitch), so the size settles: GPU time follows
                 // the pixel count (scale squared), each change aims for the middle of the band at once, going down
@@ -1633,7 +1654,7 @@ int runVr(const std::vector<std::string>& apks, bool system = false) {
                 if (avg > budget * hi || p95 > budget * (hi + 0.25)) {
                     calmWindows = 0;
                     lastDown = now;
-                    if (r.foveationActive() && fovBase() + fovExtra < 3) {
+                    if (r.foveationActive() && fovGpuRoom() && stuttering) {
                         fovExtra += 0.5f;
                         applyFoveation();
                         LOG("auto resolution: GPU %.2f ms (p95 %.2f) of %.2f: foveation %.2g first", avg, p95, budget, r.foveationStrength());
@@ -1665,21 +1686,26 @@ int runVr(const std::vector<std::string>& apks, bool system = false) {
             } else if (!perf.autoResolution && r.foveationActive() && avg > 0 && now > settleUntil) {
                 // A fixed resolution stays as chosen, but a home too heavy for it would drop frames (stutter): the edges
                 // of view get coarser first (stronger foveation; where you look stays sharp), and go back when there's room.
-                const double hi = system ? 0.65 : 0.9, lo = system ? 0.4 : 0.6;
-                if ((avg > budget * hi || p95 > budget * (hi + 0.25)) && fovBase() + fovExtra < 3) {
+                // Up only after two windows over in a row, down only after a long calm (the coarser edges themselves
+                // make the GPU time drop: going straight back would pump the detail in and out every few seconds).
+                const double hi = system ? 0.65 : 0.9;
+                const bool over = stuttering && (avg > budget * hi || p95 > budget * (hi + 0.25));
+                overWindows = over ? overWindows + 1 : 0;
+                if (over && overWindows >= 2 && fovGpuRoom()) {
+                    overWindows = 0;
                     fovExtra += 0.5f;
                     applyFoveation();
                     LOG("fixed resolution, GPU %.2f ms (p95 %.2f) of %.2f: foveation %.2g", avg, p95, budget, r.foveationStrength());
                     settleUntil = now + std::chrono::seconds(2);
                     calmWindows = 0;
                     lastDown = now;
-                } else if (avg < budget * lo && fovExtra > 0 && ++calmWindows >= 3 && now - lastDown > std::chrono::seconds(10)) {
+                } else if (!stuttering && fovExtra > 0 && ++calmWindows >= 5 && now - lastDown > std::chrono::seconds(30)) {
                     calmWindows = 0;
                     fovExtra = std::max(0.0f, fovExtra - 0.5f);
                     applyFoveation();
                     LOG("fixed resolution, GPU %.2f ms of %.2f: foveation back to %.2g", avg, budget, r.foveationStrength());
                     settleUntil = now + std::chrono::seconds(2);
-                } else if (avg >= budget * lo) {
+                } else if (stuttering) {
                     calmWindows = 0;
                 }
             }
@@ -1863,6 +1889,7 @@ int runVr(const std::vector<std::string>& apks, bool system = false) {
         Mat4 rig;
         loco.rig(rig.m);
         const Mat4 headWorld = mul(rig, head);
+        videos.update(r, &headWorld.m[12], &headWorld.m[0], g_volume, g_audioMuted.load());
         if (system) {
             env.state()->fade = static_cast<uint32_t>(fade * loco.blinkLevel() * 1000);
             // How the rig moves this frame (not your body): its smooth turn, and where the head's spot in the room
@@ -1915,7 +1942,15 @@ int runVr(const std::vector<std::string>& apks, bool system = false) {
             // Where each eye looks, in its image: the gaze (eye tracked), else straight ahead through the lens.
             float go[3], gt[3];
             gazeOk = perf.foveation == 2 && loco.gaze(go, gt);
-            for (int e = 0; e < 2; ++e) {
+            // A blink or a lost track for a moment: where you were looking stays sharp (it jumping to the lens centre and
+            // back showed); only after half a second without a gaze does it go to the centre.
+            bool hold = false;
+            if (gazeOk) gazeLost = std::chrono::steady_clock::time_point{};
+            else if (perf.foveation == 2 && gazeSmooth[0][0] >= 0) {
+                if (gazeLost == std::chrono::steady_clock::time_point{}) gazeLost = std::chrono::steady_clock::now();
+                hold = std::chrono::steady_clock::now() - gazeLost < std::chrono::milliseconds(500);   // (the centres stay as they are)
+            }
+            for (int e = 0; e < 2 && !hold; ++e) {
                 const Mat4 eyeT = mul(head, eyeToHead[e]);   // eye pose in standing space
                 float d[3] = {0, 0, -1};                     // eye space: straight ahead
                 if (gazeOk) {
@@ -2096,7 +2131,8 @@ int runVr(const std::vector<std::string>& apks, bool system = false) {
             const auto le = std::chrono::steady_clock::now();
             const double loopMs = std::chrono::duration<double, std::milli>(le - loopStart).count();
             lastLoopMs = loopMs;
-            if (fade >= 0.99f && loopMs > 1.5 * 1000.0 / hz * frameStride) ++statHitchShown;   // a frame you could see, late (stuttered)
+            if (fade >= 0.99f && loopMs > 1.5 * 1000.0 / hz * frameStride) { ++statHitchShown; ++tuneLate; }   // a frame you could see, late (stuttered)
+            if (fade >= 0.99f) ++tuneFrames;
             prof.frame(r, loopMs, animMs, r.lastGpuMs(), gpuNew);
             loopStart = le;
             prof.report(system ? (uploading ? "system(loading)" : "system") : "scene");

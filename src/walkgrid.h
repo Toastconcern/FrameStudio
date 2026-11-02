@@ -383,6 +383,33 @@ struct WalkGrid {
         return found;
     }
 
+    // Where to stand up from a seat at pos (its sitting point) facing yaw (0: -Z): the nearest good spot, in front first
+    // and then round to the sides, behind last (at 0.45 to 1.1 m: off the seat, not across the room). Good: on the area
+    // at the floor the seat stands on, with the way to it from the seat's front edge on the area too (not over a coffee
+    // table or round a corner). out: the spot on the floor. False: there's none (the seat is walled in).
+    bool standUpSpot(const float pos[3], float yaw, float out[3]) const {
+        const float floorY = pos[1] - 0.45f;                               // (a seat is about knee height)
+        static const float kAngles[] = {0, 20, -20, 40, -40, 65, -65, 90, -90, 120, -120, 150, -150, 180};   // degrees off its front
+        static const float kOut[] = {0.45f, 0.6f, 0.75f, 0.9f, 1.1f};
+        const float c = std::cos(yaw), s = std::sin(yaw);
+        for (float deg : kAngles) {
+            const float a = deg * 3.14159265f / 180;
+            // the seat's front (-Z, turned by yaw) turned by a
+            const float fx = -s, fz = -c, dx = fx * std::cos(a) - fz * std::sin(a), dz = fx * std::sin(a) + fz * std::cos(a);
+            for (float d : kOut) {
+                const float x = pos[0] + dx * d, z = pos[2] + dz * d;
+                float h;
+                if (!floorAt(x, z, floorY + p.step, p.step, p.step + 0.3f, h) || !walkable(x, z, h)) continue;
+                bool clear = true;                                         // the way there, standable, from 0.35 m out (past the seat's edge)
+                for (float t = 0.35f; t < d && clear; t += 0.1f) clear = walkable(pos[0] + dx * t, pos[2] + dz * t, h);
+                if (!clear) continue;
+                out[0] = x; out[1] = h; out[2] = z;
+                return true;
+            }
+        }
+        return false;
+    }
+
     // A head (the eyes at (x, y, z), a ball of radius r) with nothing solid in it: how far to move it over XZ, to the
     // nearest place where nothing solid at its height (a wall, a shelf, a lamp, a table top bent over; not the floors
     // you stand on) is closer than r. False: it's clear already (or there's no clear place within 0.6 m).
@@ -823,7 +850,8 @@ inline void walkShapeMesh(const WorldCollider& c, std::vector<float>& pos, std::
 // they're on are kept (none: the one at `anchor`, else the biggest). anchor: the middle of the home (the reach is
 // measured from it; default the first seed, else the origin).
 inline std::shared_ptr<WalkGrid> buildWalkGrid(const std::vector<WalkSource>& sources, const std::vector<std::array<float, 3>>& seeds,
-                                               const WalkParams& P, WalkReport* report = nullptr, const float* anchorIn = nullptr) {
+                                               const WalkParams& P, WalkReport* report = nullptr, const float* anchorIn = nullptr,
+                                               const std::vector<WalkStroke>* paint = nullptr) {
     using namespace walkgrid_detail;
     const auto t0 = std::chrono::steady_clock::now();
     WalkReport rep;
@@ -860,6 +888,13 @@ inline std::shared_ptr<WalkGrid> buildWalkGrid(const std::vector<WalkSource>& so
         lo[0] = std::min(lo[0], sd[0] - 2); hi[0] = std::max(hi[0], sd[0] + 2);
         lo[1] = std::min(lo[1], sd[2] - 2); hi[1] = std::max(hi[1], sd[2] + 2);
     }
+    if (paint)                                                         // so is floor painted where nothing is
+        for (const WalkStroke& k : *paint) {
+            if (k.erase) continue;
+            const float r = std::clamp(k.radius, 0.01f, 20.0f);
+            lo[0] = std::min(lo[0], k.pos[0] - r); hi[0] = std::max(hi[0], k.pos[0] + r);
+            lo[1] = std::min(lo[1], k.pos[2] - r); hi[1] = std::max(hi[1], k.pos[2] + r);
+        }
     if (lo[0] > hi[0]) { if (report) *report = rep; return g; }
     const float R_ox = std::floor(lo[0] / cs) * cs - cs, R_oz = std::floor(lo[1] / cs) * cs - cs;
     const int nx = static_cast<int>(std::ceil((hi[0] - R_ox) / cs)) + 2, nz = static_cast<int>(std::ceil((hi[1] - R_oz) / cs)) + 2;
@@ -960,7 +995,101 @@ inline std::shared_ptr<WalkGrid> buildWalkGrid(const std::vector<WalkSource>& so
         }
         cstart[ncell] = static_cast<uint32_t>(cs_.size());
     };
+    // The floor brush's dabs (HomeWorld::walkPaint), in order, onto the surface under each: a painted top is a floor
+    // the way a drawn floor is (stood on at any slope, kept even on furniture or where nobody starts, right up to its
+    // edge); an erased one is no floor at all (nor bridged over). A dab takes the top it touched and the tops within
+    // its radius joined to that one a step or less apart (a slope, a stair), not a table beside it or a floor below.
+    std::vector<uint8_t> painted;                                     // per span: 0 untouched, 1 painted, 2 erased
+    auto applyPaint = [&] {
+        painted.assign(cs_.size(), 0);
+        if (!paint) return;
+        std::vector<std::pair<uint32_t, int32_t>> stack;              // (span, its cell's x + z * nx)
+        std::vector<uint32_t> visit(cs_.size(), 0);                   // the dab (1-based) that last reached it
+        uint32_t dab = 0;
+        for (const WalkStroke& k : *paint) {
+            ++dab;
+            const float r = std::clamp(k.radius, 0.01f, 20.0f);
+            const int R = static_cast<int>(std::ceil(r / cs)) + 1;
+            const int cx = static_cast<int>(std::floor((k.pos[0] - R_ox) / cs)), cz = static_cast<int>(std::floor((k.pos[2] - R_oz) / cs));
+            auto inDab = [&](int x, int z) {
+                if (x < 0 || z < 0 || x >= nx || z >= nz) return false;
+                const float dx = R_ox + (x + 0.5f) * cs - k.pos[0], dz = R_oz + (z + 0.5f) * cs - k.pos[2];
+                return dx * dx + dz * dz <= std::max(r * r, 0.25f * cs * cs);
+            };
+            // the top it touched: nearest its height in the cells round its centre
+            uint32_t first = UINT32_MAX;
+            int32_t firstCell = -1;
+            float bd = 0.3f;
+            for (int z = cz - 1; z <= cz + 1; ++z)
+                for (int x = cx - 1; x <= cx + 1; ++x) {
+                    if (x < 0 || z < 0 || x >= nx || z >= nz) continue;
+                    const size_t cell = static_cast<size_t>(z) * nx + x;
+                    for (uint32_t s = cstart[cell]; s < cstart[cell + 1]; ++s)
+                        if (!(cs_[s].flags & kWalkWall) && std::fabs(cs_[s].hi - k.pos[1]) + (x != cx || z != cz ? 0.05f : 0) < bd) { bd = std::fabs(cs_[s].hi - k.pos[1]); first = s; firstCell = static_cast<int32_t>(cell); }
+                }
+            if (first == UINT32_MAX) continue;
+            const uint8_t mark = k.erase ? 2 : 1;
+            stack.assign(1, {first, firstCell});
+            visit[first] = dab;
+            painted[first] = mark;
+            while (!stack.empty()) {
+                const uint32_t s = stack.back().first;
+                const int x = stack.back().second % nx, z = stack.back().second / nx;
+                stack.pop_back();
+                static const int d4[4][2] = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}};
+                for (const auto& d : d4) {
+                    const int xx = x + d[0], zz = z + d[1];
+                    if (!inDab(xx, zz) || std::abs(xx - cx) > R || std::abs(zz - cz) > R) continue;
+                    const size_t c2 = static_cast<size_t>(zz) * nx + xx;
+                    uint32_t best = UINT32_MAX;
+                    float bh = P.step + 1e-4f;
+                    for (uint32_t s2 = cstart[c2]; s2 < cstart[c2 + 1]; ++s2)
+                        if (!(cs_[s2].flags & kWalkWall) && std::fabs(cs_[s2].hi - cs_[s].hi) < bh) { bh = std::fabs(cs_[s2].hi - cs_[s].hi); best = s2; }
+                    if (best == UINT32_MAX || visit[best] == dab) continue;
+                    visit[best] = dab;
+                    painted[best] = mark;
+                    stack.push_back({best, static_cast<int32_t>(c2)});
+                }
+            }
+        }
+        for (size_t s = 0; s < cs_.size(); ++s) if (painted[s] == 1) cs_[s].flags |= kWalkUp | kWalkFloorRole;
+    };
     compact();
+    applyPaint();
+    // Floor painted where there's nothing to paint on (over a gap, water, open air): a floor at the dab's height in each
+    // of its cells with no surface within a step of it, so a floor can be carried on past its edge at its own level.
+    // A dab that touched a surface makes it only over a drop (nothing within kOverDrop below): the brush's edge reaching
+    // past a table top or a stair onto the floor under it paints no floor in the air round it.
+    constexpr float kOverDrop = 1.0f;
+    if (paint) {
+        bool added = false;
+        const auto anyNear = [&](size_t cell, float lo, float hi) {
+            for (uint32_t s = cstart[cell]; s < cstart[cell + 1]; ++s) if (cs_[s].hi >= lo && cs_[s].lo <= hi) return true;
+            return false;
+        };
+        for (const WalkStroke& k : *paint) {
+            if (k.erase) continue;
+            bool onSurface = false;   // (the dab's own cell: something within a step of where it touched)
+            {
+                const int cx = static_cast<int>(std::floor((k.pos[0] - R_ox) / cs)), cz = static_cast<int>(std::floor((k.pos[2] - R_oz) / cs));
+                if (cx >= 0 && cz >= 0 && cx < nx && cz < nz) onSurface = anyNear(static_cast<size_t>(cz) * nx + cx, k.pos[1] - P.step, k.pos[1] + P.step);
+            }
+            const float r = std::clamp(k.radius, 0.01f, 20.0f);
+            const int x0 = std::max(0, static_cast<int>(std::floor((k.pos[0] - r - R_ox) / cs))), x1 = std::min(nx - 1, static_cast<int>(std::floor((k.pos[0] + r - R_ox) / cs)));
+            const int z0 = std::max(0, static_cast<int>(std::floor((k.pos[2] - r - R_oz) / cs))), z1 = std::min(nz - 1, static_cast<int>(std::floor((k.pos[2] + r - R_oz) / cs)));
+            for (int z = z0; z <= z1; ++z)
+                for (int x = x0; x <= x1; ++x) {
+                    const float dx = R_ox + (x + 0.5f) * cs - k.pos[0], dz = R_oz + (z + 0.5f) * cs - k.pos[2];
+                    if (dx * dx + dz * dz > std::max(r * r, 0.25f * cs * cs)) continue;
+                    const size_t cell = static_cast<size_t>(z) * nx + x;
+                    if (anyNear(cell, k.pos[1] - P.step, k.pos[1] + P.step)) continue;   // (something there: painted onto)
+                    if (onSurface && anyNear(cell, k.pos[1] - kOverDrop, k.pos[1])) continue;   // (a floor just under it: no drop)
+                    addAt(cell, k.pos[1], k.pos[1], kWalkUp, -1);
+                    added = true;
+                }
+        }
+        if (added) { compact(); applyPaint(); }
+    }
     // 2. A span is a floor where it's stood on, isn't a wall, and has headroom.
     std::vector<uint8_t> cand;
     auto ceilOf = [&](size_t s, size_t cell) { return s + 1 < cstart[cell + 1] ? cs_[s + 1].lo : 1e30f; };
@@ -968,7 +1097,8 @@ inline std::shared_ptr<WalkGrid> buildWalkGrid(const std::vector<WalkSource>& so
         cand.assign(cs_.size(), 0);
         for (size_t i = 0; i < ncell; ++i)
             for (uint32_t s = cstart[i]; s < cstart[i + 1]; ++s)
-                cand[s] = (cs_[s].flags & kWalkUp) && !(cs_[s].flags & (kWalkWall | kWalkFurniture)) && ceilOf(s, i) - cs_[s].hi >= P.headroom;
+                cand[s] = (cs_[s].flags & kWalkUp) && !(cs_[s].flags & (kWalkWall | kWalkFurniture)) && painted[s] != 2 &&
+                          ceilOf(s, i) - cs_[s].hi >= P.headroom;
     };
     findCand();
 
@@ -1048,6 +1178,7 @@ inline std::shared_ptr<WalkGrid> buildWalkGrid(const std::vector<WalkSource>& so
             }
             rep.bridgedArea = bridged * cs * cs;
             compact();
+            applyPaint();
             findCand();
             for (size_t s = 0; s < cs_.size(); ++s) if (!cand[s]) cs_[s].flags &= static_cast<uint8_t>(~kWalkBridged);
         }
@@ -1316,7 +1447,7 @@ inline std::shared_ptr<WalkGrid> buildWalkGrid(const std::vector<WalkSource>& so
                 const int32_t s = stack.back();
                 stack.pop_back();
                 area[id] += cs * cs;
-                if (cs_[s].flags & kWalkFloorRole) keep[id] = 1;
+                if (cs_[s].flags & kWalkFloorRole) keep[id] |= painted[s] == 1 ? 4 : 1;   // (painted by hand: kept however small)
                 for (int d = 0; d < 4; ++d) {
                     const int32_t b = con[s][d];
                     if (b >= 0 && core[b] && region[b] < 0) { region[b] = id; stack.push_back(b); }

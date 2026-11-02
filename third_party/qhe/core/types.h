@@ -336,6 +336,11 @@ struct MeshData {
     // Only its front is ever seen from anywhere the player can be (Frame Studio's visibility trim, visibility_bake.h):
     // the renderer culls its back faces. Separate from doubleSided, which is the material's own say (glTF).
     bool cullBack = false;
+    // A video screen (Frame Studio's Import Video, src/video_clip.h): its picture is the playing video's frame, and its
+    // sound is heard round it — all of it within videoNear metres of the screen, fading to nothing at videoFar.
+    // video: the .fvid file (a baked scene stores its .fenv member name, "videos/<file>"); "" for every other mesh.
+    std::string video;
+    float videoNear = 2.0f, videoFar = 8.0f, videoVolume = 1.0f;
 
     // Dynamic vertices: positions are rewritten every frame (glTF skeletal animation).
     // The renderer keeps this mesh's VBO persistently mapped so an external animator can

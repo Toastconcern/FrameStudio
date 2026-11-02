@@ -35,6 +35,9 @@ struct ObjectEdit {
     bool deleted = false;
     float pivot[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
     float world[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+    // A video screen's sound (MeshData::videoNear / videoFar / videoVolume), as set in Studio: "video": [near, far, volume].
+    bool hasVideo = false;
+    float video[3] = {2, 8, 1};
 };
 
 struct HomeSound {
@@ -172,6 +175,7 @@ inline bool saveHomeEdits(const std::string& path, const HomeEdits& e) {
         mat(x.pivot);
         o << ",\n      \"world\": ";
         mat(x.world);
+        if (x.hasVideo) o << ",\n      \"video\": [" << x.video[0] << ", " << x.video[1] << ", " << x.video[2] << "]";
         o << " }";
     }
     o << "\n  ]";
@@ -232,6 +236,7 @@ inline bool loadHomeEdits(const std::string& path, HomeEdits& out) {
                             : k == "deleted" ? r.boolean(x.deleted)
                             : k == "pivot" ? r.floats(x.pivot, 16)
                             : k == "world" ? r.floats(x.world, 16)
+                            : k == "video" ? (x.hasVideo = r.floats(x.video, 3))
                             : r.skip();
                     if (!ok) return false;
                 } while (r.eat(','));

@@ -304,6 +304,10 @@ static void addClayPrograms(HslScene& scene) {
     p.frag.assign(std::begin(kClayFragSpirv), std::end(kClayFragSpirv));
     scene.programs[p.path] = p;
 }
+std::string addModelPrograms(HslScene& scene) {
+    if (!scene.programs.count(kClayProgram)) addClayPrograms(scene);
+    return kClayProgram;
+}
 // (only when a model uses them: a scene without vertex colours bakes exactly as before)
 static void addVColorPrograms(HslScene& scene) {
     ShaderProgramSrc p;
@@ -337,6 +341,10 @@ static bool loadFenv(const std::string& path, HslScene& scene, std::string& erro
         if (!blob.empty() && !f.read(reinterpret_cast<char*>(blob.data()), static_cast<std::streamsize>(blob.size()))) blob.clear();
         if (!unbakeScene(blob.data(), blob.size(), scene, error)) { error += ": " + path; return false; }
         scene.sourceFiles.resize(scene.apkPaths.size());
+        // video screens name their clip as its member ("videos/<file>"): now the file it was unpacked to
+        const std::filesystem::path dir = std::filesystem::u8path(m.scene).parent_path();
+        for (MeshData& md : scene.meshes)
+            if (!md.video.empty()) md.video = (dir / std::filesystem::u8path(md.video)).u8string();
     } else {
         std::vector<std::string> all = sources;
         all.insert(all.end(), models.begin(), models.end());
@@ -901,7 +909,7 @@ std::shared_ptr<const WalkGrid> bakeWalkGrid(const HslScene& scene, const HomeWo
     walkColliderSources(cw, src, sp, si, static_cast<int>(scene.meshes.size()));
     // (a vista's meshes aren't sources, so the colliders' extent counts like the meshes': a home whose floor and
     // furniture are all Studio surfaces is all colliders)
-    return buildWalkGrid(src, walkSeeds(world), params, report);
+    return buildWalkGrid(src, walkSeeds(world), params, report, nullptr, &world.walkPaint);
 }
 
 // Baked walkable areas, kept between opens (a big home's bake is most of a second): keyed by this build, every file

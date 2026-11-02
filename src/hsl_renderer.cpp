@@ -552,6 +552,58 @@ HslRenderer::Image HslRenderer::createTextureFmt(const void* pixels, uint32_t w,
     return t.img;
 }
 
+// A video screen's image (RGBA8 sRGB, one level: each frame replaces it whole), with its first frame in.
+HslRenderer::Image HslRenderer::createVideoTexture(const u8* rgba, uint32_t w, uint32_t h) {
+    Image img = createImage2D(w, h, 1, 1, VK_SAMPLE_COUNT_1_BIT, VK_FORMAT_R8G8B8A8_SRGB, VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                              VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_VIEW_TYPE_2D);
+    if (!img.image) return img;
+    Buffer staging = createBuffer(static_cast<VkDeviceSize>(w) * h * 4, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, true);
+    if (!staging.buf) { destroy(img); return Image{}; }
+    std::memcpy(staging.mapped, rgba, static_cast<size_t>(w) * h * 4);
+    oneShot([&](VkCommandBuffer c) {
+        imageBarrier(c, img.image, VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 1, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0,
+                     VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+        VkBufferImageCopy copy = {};
+        copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        copy.imageExtent = {w, h, 1};
+        vkCmdCopyBufferToImage(c, staging.buf, img.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+        imageBarrier(c, img.image, VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 1, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                     VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+    });
+    retire(staging);
+    return img;
+}
+
+bool HslRenderer::setVideoFrame(size_t i, std::vector<u8>& rgba) {
+    if (i >= meshes_.size() || meshes_[i].video < 0) return false;
+    VideoTex& v = videos_[static_cast<size_t>(meshes_[i].video)];
+    if (rgba.size() != static_cast<size_t>(v.w) * v.h * 4) return false;
+    v.next.swap(rgba);
+    v.dirty = true;
+    return true;
+}
+
+// The frames set since the last render go up in this frame's commands, through the upload ring (a full ring: next frame).
+void HslRenderer::pumpVideos() {
+    for (VideoTex& v : videos_) {
+        if (!v.dirty || !ring_.mapped) continue;
+        const VkDeviceSize bytes = v.next.size(), at = (ringHead_ + 255) & ~VkDeviceSize(255);
+        if (at + bytes > kRingSize) continue;
+        std::memcpy(static_cast<u8*>(ring_.mapped) + at, v.next.data(), static_cast<size_t>(bytes));
+        ringHead_ = at + bytes;
+        imageBarrier(cmd_, v.img.image, VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 1, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                     VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+        VkBufferImageCopy copy = {};
+        copy.bufferOffset = at;
+        copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        copy.imageExtent = {v.w, v.h, 1};
+        vkCmdCopyBufferToImage(cmd_, ring_.buf, v.img.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+        imageBarrier(cmd_, v.img.image, VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 1, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                     VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+        v.dirty = false;
+    }
+}
+
 // 1x1-per-face cube: +Y top, -Y bottom, the four sides `side` (a hemisphere light: bright sky, dim ground).
 HslRenderer::Image HslRenderer::createSolidCube(const float top[3], const float side[3], const float bottom[3]) {
     Image img = createImage2D(1, 1, 6, 1, VK_SAMPLE_COUNT_1_BIT, VK_FORMAT_R16G16B16A16_SFLOAT,
@@ -1931,6 +1983,16 @@ VkImageView HslRenderer::textureFor(const spv::Resource& r, GpuMesh& gm, const M
         }
         return upload(rgba, w, h, srgb);
     };
+    // A video screen's picture: its own image, one level, rewritten with each new frame (setVideoFrame).
+    if (isBase && !md.video.empty() && md.texW && md.texH && md.texRGBA.size() >= static_cast<size_t>(md.texW) * md.texH * 4) {
+        Image img = createVideoTexture(md.texRGBA.data(), md.texW, md.texH);
+        if (img.view) {
+            gm.images.push_back(img);
+            gm.video = static_cast<int>(videos_.size());
+            videos_.push_back({img, md.texW, md.texH, {}, false});
+            return img.view;
+        }
+    }
     VkImageView v = VK_NULL_HANDLE;
     if (isRbao) v = md.hasOrm ? map(md.ormSrc, md.ormRGBA, md.ormW, md.ormH, false, white_.view) : white_.view;
     else if (isEmissive) v = md.hasEmissive ? map(md.emissiveSrc, md.emissiveRGBA, md.emissiveW, md.emissiveH, true, black_.view) : black_.view;
@@ -3210,7 +3272,7 @@ bool HslRenderer::uploadMesh(const MeshData& md, int sceneIndex) {
     // copy, at the same depth, shaded every one of its pixels a second time to the same colour. It stays loaded (a
     // home edit can hide or move the first one) but isn't drawn while the first shows it (render()).
     static const bool noDedupe = std::getenv("FH_NO_DEDUPE") != nullptr;   // A/B: every copy drawn
-    if (!noDedupe && !gm.dynamic && !gm.skybox && gm.blend == 0 && gm.skinUbo < 0 && !md.hasVat) {
+    if (!noDedupe && !gm.dynamic && !gm.skybox && gm.blend == 0 && gm.skinUbo < 0 && !md.hasVat && gm.video < 0) {
         uint64_t h = 0xcbf29ce484222325ull;
         auto mix = [&h](const void* p, size_t n) {
             const u8* b = static_cast<const u8*>(p);
@@ -3237,7 +3299,7 @@ bool HslRenderer::uploadMesh(const MeshData& md, int sceneIndex) {
     }
     // (see-through ones too: the hand tutorials' thousand-odd plants are alpha-blended; FH_NO_BLEND_BATCH=1 for A/B)
     static const bool noBlendBatch = std::getenv("FH_NO_BLEND_BATCH") != nullptr;
-    if (p.clay && !gm.dynamic && !gm.skybox && (gm.blend == 0 || !noBlendBatch) && gm.skinUbo < 0 && !md.hasVat && gm.dupOf < 0) {   // (buildBatches)
+    if (p.clay && !gm.dynamic && !gm.skybox && (gm.blend == 0 || !noBlendBatch) && gm.skinUbo < 0 && !md.hasVat && gm.dupOf < 0 && gm.video < 0) {   // (buildBatches)
         uint64_t h = 0xcbf29ce484222325ull;
         auto mix = [&h](const void* q, size_t n) {
             const u8* b = static_cast<const u8*>(q);
@@ -3492,6 +3554,7 @@ void HslRenderer::unload() {
     sel_.mesh = -1;
     sel_.edgeCount = sel_.triCount = 0;
     meshes_.clear();
+    videos_.clear();                                       // (their images were the meshes', freed above)
     for (Batch& b : batches_) {   // (its set2 is its first part's, freed above; a sorted one's ibo is one of its sortIbo)
         destroy(b.gm.vbo);
         if (b.sorted) { for (Buffer& sb : b.sortIbo) destroy(sb); } else destroy(b.gm.ibo);
@@ -3866,6 +3929,7 @@ bool HslRenderer::canRecordEarly() {
         std::lock_guard<std::mutex> l(jobMutex_);   // (decoded textures waiting to go up)
         if (!done_.empty()) return no("decoded textures to upload");
     }
+    for (const VideoTex& v : videos_) if (v.dirty) return no("a video frame to upload");   // (the ring is the last frame's till it's done)
     if (fdmOn_ && !fdmOffset_ && fdm_.image && (!fdmInit_ || fdmCopyRecorded_ || fdmWantKey() != fdmKey_)) return no("the density map changes");
     return true;
 }
@@ -4037,6 +4101,7 @@ void HslRenderer::render(const EyeView eyes[2], float timeSec) {
     lastUploads_ = 0;
     lastUploadMB_ = 0;
     if (!early) pumpTextures(preloading_ ? (uploadsUnseen_ ? 40.0 : 14.0) : 3.0);
+    if (!early) pumpVideos();
     if (preloading_ && waiting_.empty()) {
         preloading_ = false;
         LOG("all %zu textures loaded", texturesRequested_);

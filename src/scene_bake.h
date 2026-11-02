@@ -11,13 +11,26 @@
 #include <string>
 #include <vector>
 
-constexpr u32 kSceneBakeVersion = 16;  // 2: world; 3: HDR maps as ASTC, binary world; 4: roles; 5: mesh refs; 6: gravity; 7: mesh paths; 8: ambience name; 9: compressed 8-bit lightmaps; 10: reflection cube as ASTC; 11: walkable area (and simplified colliders); 12: prepared and specialized shaders; 13: Clay / glTF CPU animation; 14: wall spots removed; 15: the environment has splats (nothing new in here: they're .fenv members, and a reader older than splats must refuse it rather than show it without them); 16: meshes' cullBack (the visibility trim's one-sided meshes)
+constexpr u32 kSceneBakeVersion = 17;  // 2: world; 3: HDR maps as ASTC, binary world; 4: roles; 5: mesh refs; 6: gravity; 7: mesh paths; 8: ambience name; 9: compressed 8-bit lightmaps; 10: reflection cube as ASTC; 11: walkable area (and simplified colliders); 12: prepared and specialized shaders; 13: Clay / glTF CPU animation; 14: wall spots removed; 15: the environment has splats (nothing new in here: they're .fenv members, and a reader older than splats must refuse it rather than show it without them); 16: meshes' cullBack (the visibility trim's one-sided meshes); 17: video screens (MeshData::video, the .fvid a .fenv member) and the world's painted floor (walkPaint)
 // What a scene is written as: the oldest version that holds it, so one without splats or one-sided meshes stays 14
 // (older Frame Homes still open it). A reader of a file needs at least this.
 constexpr u32 kSceneBakeVersionNoSplats = 14;
 constexpr u32 kSceneBakeVersionSplats = 15;
+constexpr u32 kSceneBakeVersionCullBack = 16;
+// Version 17 holds video screens and painted floor: needed only by a scene with either.
+inline bool sceneNeedsV17(const HslScene& scene) {
+    if (!scene.world.walkPaint.empty()) return true;
+    for (const MeshData& m : scene.meshes) if (!m.video.empty()) return true;
+    return false;
+}
 inline u32 sceneBakeVersionFor(const HslScene& scene, bool cullBack) {
-    return cullBack ? kSceneBakeVersion : scene.splats.empty() ? kSceneBakeVersionNoSplats : kSceneBakeVersionSplats;
+    if (sceneNeedsV17(scene)) return kSceneBakeVersion;
+    return cullBack ? kSceneBakeVersionCullBack : scene.splats.empty() ? kSceneBakeVersionNoSplats : kSceneBakeVersionSplats;
+}
+// The .fenv member a video screen's clip is stored as (a baked scene names it so).
+inline std::string videoMemberName(const std::string& file) {
+    const size_t slash = file.find_last_of("/\\");
+    return "videos/" + (slash == std::string::npos ? file : file.substr(slash + 1));
 }
 inline u32 sceneBakeVersionFor(const HslScene& scene) {
     bool cullBack = false;

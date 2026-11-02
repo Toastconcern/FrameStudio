@@ -81,6 +81,10 @@ struct HslScene {
     HomeWorld world;                    // spawns, seats, colliders, walkable areas (Meta's, or a .fenv's world.json)
 };
 
+// The built-in unlit programs imported models draw with (added to the scene when it hasn't them); the plain one's
+// path, for a mesh made in Frame Studio (a video screen) to draw with.
+std::string addModelPrograms(HslScene& scene);
+
 // Loads one or more APKs as a single home (footprint + vista). Returns false (with `error`) when an APK
 // is not an HSL home or fails to parse.
 bool loadHslScene(const std::vector<std::string>& apkPaths, HslScene& scene, std::string& error);

@@ -66,6 +66,11 @@ public:
     // and the static batches rebuilt (waits for the GPU).
     void updateMeshIndices(const std::vector<int>& sceneIndices);
     void reloadSplats();
+    // Video screens (MeshData::video): the next frame of draw index i's video (RGBA8, the size of its first), shown from
+    // the next render() on. Taken (swapped in, no copy: `rgba` comes back with the buffer it replaced). False when i
+    // isn't a video screen or the size is wrong (rgba left alone).
+    bool setVideoFrame(size_t i, std::vector<u8>& rgba);
+    bool meshIsVideo(size_t i) const { return i < meshes_.size() && meshes_[i].video >= 0; }
     // Renders both eyes; the result is left in `colorImage()` layers 0 (left) / 1 (right), TRANSFER_SRC layout.
     void render(const EyeView eyes[2], float timeSec);
     // Late pose (system mode): asked inside render() for the eyes to draw from, just before the frame's view goes to
@@ -295,6 +300,7 @@ private:
         bool inView = true;                         // passed the view-frustum test this frame
         std::vector<std::pair<const TexSource*, bool>> wants;   // streamed textures still to request
         int skinUbo = -1;                           // index in ubos of the sbSkinningMatrices buffer
+        int video = -1;                             // a video screen: its videos_ entry
         bool alphaToCoverage = false;               // cut-out foliage (SHAD pass state)
         bool dynamic = false;                       // animated on the CPU: host-visible vertices, rewritten per frame
         uint32_t posGen = 0, uvGen = 0;             // the MeshData posGen / uvGen its vertex buffer holds
@@ -607,6 +613,11 @@ private:
     // One persistent upload buffer, reused every frame (as WebGPU's writeTexture does): per-texture staging
     // allocations made Windows page memory in and out and held the GPU queue for seconds.
     static constexpr VkDeviceSize kRingSize = 256ull << 20;
+    // Video screens' pictures: each its own image (one of its mesh's images), and the frame waiting to go up.
+    struct VideoTex { Image img; uint32_t w = 0, h = 0; std::vector<u8> next; bool dirty = false; };
+    std::vector<VideoTex> videos_;
+    Image createVideoTexture(const u8* rgba, uint32_t w, uint32_t h);
+    void pumpVideos();
     Buffer ring_;
     VkDeviceSize ringHead_ = 0;
     void recordTextureUpload(VkCommandBuffer c, const PreparedTex& t);

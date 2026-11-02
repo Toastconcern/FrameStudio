@@ -4,6 +4,34 @@ Newest first. When this file changed since the last release, the next release's 
 and the notes post to the Discord's #releases channel: add a section at the top in the push you want announced.
 The version: VERSION (major.minor) and the commits since VERSION changed, so the commit that bumps VERSION is .0.
 
+## v0.2.2
+
+### Frame Studio and Frame Home
+- New: video screens. File › Import › Video or Moving Picture puts an MP4, MOV, WebM, MKV, AVI, WMV or GIF on a screen
+  on the wall you're looking at (or standing in front of you), playing on a loop with its sound. Move, turn, scale,
+  hide or delete it like anything else. Each screen has an audio area: walk into it and the sound slowly comes up,
+  walk away and it fades out (Full sound within / Silent beyond in the Video section; the view shows both as rings
+  round it). A GIF or any clip can be given a sound file to play with it (Add a Sound).
+- Draw Floor works like the auto floor: drag over any surface to paint walkable floor onto it, Shift+drag to erase
+  floor, without selecting anything first. Painted floor stays on furniture, slopes and small patches, and you can paint
+  past a floor's edge over a gap or open air to carry it on at its own level; what you paint is saved with the home and
+  kept when the area is made again. Clear Painted Floor takes it all back.
+- Draw Wall and Draw Seats (press B again to switch): drag a line on the floor for an invisible wall along it (its
+  height adjustable), click a cushion for a seat facing you, or drag along a sofa or bench for a row of seats.
+- Trimming is 1.5–3× faster, and takes out more: stray triangles sealed inside things (glimpsed only at their outline),
+  and the parts of see-through and cut-out things that are always behind something solid. Homes look the same from
+  everywhere you can stand.
+- Opening another environment leaves nothing of the last one's trimming behind (Put Back, the red view).
+- Standing up from a seat puts you somewhere you can stand: in front when there's room, else beside it (round a coffee
+  table, not on it), behind last. New seats find their spot themselves; a seat's Find a Spot button finds it again.
+- Draw mode draws, Arrange mode moves: nothing can be moved, turned or scaled while drawing (the gizmo and the panel's
+  fields wait for Arrange). The Draw button and its tooltip say what it draws (Floor, Wall or Seats).
+- Eye-tracked foveation stays at your setting in a home that runs smoothly: the edges only get coarser when frames are
+  really being missed, at most a level past your setting, and they don't pump sharper and blurrier every few seconds.
+  A blink no longer makes the sharp spot jump to the middle of view.
+- Fixed: two Frame Studio windows open at once could both close when the mouse went over the other one.
+- Environments with video screens or painted floor need this Frame Home or newer (an older one says so).
+
 ## v0.2.1
 
 ### Frame Studio and Frame Home

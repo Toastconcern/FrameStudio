@@ -432,8 +432,9 @@ inline bool fenvParseManifest(const std::string& json, FenvManifest& m) {
 
 // The features this build reads (FenvManifest::needs), and the ones a manifest asks for that it doesn't ("" none).
 inline const std::vector<std::string>& fenvFeatures() {
-    // splats: Gaussian splat members; one-sided: a trimmed scene (meshes drawn one side only, scene format 16)
-    static const std::vector<std::string> known = {"splats", "one-sided"};
+    // splats: Gaussian splat members; one-sided: a trimmed scene (meshes drawn one side only, scene format 16);
+    // videos: video screens (.fvid members, src/video_clip.h; a baked scene's format 17)
+    static const std::vector<std::string> known = {"splats", "one-sided", "videos"};
     return known;
 }
 // Who made it, as shown: "Frame Studio v0.2.3", or "made before v0.2" (the version wasn't written then).
@@ -625,10 +626,13 @@ struct FenvMember {
 
 namespace fenv_detail {
 // What the manifest says of the members themselves: the baked scene's (m.scene) format, and from format 16 on that its
-// meshes may be drawn one side only ("one-sided": a Frame Home before that can't open it, and says so).
+// meshes may be drawn one side only ("one-sided": a Frame Home before that can't open it, and says so); a video
+// screen's clip among them, that it has videos ("videos").
 inline FenvManifest withNeeds(const FenvManifest& m, const std::vector<FenvMember>& members) {
     FenvManifest out = m;
     for (const FenvMember& f : members) {
+        const bool video = f.name.size() > 5 && f.name.compare(f.name.size() - 5, 5, ".fvid") == 0;
+        if (video && std::find(out.needs.begin(), out.needs.end(), "videos") == out.needs.end()) out.needs.push_back("videos");
         if (f.name != m.scene || f.bytes.size() < 8) continue;
         uint32_t magic = 0, version = 0;
         std::memcpy(&magic, f.bytes.data(), 4);

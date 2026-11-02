@@ -42,7 +42,7 @@ template <typename T> struct Table {
 // cullBack: written (version 16 on) when the scene holds any one-sided mesh; otherwise the file stays readable by older
 // versions, and none is.
 void writeMesh(Writer& w, const MeshData& m, Table<TexSource>& tex, Table<std::vector<u16>>& half, const std::vector<u32>* indices, int cullBack,
-               const std::vector<float>* normals) {
+               const std::vector<float>* normals, bool v17) {
     w.str(m.name);
     w.str(m.path);
     w.u(static_cast<u32>(m.components.size()));
@@ -88,7 +88,8 @@ void writeMesh(Writer& w, const MeshData& m, Table<TexSource>& tex, Table<std::v
     w.fa(m.lightmapPower, 3); w.f(m.metallic); w.f(m.roughness); w.f(m.speciblDiffScale); w.f(m.speciblSpecScale);
     w.fa(m.albedoFactor, 3); w.fa(m.curTint, 4); w.b(m.animatedTintAlpha);
     w.fa(m.animXform, 16); w.fa(m.uvXform, 6); w.vec(m.skinBindPos); w.vec(m.skinJoints); w.fa(m.skinBox, 6);
-    if (cullBack >= 0) w.b(cullBack != 0);
+    if (cullBack >= 0 || v17) w.b(cullBack > 0);
+    if (v17) { w.str(m.video.empty() ? std::string() : videoMemberName(m.video)); w.f(m.videoNear); w.f(m.videoFar); w.f(m.videoVolume); }
 }
 
 void readMesh(Reader& r, MeshData& m, const std::vector<std::shared_ptr<const TexSource>>& tex,
@@ -146,6 +147,7 @@ void readMesh(Reader& r, MeshData& m, const std::vector<std::shared_ptr<const Te
     r.fa(m.albedoFactor, 3); r.fa(m.curTint, 4); m.animatedTintAlpha = r.b();
     if (version >= 13) { r.fa(m.animXform, 16); r.fa(m.uvXform, 6); m.skinBindPos = r.vec<float>(); m.skinJoints = r.vec<float>(); r.fa(m.skinBox, 6); }
     if (version >= 16) m.cullBack = r.b();
+    if (version >= 17) { m.video = r.str(); m.videoNear = r.f(); m.videoFar = r.f(); m.videoVolume = r.f(); }
 }
 
 // The world layer in binary (world.json is the editable form): mesh colliders and walkable surfaces are
@@ -166,7 +168,8 @@ int sameMesh(const WorldCollider& c, const std::vector<MeshData>& meshes) {
     return -1;
 }
 
-void writeWorld(Writer& w, const HomeWorld& wd, const std::vector<MeshData>& meshes, const std::vector<char>* thinned, const std::string& walkGrid) {
+void writeWorld(Writer& w, const HomeWorld& wd, const std::vector<MeshData>& meshes, const std::vector<char>* thinned, const std::string& walkGrid,
+                bool v17) {
     w.str(wd.origin);
     for (const auto* list : {&wd.spawns, &wd.seats, &wd.hotspots}) {
         w.u(static_cast<u32>(list->size()));
@@ -186,6 +189,10 @@ void writeWorld(Writer& w, const HomeWorld& wd, const std::vector<MeshData>& mes
     for (const WorldGravity& g : wd.gravity) { w.str(g.name); w.pod(g.kind); w.fa(g.world, 16); w.fa(g.half, 3); w.f(g.radius); w.pod(g.priority); }
     w.f(wd.fallLimit);
     w.str(walkGrid);
+    if (v17) {
+        w.u(static_cast<u32>(wd.walkPaint.size()));
+        for (const WalkStroke& k : wd.walkPaint) { w.fa(k.pos, 3); w.f(k.radius); w.b(k.erase); }
+    }
 }
 
 void readWorld(Reader& r, HomeWorld& wd, u32 version, std::vector<std::pair<size_t, int>>& refs) {
@@ -215,6 +222,10 @@ void readWorld(Reader& r, HomeWorld& wd, u32 version, std::vector<std::pair<size
     if (version >= 11) {   // its mesh colliders were simplified by the bake
         wd.walkGrid = r.str();
         for (WorldCollider& c : wd.colliders) c.simplified = c.kind == WorldCollider::Mesh;
+    }
+    if (version >= 17) {
+        wd.walkPaint.resize(r.count(17));
+        for (WalkStroke& k : wd.walkPaint) { if (r.bad) break; r.fa(k.pos, 3); k.radius = r.f(); k.erase = r.b(); }
     }
     worldAdoptLegacyWalkable(wd);
 }
@@ -293,9 +304,10 @@ bool bakeScene(const HslScene& scene, std::vector<u8>& out, std::string& error, 
         cull[i] = vis && i < vis->cullBack.size() ? vis->cullBack[i] : meshes[i]->cullBack;
         anyCull = anyCull || cull[i];
     }
+    const bool v17 = sceneNeedsV17(s);
     for (size_t i = 0; i < s.meshes.size(); ++i)
         writeMesh(mw, *meshes[i], tex, half, vis && vis->changed[i] ? &vis->indices[i] : nullptr, anyCull ? cull[i] : -1,
-                  vis && vis->changed[i] && i < vis->normals.size() && !vis->normals[i].empty() ? &vis->normals[i] : nullptr);
+                  vis && vis->changed[i] && i < vis->normals.size() && !vis->normals[i].empty() ? &vis->normals[i] : nullptr, v17);
 
     Writer w{out};
     w.u(kMagic); w.u(sceneBakeVersionFor(s, anyCull));
@@ -321,7 +333,7 @@ bool bakeScene(const HslScene& scene, std::vector<u8>& out, std::string& error, 
         std::string walkGrid = options && !options->walkGrid.empty() ? options->walkGrid : s.world.walkGrid;
         if (walkGrid.empty())
             if (const std::shared_ptr<const WalkGrid> g = bakeWalkGrid(s, world, WalkParams{})) walkGrid = encodeWalkGrid(*g);
-        writeWorld(w, world, s.meshes, vis ? &vis->changed : nullptr, walkGrid);
+        writeWorld(w, world, s.meshes, vis ? &vis->changed : nullptr, walkGrid, v17);
     }
     // The shaders as the Frame's GPU runs them (shader_bake.h): each program's prepared forms, and per distinct set
     // of material values its meshes have, the fragment shader with them baked in.
@@ -401,7 +413,10 @@ bool optimizeForBake(const HslScene& scene, const std::vector<ObjectEdit>* edits
     if (scene.animate && !scene.saveAnimation) { vis.skipped = "the home's animation can't be stored (it isn't baked)"; return false; }
     // Everything a CPU animation writes stays whole (and hides nothing): its motion isn't in what's seen from where.
     VisibilityOptions vo = pass ? *pass : VisibilityOptions();
+    if (!pass) vo.threads = std::max(1, static_cast<int>(std::thread::hardware_concurrency()) - 1);   // (an offline bake: every core but one)
     if (const char* e = std::getenv("FH_VIS_SPECK")) vo.speck = std::atoi(e);   // diagnostics: the speck limit
+    if (const char* e = std::getenv("FH_VIS_FARMERGE")) vo.farMerge = std::atoi(e) != 0;   // diagnostics: merging by distance off
+    if (const char* e = std::getenv("FH_VIS_POCKET")) vo.pocket = static_cast<float>(std::atof(e));   // diagnostics: the sealed-in reach (0 off)
     if (scene.saveAnimation) {
         std::vector<u8> anim;
         scene.saveAnimation(anim);
@@ -419,9 +434,9 @@ bool optimizeForBake(const HslScene& scene, const std::vector<ObjectEdit>* edits
         vis.changed.assign(vis.changed.size(), 0);
         vis.trisAfter = vis.trisBefore;
     }
-    std::fprintf(stderr, "[optimize] from %zu eye spots: %zu of %zu triangles left out (%.1f%%), %zu meshes emptied, %zu thinned, %zu one-sided (%zu triangles turned), %zu merged away, %.1f s\n",
+    std::fprintf(stderr, "[optimize] from %zu eye spots: %zu of %zu triangles left out (%.1f%%), %zu meshes emptied, %zu thinned, %zu one-sided (%zu triangles turned), %zu merged away, %zu sealed in, %.1f s\n",
                  vis.samples, vis.trisBefore - vis.trisAfter, vis.trisBefore, vis.trisBefore ? 100.0 * (vis.trisBefore - vis.trisAfter) / vis.trisBefore : 0.0,
-                 vis.meshesEmptied, vis.meshesTouched, vis.meshesCulled, vis.trisFlipped, vis.trisMerged, vis.ms / 1000);
+                 vis.meshesEmptied, vis.meshesTouched, vis.meshesCulled, vis.trisFlipped, vis.trisMerged, vis.pocketed, vis.ms / 1000);
     return true;
 }
 

@@ -1,4 +1,5 @@
 #include "model_import.h"
+#include "video_clip.h"
 
 #define CGLTF_IMPLEMENTATION
 #include "cgltf.h"
@@ -613,6 +614,32 @@ bool importSkyPanorama(const std::string& path, std::vector<MeshData>& meshes, s
     return true;
 }
 
+// A video (src/video_clip.h) as a screen: one upright quad 1.6 m across (as tall as the picture's shape says), its
+// middle at the origin and its front facing +Z, showing the first frame; the players draw the rest (MeshData::video).
+bool importVideo(const std::string& path, std::vector<MeshData>& meshes, std::vector<std::string>& files, std::string& error) {
+    VideoClip clip;
+    if (!clip.open(path, &error)) return false;
+    Image img;
+    if (!clip.frame(0, img.rgba)) { error = "the video's first frame doesn't decode: " + path; return false; }
+    img.w = clip.width;
+    img.h = clip.height;
+    constexpr float kWidth = 1.6f;
+    const float hw = kWidth * 0.5f, hh = hw * clip.height / clip.width;
+    MeshData md;
+    md.name = fs::u8path(path).stem().u8string();
+    md.path = md.name + " (video)";
+    md.positions = {-hw, hh, 0, hw, hh, 0, hw, -hh, 0, -hw, -hh, 0};
+    md.uvs = {0, 0, 1, 0, 1, 1, 0, 1};
+    md.normals = {0, 0, 1, 0, 0, 1, 0, 0, 1, 0, 0, 1};
+    md.indices = {0, 2, 1, 0, 3, 2};
+    const float white[4] = {1, 1, 1, 1};
+    finish(md, &img, white, false, false, 0.5f);
+    md.video = path;
+    meshes.push_back(std::move(md));
+    files.push_back(path);
+    return true;
+}
+
 }  // namespace
 
 bool isSkyPanoramaPath(const std::string& path) {
@@ -624,7 +651,7 @@ bool isSkyPanoramaPath(const std::string& path) {
 
 bool isModelPath(const std::string& path) {
     const std::string ext = lower(fs::u8path(path).extension().u8string());
-    return ext == ".gltf" || ext == ".glb" || ext == ".fbx" || ext == ".obj" || ext == ".stl" || ext == ".ply" || isSkyPanoramaPath(path);
+    return ext == ".gltf" || ext == ".glb" || ext == ".fbx" || ext == ".obj" || ext == ".stl" || ext == ".ply" || ext == ".fvid" || isSkyPanoramaPath(path);
 }
 
 bool importModel(const std::string& path, std::vector<MeshData>& meshes, std::vector<std::string>& files, std::string& error) {
@@ -638,6 +665,7 @@ bool importModel(const std::string& path, std::vector<MeshData>& meshes, std::ve
         if (ext == ".fbx" || ext == ".obj") return importUfbx(path, meshes, files, error);
         if (ext == ".stl") return importStl(path, meshes, files, error);
         if (ext == ".ply") return importPly(path, meshes, files, error);
+        if (ext == ".fvid") return importVideo(path, meshes, files, error);
         error = "unsupported model type: " + path;
         return false;
     } catch (const std::exception&) {

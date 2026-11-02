@@ -324,6 +324,12 @@ static ImGuiViewport* ImGui_ImplWin32_FindViewportByPlatformHandle(HWND hwnd)
     // We could use ImGui::FindViewportByPlatformHandle() but GetPropA() gets us closer to parallel multi-contexts,
     // until we can pass an explicit context to FindViewportByPlatformHandle().
     //return ImGui::FindViewportByPlatformHandle((void*)hwnd);
+    // FRAME STUDIO PATCH: only our own windows. Another process's ImGui window (a second Frame Studio) carries the same
+    // property, holding a pointer into ITS memory: read here it crashed both (the mouse over the other one's window).
+    DWORD pid = 0;
+    ::GetWindowThreadProcessId(hwnd, &pid);
+    if (pid != ::GetCurrentProcessId())
+        return nullptr;
     return (ImGuiViewport*)::GetPropA(hwnd, "IMGUI_VIEWPORT");
 }
 

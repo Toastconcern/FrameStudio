@@ -8,11 +8,17 @@
 // (a branch, a rail: pixel centres can miss it) when it touches a pixel where it's nearest. Spots 35 cm
 // apart at four heights, checked against renders from random places in between: no pixel changes. What no spot sees
 // goes: single triangles of still, solid meshes (the backs of walls, under floors, the hidden side of a surface built
-// two-sided, the inside of closed shapes), and whole meshes of anything else (see-through, cut-out, moved by its
-// shader) whose widened bounds no spot sees (box against the depths, an edge looked past by a pixel). Also gone, seen
-// or not: a solid mesh's triangle drawn over exactly by a later one of the same mesh (coveredTwins). Never touched:
-// the sky, animated, skinned and edited meshes. Vertices aren't removed (a shader may number them): only index lists
-// shrink.
+// two-sided, the inside of closed shapes), whole meshes of anything else (see-through, cut-out, moved by its shader)
+// whose widened bounds no spot sees (box against the depths, an edge looked past by a pixel), and of a still
+// see-through or cut-out mesh seen, the triangles always behind the solid depth (5 cm of slack, a pixel round). Also
+// gone, seen or not: a solid mesh's triangle drawn over exactly by a later one of the same mesh (coveredTwins), and one
+// only the thin look kept (at an outline) that's sealed inside its object (every way out of it meets geometry within
+// half a metre: the pocket test). Never
+// touched: the sky, animated, skinned and edited meshes. Vertices aren't removed (a shader may number them): only index
+// lists shrink.
+//   Drawing is most of the time: the solid triangles go in clusters of 32 (each with its box), nearest first, and a
+// cluster or a triangle whose box is behind what's drawn over all of it (8 x 8 tiles' farthest depth) is passed over,
+// unchanged pixel for pixel.
 #include "hsl_scene.h"
 #include "walkgrid.h"
 #include "home_edits.h"
@@ -40,6 +46,7 @@ struct VisibilityResult {
     std::vector<std::vector<u32>> removed;     // per mesh: the hidden triangles left out (index triples; not the twins), to show
     std::vector<std::vector<float>> normals;   // per changed mesh: its vertex normals pinned (empty: its own stand)
     size_t samples = 0, trisBefore = 0, trisAfter = 0, meshesEmptied = 0, meshesTouched = 0, meshesCulled = 0, trisFlipped = 0, trisMerged = 0;
+    size_t pocketed = 0;                       // glimpsed but sealed in (opt.pocket): left out
     double ms = 0;
     std::string skipped;                       // why nothing was done ("" when it ran)
 };
@@ -177,6 +184,13 @@ struct FaceDepth {
     std::vector<float> z, tieZ;
     std::vector<int> id, tieId;                 // tris index, -1 none
     std::vector<std::vector<float>> farZ;
+    // While drawing: per 8 x 8 tile the farthest depth drawn in it (infinity while a pixel is empty), worked out again
+    // when asked after something was drawn there. A triangle beyond it (and its tie) over every tile it covers can't
+    // change a pixel: it isn't drawn.
+    static constexpr int kTile = 8;
+    int tiles = 0;
+    std::vector<float> tileFar;
+    std::vector<uint8_t> tileStale;
     void reset(int size) {
         n = size;
         const size_t count = static_cast<size_t>(n) * n;
@@ -187,6 +201,33 @@ struct FaceDepth {
         levels = 0;
         for (int s = n; s >= 1; s /= 2) ++levels;
         farZ.resize(levels);
+        tiles = (n + kTile - 1) / kTile;
+        tileFar.assign(static_cast<size_t>(tiles) * tiles, std::numeric_limits<float>::infinity());
+        tileStale.assign(static_cast<size_t>(tiles) * tiles, 0);
+    }
+    float tileFarthest(int tx, int ty) {
+        const size_t t = static_cast<size_t>(ty) * tiles + tx;
+        if (tileStale[t]) {
+            float m = 0;
+            for (int y = ty * kTile, y1 = std::min(n, y + kTile); y < y1; ++y)
+                for (int x = tx * kTile, x1 = std::min(n, x + kTile); x < x1; ++x) m = std::max(m, z[static_cast<size_t>(y) * n + x]);
+            tileFar[t] = m;
+            tileStale[t] = 0;
+        }
+        return tileFar[t];
+    }
+    // Whether something at depth d or nearer over pixels [x0, x1] x [y0, y1] could still be drawn (nearest or tied).
+    bool open(int x0, int y0, int x1, int y1, float d) {
+        for (int ty = y0 / kTile; ty <= y1 / kTile; ++ty)
+            for (int tx = x0 / kTile; tx <= x1 / kTile; ++tx) {
+                const float farthest = tileFarthest(tx, ty);
+                if (d <= farthest + tie(farthest)) return true;
+            }
+        return false;
+    }
+    void drewIn(int x0, int y0, int x1, int y1) {
+        for (int ty = y0 / kTile; ty <= y1 / kTile; ++ty)
+            for (int tx = x0 / kTile; tx <= x1 / kTile; ++tx) tileStale[static_cast<size_t>(ty) * tiles + tx] = 1;
     }
     // Two surfaces this close in depth (m) draw in an order and with a rounding the bake can't know (meshes aren't drawn
     // in scene order; one surface triangulated twice fights pixel by pixel): both count as seen.
@@ -272,10 +313,25 @@ inline int clipToFace(const float (*v)[3], int count, int f, int n, float (*out)
     return m;
 }
 
-// Draws triangle `tri` (eye-relative) into face f (pixel centres inside, depth from 1/z).
+// Draws triangle `tri` (eye-relative) into face f (pixel centres inside, depth from 1/z). Not when the tiles it covers
+// are all nearer already (FaceDepth::open). Each row only over the pixels its edges leave (worked out from them, a pixel
+// of slack each way: the inside test per pixel decides, as before).
 inline void rasterTriangle(const float (*v)[3], int f, FaceDepth& fd, int tri) {
     float p[8][3];
     const int m = clipToFace(v, 3, f, fd.n, p);
+    if (m < 3) return;
+    {   // all of it behind what's drawn?
+        float lo[2] = {1e30f, 1e30f}, hi[2] = {-1e30f, -1e30f}, nearest = 1e30f;
+        for (int k = 0; k < m; ++k) {
+            lo[0] = std::min(lo[0], p[k][0]); hi[0] = std::max(hi[0], p[k][0]);
+            lo[1] = std::min(lo[1], p[k][1]); hi[1] = std::max(hi[1], p[k][1]);
+            nearest = std::min(nearest, p[k][2]);
+        }
+        const int x0 = std::max(0, static_cast<int>(std::floor(lo[0]))), x1 = std::min(fd.n - 1, static_cast<int>(std::ceil(hi[0])));
+        const int y0 = std::max(0, static_cast<int>(std::floor(lo[1]))), y1 = std::min(fd.n - 1, static_cast<int>(std::ceil(hi[1])));
+        if (x0 > x1 || y0 > y1 || !fd.open(x0, y0, x1, y1, nearest)) return;
+        fd.drewIn(x0, y0, x1, y1);
+    }
     for (int k = 1; k + 1 < m; ++k) {
         const float* a = p[0];
         const float* b = p[k];
@@ -286,9 +342,29 @@ inline void rasterTriangle(const float (*v)[3], int f, FaceDepth& fd, int tri) {
         const int y0 = std::max(0, static_cast<int>(std::floor(std::min({a[1], b[1], c[1]})))), y1 = std::min(fd.n - 1, static_cast<int>(std::ceil(std::max({a[1], b[1], c[1]}))));
         if (x0 > x1 || y0 > y1) continue;
         const float ia = 1 / area, za = 1 / a[2], zb = 1 / b[2], zc = 1 / c[2];
+        const bool spans = std::fabs(area) >= 1.0f && x1 - x0 > 4;   // (a sliver: its box is all there is)
         for (int y = y0; y <= y1; ++y) {
             const float py = y + 0.5f;
-            for (int x = x0; x <= x1; ++x) {
+            int xs = x0, xe = x1;
+            if (spans) {
+                // the barycentrics along the row are linear in x: w = slope * x + at0; each >= 0 on one side of a point
+                const float s0 = (b[1] - c[1]) * ia, k0 = (b[0] * (c[1] - py) - (b[1] - py) * c[0]) * ia;
+                const float s1 = (c[1] - a[1]) * ia, k1 = (c[0] * (a[1] - py) - (c[1] - py) * a[0]) * ia;
+                const float s2 = -s0 - s1, k2 = 1 - k0 - k1;
+                float from = -1e30f, to = 1e30f;
+                for (const auto& e : {std::pair<float, float>{s0, k0}, {s1, k1}, {s2, k2}}) {
+                    if (e.first > 0) from = std::max(from, -e.second / e.first);
+                    else if (e.first < 0) to = std::min(to, -e.second / e.first);
+                    else if (e.second < 0) { from = 1e30f; break; }
+                }
+                if (from > to + 2) continue;
+                // (clamped to the box before they're whole numbers: an edge that doesn't bound a side says +-1e30)
+                xs = std::max(x0, static_cast<int>(std::floor(std::clamp(from, x0 - 2.0f, x1 + 2.0f) - 0.5f)) - 1);
+                xe = std::min(x1, static_cast<int>(std::ceil(std::clamp(to, x0 - 2.0f, x1 + 2.0f) - 0.5f)) + 1);
+            }
+            // (a pixel where it's beyond what's drawn and its tie is passed over before the divide)
+            const size_t row = static_cast<size_t>(y) * fd.n;
+            for (int x = xs; x <= xe; ++x) {
                 const float px = x + 0.5f;
                 const float w0 = ((b[0] - px) * (c[1] - py) - (b[1] - py) * (c[0] - px)) * ia;
                 const float w1 = ((c[0] - px) * (a[1] - py) - (c[1] - py) * (a[0] - px)) * ia;
@@ -296,7 +372,9 @@ inline void rasterTriangle(const float (*v)[3], int f, FaceDepth& fd, int tri) {
                 if (w0 < 0 || w1 < 0 || w2 < 0) continue;
                 const float iz = w0 * za + w1 * zb + w2 * zc;
                 if (iz <= 0) continue;
-                fd.put(static_cast<size_t>(y) * fd.n + x, 1 / iz, tri);
+                const float drawn = fd.z[row + x];
+                if (iz * (drawn + FaceDepth::tie(drawn)) < 1) continue;   // (drawn infinite: never)
+                fd.put(row + x, 1 / iz, tri);
             }
         }
     }
@@ -412,6 +490,9 @@ struct VisibilityOptions {
     int face = 512;                            // cube face size (pixels; a power of two): what's never nearest at a pixel goes
     bool cull = true;                          // solid meshes' backs not drawn (each triangle turned to the side seen)
     bool merge = true;                         // what's kept rebuilt with fewer triangles where nothing changes (mesh_simplify.h)
+    float pocket = 0.5f;                       // a triangle only the thin look kept that's sealed in within this (m) on the
+                                               // side it was seen from goes (0: never)
+    bool farMerge = true;                      // ...within what a pixel shows from the nearest an eye comes (else 0.1 mm everywhere)
     int speck = 0;                             // won no more than this many pixels from any one spot (and never showed as a
                                                // thin line): left out. 0: only what was ever just tied with what's drawn
                                                // there (it covers the same pixels); 1 already leaves visible specks. -1: none
@@ -464,11 +545,12 @@ inline bool bakeVisibility(const HslScene& scene, const HomeWorld& world, const 
     }
 
     // World-space triangles: the solid ones (occluders, tested one by one), boxes for the rest.
-    std::vector<Tri> tris;
+    std::vector<Tri> tris, glass;                          // glass: the see-through / cut-out meshes' (hide nothing)
     std::vector<std::array<float, 6>> boxes(nm);
-    std::vector<size_t> firstTri(nm + 1, 0);
+    std::vector<size_t> firstTri(nm + 1, 0), firstGlass(nm + 1, 0);
     for (size_t m = 0; m < nm; ++m) {
         firstTri[m] = tris.size();
+        firstGlass[m] = glass.size();
         const MeshData& md = scene.meshes[m];
         out.trisBefore += md.indices.size() / 3;
         if (!kind[m]) continue;
@@ -489,14 +571,16 @@ inline bool bakeVisibility(const HslScene& scene, const HomeWorld& world, const 
                 for (int j = 0; j < 3; ++j) { bb[j] = std::min(bb[j], tr.v[k][j]); bb[3 + j] = std::max(bb[3 + j], tr.v[k][j]); }
             }
             if (!ok) { kind[m] = 0; break; }
-            if (kind[m] == 2) { tr.mesh = static_cast<u32>(m); tr.index = static_cast<u32>(t); tris.push_back(tr); }
+            tr.mesh = static_cast<u32>(m); tr.index = static_cast<u32>(t);
+            (kind[m] == 2 ? tris : glass).push_back(tr);
         }
-        if (!kind[m]) { tris.resize(firstTri[m]); continue; }
+        if (!kind[m]) { tris.resize(firstTri[m]); glass.resize(firstGlass[m]); continue; }
         // a see-through / cut-out mesh's box, widened (a little sway, an offset the material adds)
         for (int j = 0; j < 3; ++j) { const float g = 0.25f + 0.1f * (bb[3 + j] - bb[j]); bb[j] -= g; bb[3 + j] += g; }
         boxes[m] = bb;
     }
     firstTri[nm] = tris.size();
+    firstGlass[nm] = glass.size();
     std::vector<char> covered(tris.size(), 0);
     for (size_t m = 0; m < nm; ++m) markCoveredTwins(tris, firstTri[m], firstTri[m + 1], covered);
     for (size_t i = 0; i < tris.size(); ++i) {   // no area at all (strip stitching): nothing to see from anywhere
@@ -571,14 +655,84 @@ inline bool bakeVisibility(const HslScene& scene, const HomeWorld& world, const 
     for (size_t i = 0; i < 2 * nm + 1; ++i) sidePixels[i].store(0, std::memory_order_relaxed);
     std::vector<uint8_t> outside(nm, 3);   // per mesh: its outer side (1 front, 2 back, 3 either)
     bool survey = true;
+    // The solid triangles in clusters of up to 32 near one another (each mesh's, in Morton order of their centres), each
+    // with its box: from a spot, a cluster whose box is behind what's drawn already over all of it on a face is passed
+    // over there whole, its triangles never even made eye-relative. (A covered twin is in none: its twin hides the same.)
+    // The glass triangles likewise, for the same test against the solid depth.
+    struct Cluster { uint32_t first = 0, count = 0; float box[6]; };
+    std::vector<uint32_t> clusterTris, glassClusterTris;
+    std::vector<Cluster> clusters, glassClusters;
+    const auto cluster = [&](const std::vector<Tri>& list, const std::vector<size_t>& first, const std::vector<char>* skip,
+                             std::vector<Cluster>& out, std::vector<uint32_t>& members) {
+        constexpr uint32_t kClusterSize = 32;
+        std::vector<std::pair<uint32_t, uint32_t>> keyed;   // (Morton code, triangle)
+        auto spread = [](uint32_t x) {   // 10 bits to every third of 30
+            x &= 0x3ff;
+            x = (x | (x << 16)) & 0x030000ff; x = (x | (x << 8)) & 0x0300f00f;
+            x = (x | (x << 4)) & 0x030c30c3; x = (x | (x << 2)) & 0x09249249;
+            return x;
+        };
+        for (size_t m = 0; m < nm; ++m) {
+            keyed.clear();
+            float lo[3] = {1e30f, 1e30f, 1e30f}, hi[3] = {-1e30f, -1e30f, -1e30f};
+            for (size_t i = first[m]; i < first[m + 1]; ++i)
+                for (int k = 0; k < 3; ++k) for (int j = 0; j < 3; ++j) { lo[j] = std::min(lo[j], list[i].v[k][j]); hi[j] = std::max(hi[j], list[i].v[k][j]); }
+            for (size_t i = first[m]; i < first[m + 1]; ++i) {
+                if (skip && (*skip)[i]) continue;
+                uint32_t code = 0;
+                for (int j = 0; j < 3; ++j) {
+                    const float c = (list[i].v[0][j] + list[i].v[1][j] + list[i].v[2][j]) / 3;
+                    const float t = hi[j] > lo[j] ? (c - lo[j]) / (hi[j] - lo[j]) : 0;
+                    code |= spread(static_cast<uint32_t>(std::clamp(t, 0.0f, 1.0f) * 1023)) << j;
+                }
+                keyed.push_back({code, static_cast<uint32_t>(i)});
+            }
+            std::sort(keyed.begin(), keyed.end());
+            for (size_t k = 0; k < keyed.size(); k += kClusterSize) {
+                Cluster c;
+                c.first = static_cast<uint32_t>(members.size());
+                for (int j = 0; j < 3; ++j) { c.box[j] = 1e30f; c.box[3 + j] = -1e30f; }
+                for (size_t q = k; q < std::min(keyed.size(), k + kClusterSize); ++q) {
+                    const uint32_t i = keyed[q].second;
+                    members.push_back(i);
+                    for (int t = 0; t < 3; ++t)
+                        for (int j = 0; j < 3; ++j) { c.box[j] = std::min(c.box[j], list[i].v[t][j]); c.box[3 + j] = std::max(c.box[3 + j], list[i].v[t][j]); }
+                }
+                c.count = static_cast<uint32_t>(members.size()) - c.first;
+                out.push_back(c);
+            }
+        }
+    };
+    cluster(tris, firstTri, &covered, clusters, clusterTris);
+    cluster(glass, firstGlass, nullptr, glassClusters, glassClusterTris);
+    // glassSeen: per glass triangle, whether some spot could see it (in front of the solid depth, with slack)
+    std::unique_ptr<std::atomic<uint8_t>[]> glassSeen(new std::atomic<uint8_t>[glass.size() ? glass.size() : 1]);
+    for (size_t i = 0; i < glass.size(); ++i) glassSeen[i].store(0, std::memory_order_relaxed);
+
     // What one worker reuses from spot to spot.
     struct Scratch {
         FaceDepth fd;
-        std::vector<std::array<float, 9>> rel;   // the triangles eye-relative
+        std::vector<std::array<float, 9>> rel;   // the triangles eye-relative (where `ready` is this spot's)
         std::vector<uint8_t> onFaces, facing;    // the cube faces each is on, the side it turns to the eye
+        std::vector<uint32_t> ready;
+        uint32_t spot = 0;                       // (counts the spots this worker has been at, from 1)
         std::vector<uint64_t> pixels;            // survey: per mesh, pixels won front / back
         std::vector<uint32_t> won;               // this face: pixels each triangle won (only `touched` nonzero)
         std::vector<int> touched;
+        // per cluster from this spot: the faces its box is on, its nearest depth on each (0: the eye is at or in it)
+        std::vector<uint8_t> clusterFaces;
+        std::vector<std::array<float, 6>> clusterNear;
+        std::vector<uint32_t> order, drawn;      // this face's clusters nearest first; the ones drawn into it
+        std::vector<uint8_t> bucketOf;
+        std::array<uint32_t, 257> bucketStart{};
+    };
+    // A cluster's box corners eye-relative.
+    const auto clusterCorners = [&](const Cluster& c, const float* e, float (*v)[3]) {
+        for (int k = 0; k < 8; ++k) {
+            v[k][0] = c.box[(k & 1) ? 3 : 0] - e[0];
+            v[k][1] = c.box[(k & 2) ? 4 : 1] - e[1];
+            v[k][2] = c.box[(k & 4) ? 5 : 2] - e[2];
+        }
     };
     const auto fromSpot = [&](size_t si, Scratch& sc) {
         FaceDepth& fd = sc.fd;
@@ -593,17 +747,33 @@ inline bool bakeVisibility(const HslScene& scene, const HomeWorld& world, const 
             if (kind[m] == 1 && e[0] >= b[0] && e[0] <= b[3] && e[1] >= b[1] && e[1] <= b[4] && e[2] >= b[2] && e[2] <= b[5])
                 seenMesh[m].store(1, std::memory_order_relaxed);
         }
-        // the triangles eye-relative, the faces each is on and the side it turns to this eye (a covered twin is left
-        // out: its twin hides the same). Once one is seen from that side, there's nothing more to learn of it.
-        rel.resize(tris.size());
-        onFaces.assign(tris.size(), 0);
-        facing.resize(tris.size());
-        for (size_t i = 0; i < tris.size(); ++i) {
-            if (covered[i]) continue;
+        // a triangle eye-relative, the faces it's on and the side it turns to this eye: worked out when its cluster is
+        // first drawn from here
+        if (rel.size() != tris.size()) { rel.resize(tris.size()); onFaces.resize(tris.size()); facing.resize(tris.size()); sc.ready.assign(tris.size(), 0); }
+        if (++sc.spot == 0) { sc.ready.assign(tris.size(), 0); sc.spot = 1; }
+        const auto prepare = [&](uint32_t i) {
+            if (sc.ready[i] == sc.spot) return;
+            sc.ready[i] = sc.spot;
             float (*r)[3] = reinterpret_cast<float (*)[3]>(rel[i].data());
             for (int k = 0; k < 3; ++k) for (int j = 0; j < 3; ++j) r[k][j] = tris[i].v[k][j] - e[j];
+            onFaces[i] = 0;
             for (int f = 0; f < 6; ++f) if (!outsideFace(r, 3, f)) onFaces[i] |= static_cast<uint8_t>(1 << f);
             facing[i] = sideFacing(r);
+        };
+        // the clusters' boxes from here: the faces each is on and how near it comes on each
+        sc.clusterFaces.resize(clusters.size());
+        sc.clusterNear.resize(clusters.size());
+        for (size_t c = 0; c < clusters.size(); ++c) {
+            clusterCorners(clusters[c], e, v);
+            uint8_t faces = 0;
+            for (int f = 0; f < 6; ++f) {
+                if (outsideFace(v, 8, f)) continue;
+                faces |= static_cast<uint8_t>(1 << f);
+                float u, w, d = 1e30f;
+                for (int k = 0; k < 8; ++k) d = std::min(d, faceOf(v[k], f, u, w));
+                sc.clusterNear[c][f] = d < kNear ? 0 : d;
+            }
+            sc.clusterFaces[c] = faces;
         }
         // (seen edge-on: it covers nothing from either side, so it counts as seen without a side: bit 4)
         const auto known = [&](size_t i) {
@@ -618,8 +788,51 @@ inline bool bakeVisibility(const HslScene& scene, const HomeWorld& world, const 
         if (survey) pixels.assign(2 * nm, 0);
         for (int f = 0; f < 6; ++f) {
             fd.reset(opt.face);
-            for (size_t i = 0; i < tris.size(); ++i)
-                if (onFaces[i] & (1 << f)) rasterTriangle(reinterpret_cast<const float (*)[3]>(rel[i].data()), f, fd, static_cast<int>(i));
+            // this face's clusters nearest first (log-spaced buckets of their nearest depth: a counting sort), so what's
+            // behind meets a full depth and is passed over
+            constexpr int kBuckets = 256;
+            sc.order.clear();
+            sc.drawn.clear();
+            sc.bucketOf.resize(clusters.size());
+            sc.bucketStart.fill(0);
+            for (size_t c = 0; c < clusters.size(); ++c) {
+                if (!(sc.clusterFaces[c] & (1 << f))) continue;
+                const float d = sc.clusterNear[c][f];
+                const int b = d <= kNear ? 0 : std::min(kBuckets - 1, static_cast<int>(std::log2(d / kNear) * 16));
+                sc.bucketOf[c] = static_cast<uint8_t>(b);
+                ++sc.bucketStart[b + 1];
+            }
+            for (int b = 0; b < kBuckets; ++b) sc.bucketStart[b + 1] += sc.bucketStart[b];
+            sc.order.resize(sc.bucketStart[kBuckets]);
+            {
+                std::array<uint32_t, 257> at = sc.bucketStart;
+                for (size_t c = 0; c < clusters.size(); ++c)
+                    if (sc.clusterFaces[c] & (1 << f)) sc.order[at[sc.bucketOf[c]]++] = static_cast<uint32_t>(c);
+            }
+            const float h = fd.n * 0.5f;
+            for (uint32_t c : sc.order) {
+                const float nearest = sc.clusterNear[c][f];
+                if (nearest > 0) {   // its box on screen (wholly in front of the eye): behind what's drawn over all of it?
+                    clusterCorners(clusters[c], e, v);
+                    float lo[2] = {1e30f, 1e30f}, hi[2] = {-1e30f, -1e30f}, u, w;
+                    for (int k = 0; k < 8; ++k) {
+                        const float d = faceOf(v[k], f, u, w);
+                        const float sx = (u / d + 1) * h, sy = (w / d + 1) * h;
+                        lo[0] = std::min(lo[0], sx); hi[0] = std::max(hi[0], sx);
+                        lo[1] = std::min(lo[1], sy); hi[1] = std::max(hi[1], sy);
+                    }
+                    const int x0 = std::max(0, static_cast<int>(std::floor(lo[0])) - 1), x1 = std::min(fd.n - 1, static_cast<int>(std::floor(hi[0])) + 1);
+                    const int y0 = std::max(0, static_cast<int>(std::floor(lo[1])) - 1), y1 = std::min(fd.n - 1, static_cast<int>(std::floor(hi[1])) + 1);
+                    if (x0 > x1 || y0 > y1 || !fd.open(x0, y0, x1, y1, nearest)) continue;
+                }
+                sc.drawn.push_back(c);
+                const Cluster& cl = clusters[c];
+                for (uint32_t q = cl.first; q < cl.first + cl.count; ++q) {
+                    const uint32_t i = clusterTris[q];
+                    prepare(i);
+                    if (onFaces[i] & (1 << f)) rasterTriangle(reinterpret_cast<const float (*)[3]>(rel[i].data()), f, fd, static_cast<int>(i));
+                }
+            }
             if (survey) {
                 for (int t : fd.id) if (t >= 0 && facing[t] != 3) ++pixels[2 * tris[t].mesh + (facing[t] == 2)];
                 continue;
@@ -639,11 +852,18 @@ inline bool bakeVisibility(const HslScene& scene, const HomeWorld& world, const 
                 sc.won[t] = 0;
             }
             sc.touched.clear();
-            for (size_t i = 0; i < tris.size(); ++i)   // the thin ones turned outwards (or either way: unsure)
-                if ((onFaces[i] & (1 << f)) && (facing[i] & outside[tris[i].mesh]) && !(known(i) && (seenSide[i].load(std::memory_order_relaxed) & 24)) &&
-                    thinSeen(reinterpret_cast<const float (*)[3]>(rel[i].data()), f, fd))
-                    see(i, 8);
-            fd.build();
+            // the thin ones turned outwards (or either way: unsure); a cluster passed over is behind what's drawn, and
+            // so is every thin one in it
+            for (uint32_t c : sc.drawn) {
+                const Cluster& cl = clusters[c];
+                for (uint32_t q = cl.first; q < cl.first + cl.count; ++q) {
+                    const uint32_t i = clusterTris[q];
+                    if ((onFaces[i] & (1 << f)) && (facing[i] & outside[tris[i].mesh]) && !(known(i) && (seenSide[i].load(std::memory_order_relaxed) & 24)) &&
+                        thinSeen(reinterpret_cast<const float (*)[3]>(rel[i].data()), f, fd))
+                        see(i, 8);
+                }
+            }
+            bool built = false;   // (the far pyramid: only once a box on this face asks)
             for (size_t m = 0; m < nm; ++m) {
                 if (kind[m] != 1 || seenMesh[m].load(std::memory_order_relaxed)) continue;
                 const auto& b = boxes[m];
@@ -652,7 +872,41 @@ inline bool bakeVisibility(const HslScene& scene, const HomeWorld& world, const 
                     v[k][1] = b[(k & 2) ? 4 : 1] - e[1];
                     v[k][2] = b[(k & 4) ? 5 : 2] - e[2];
                 }
-                if (!outsideFace(v, 8, f) && boxSeenOnFace(v, f, fd)) seenMesh[m].store(1, std::memory_order_relaxed);
+                if (outsideFace(v, 8, f)) continue;
+                if (!built) { fd.build(); built = true; }
+                if (boxSeenOnFace(v, f, fd)) seenMesh[m].store(1, std::memory_order_relaxed);
+            }
+            // the glass triangles not seen yet, cluster by cluster: in front of the solid depth anywhere near (the far
+            // pyramid: the farthest of each pixel's 3 x 3), 5 cm of slack
+            constexpr float kGlassSlack = 0.05f;
+            for (const Cluster& gc : glassClusters) {
+                bool open = false;
+                for (uint32_t q = gc.first; q < gc.first + gc.count && !open; ++q) open = !glassSeen[glassClusterTris[q]].load(std::memory_order_relaxed);
+                if (!open) continue;
+                clusterCorners(gc, e, v);
+                if (outsideFace(v, 8, f)) continue;
+                if (!built) { fd.build(); built = true; }
+                if (!boxSeenOnFace(v, f, fd)) continue;
+                const float h = fd.n * 0.5f;
+                for (uint32_t q = gc.first; q < gc.first + gc.count; ++q) {
+                    const uint32_t i = glassClusterTris[q];
+                    if (glassSeen[i].load(std::memory_order_relaxed)) continue;
+                    float t3[3][3], u, w, lo[2] = {1e30f, 1e30f}, hi[2] = {-1e30f, -1e30f}, nearest = 1e30f;
+                    for (int k = 0; k < 3; ++k) for (int j = 0; j < 3; ++j) t3[k][j] = glass[i].v[k][j] - e[j];
+                    if (outsideFace(t3, 3, f)) continue;
+                    bool behind = false;
+                    for (int k = 0; k < 3; ++k) {
+                        const float d = faceOf(t3[k], f, u, w);
+                        if (d < kNear + kGlassSlack) { behind = true; break; }
+                        const float sx = (u / d + 1) * h, sy = (w / d + 1) * h;
+                        lo[0] = std::min(lo[0], sx); hi[0] = std::max(hi[0], sx);
+                        lo[1] = std::min(lo[1], sy); hi[1] = std::max(hi[1], sy);
+                        nearest = std::min(nearest, d);
+                    }
+                    const int x0 = std::max(0, static_cast<int>(std::floor(lo[0])) - 1), x1 = std::min(fd.n - 1, static_cast<int>(std::floor(hi[0])) + 1);
+                    const int y0 = std::max(0, static_cast<int>(std::floor(lo[1])) - 1), y1 = std::min(fd.n - 1, static_cast<int>(std::floor(hi[1])) + 1);
+                    if (behind || (x0 <= x1 && y0 <= y1 && fd.farther(x0, y0, x1, y1, nearest - kGlassSlack))) glassSeen[i].store(1, std::memory_order_relaxed);
+                }
             }
         }
         if (survey) for (size_t k = 0; k < 2 * nm; ++k) if (pixels[k]) sidePixels[k].fetch_add(pixels[k], std::memory_order_relaxed);
@@ -681,6 +935,46 @@ inline bool bakeVisibility(const HslScene& scene, const HomeWorld& world, const 
     survey = false;
     fromSpots(every);
 
+    // How near any eye comes to each solid triangle (its cluster's box, m): what's only ever seen from afar is merged
+    // within what a pixel there can show (mesh_simplify.h toleranceAt).
+    std::vector<float> nearestEye(tris.size(), 0);
+    if (opt.merge && opt.farMerge) {
+        std::vector<float> clusterEye(clusters.size(), 0);
+        // the spots binned on a 2 m grid over XZ: each cluster looks in rings of cells out from its box until no
+        // nearer spot can be left (a cell r rings out is at least r cells away), not at every spot
+        constexpr float kBin = 2.0f;
+        float sx0 = 1e30f, sz0 = 1e30f, sx1 = -1e30f, sz1 = -1e30f;
+        for (const auto& sp : spots) { sx0 = std::min(sx0, sp[0]); sx1 = std::max(sx1, sp[0]); sz0 = std::min(sz0, sp[2]); sz1 = std::max(sz1, sp[2]); }
+        const int bx = static_cast<int>((sx1 - sx0) / kBin) + 1, bz = static_cast<int>((sz1 - sz0) / kBin) + 1;
+        std::vector<std::vector<uint32_t>> bins(static_cast<size_t>(bx) * bz);
+        for (size_t i = 0; i < spots.size(); ++i)
+            bins[static_cast<size_t>(static_cast<int>((spots[i][2] - sz0) / kBin)) * bx + static_cast<int>((spots[i][0] - sx0) / kBin)].push_back(static_cast<uint32_t>(i));
+        par::forEach(clusters.size(), [&](size_t c) {
+            const float* b = clusters[c].box;
+            float best = 1e30f;
+            const auto binOf = [&](float v, float o, int count) { return std::clamp(static_cast<int>(std::floor((v - o) / kBin)), 0, count - 1); };
+            const int ix0 = binOf(b[0], sx0, bx), ix1 = binOf(b[3], sx0, bx), iz0 = binOf(b[2], sz0, bz), iz1 = binOf(b[5], sz0, bz);
+            for (int ring = 0; ring <= std::max(bx, bz); ++ring) {
+                for (int iz = iz0 - ring; iz <= iz1 + ring; ++iz)
+                    for (int ix = ix0 - ring; ix <= ix1 + ring; ++ix) {
+                        if (ring && iz > iz0 - ring && iz < iz1 + ring && ix > ix0 - ring && ix < ix1 + ring) continue;   // (inner: done)
+                        if (ix < 0 || iz < 0 || ix >= bx || iz >= bz) continue;
+                        for (uint32_t si : bins[static_cast<size_t>(iz) * bx + ix]) {
+                            const auto& sp = spots[si];
+                            float d2 = 0;
+                            for (int j = 0; j < 3; ++j) { const float o = std::max({b[j] - sp[j], 0.0f, sp[j] - b[3 + j]}); d2 += o * o; }
+                            best = std::min(best, d2);
+                        }
+                    }
+                const float reach = ring * kBin;   // every spot not looked at yet is at least this far across
+                if (best <= reach * reach) break;
+            }
+            clusterEye[c] = std::sqrt(best);
+        });
+        for (size_t c = 0; c < clusters.size(); ++c)
+            for (uint32_t q = clusters[c].first; q < clusters[c].first + clusters[c].count; ++q) nearestEye[clusterTris[q]] = clusterEye[c];
+    }
+
     // What's kept: the seen triangles, the seen meshes. A solid mesh's back isn't drawn (cullBack): each triangle seen
     // from one side only turned that side to the front, one seen from both drawn as a pair back to back (the same
     // pixels as before, from either side: one of the two is drawn, the other dropped before it costs a pixel). Not when
@@ -688,8 +982,62 @@ inline bool bakeVisibility(const HslScene& scene, const HomeWorld& world, const 
     // apart (then only if every one is seen from its front already).
     // Seen at all, and more than a speck: won a pixel outright from some spot, more than opt.speck of them, or showed as
     // a thin line (a branch far off). Only ever tied with what's drawn there: what it ties with covers the same pixels.
+    // Sealed in: the inside of a closed thing the thin look passed at its outline (its conservative coverage reaches a
+    // pixel past the surface in front), never seen at a pixel centre from anywhere, and every way out from just off the
+    // side it was seen from meets geometry within opt.pocket. Looked at coarsely (32 pixels a face, 2.8 degrees each,
+    // the geometry within reach only), so a real opening (more than a few centimetres) reads as open. One that won a
+    // pixel stays, even sealed: it shows through a hairline crack the GPU draws too (taken out, the crack would show
+    // what's behind the thing instead: a sparkle).
+    std::vector<char> pocketed(tris.size(), 0);
+    if (opt.pocket > 0) {
+        constexpr int kRes = 32;
+        std::vector<size_t> weak;
+        for (size_t i = 0; i < tris.size(); ++i) {
+            if (covered[i] || kind[tris[i].mesh] != 2) continue;
+            const uint8_t seen = seenSide[i].load();
+            if ((seen & 8) && !(seen & 16)) weak.push_back(i);
+        }
+        const float R = opt.pocket;
+        par::forEach(weak.size(), [&](size_t k) {
+            const size_t i = weak[k];
+            const Tri& t = tris[i];
+            const float a[3] = {t.v[1][0] - t.v[0][0], t.v[1][1] - t.v[0][1], t.v[1][2] - t.v[0][2]}, b[3] = {t.v[2][0] - t.v[0][0], t.v[2][1] - t.v[0][1], t.v[2][2] - t.v[0][2]};
+            float n[3] = {a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]};
+            const float L = std::sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
+            if (L < 1e-12f) return;
+            for (float& c : n) c /= L;
+            const uint8_t seen = seenSide[i].load();
+            const float mid[3] = {(t.v[0][0] + t.v[1][0] + t.v[2][0]) / 3, (t.v[0][1] + t.v[1][1] + t.v[2][1]) / 3, (t.v[0][2] + t.v[1][2] + t.v[2][2]) / 3};
+            // the geometry within reach of it
+            std::vector<uint32_t> nearby;
+            for (const Cluster& c : clusters) {
+                float d2 = 0;
+                for (int j = 0; j < 3; ++j) { const float o = std::max({c.box[j] - mid[j], 0.0f, mid[j] - c.box[3 + j]}); d2 += o * o; }
+                if (d2 <= (R + 0.01f) * (R + 0.01f)) for (uint32_t q = c.first; q < c.first + c.count; ++q) nearby.push_back(clusterTris[q]);
+            }
+            FaceDepth d;
+            const auto sealedFrom = [&](float side) {   // every pixel of every face meets something within R
+                float at[3];
+                for (int j = 0; j < 3; ++j) at[j] = mid[j] + n[j] * side * 0.002f;
+                for (int f = 0; f < 6; ++f) {
+                    d.reset(kRes);
+                    for (uint32_t q : nearby) {
+                        if (q == i) continue;
+                        float rr[3][3];
+                        for (int c = 0; c < 3; ++c) for (int j = 0; j < 3; ++j) rr[c][j] = tris[q].v[c][j] - at[j];
+                        if (!outsideFace(rr, 3, f)) rasterTriangle(rr, f, d, static_cast<int>(q));
+                    }
+                    for (size_t o = 0; o < d.z.size(); ++o) if (d.id[o] < 0 || d.z[o] > R) return false;
+                }
+                return true;
+            };
+            const bool front = (seen & 1) || (seen & 4), back = (seen & 2) || (seen & 4);
+            if ((!front || sealedFrom(1.0f)) && (!back || sealedFrom(-1.0f))) pocketed[i] = 1;
+        });
+        for (char p : pocketed) out.pocketed += p != 0;
+    }
     const auto keeps = [&](size_t i) -> uint8_t {
-        const uint8_t seen = covered[i] ? 0 : seenSide[i].load();
+        const uint8_t seen = covered[i] || pocketed[i] ? 0 : seenSide[i].load();
         if (!seen) return 0;
         const bool more = (seen & 8) || ((seen & 16) && static_cast<int>(bestShow[i].load()) > opt.speck);
         return opt.speck < 0 || more ? seen : 0;
@@ -705,6 +1053,20 @@ inline bool bakeVisibility(const HslScene& scene, const HomeWorld& world, const 
             ++out.meshesEmptied;
             continue;
         }
+        if (kind[m] == 1) {   // seen as a whole: the triangles of it no spot could see go
+            std::vector<u32>& keep = out.indices[m];
+            for (size_t i = firstGlass[m]; i < firstGlass[m + 1]; ++i) {
+                const u32* t = &md.indices[glass[i].index];
+                std::vector<u32>& to = glassSeen[i].load() ? keep : out.removed[m];
+                to.insert(to.end(), t, t + 3);
+            }
+            out.trisAfter += keep.size() / 3;
+            if (keep.size() == md.indices.size()) { keep.clear(); continue; }
+            out.changed[m] = 1;
+            out.normals[m] = pinnedNormals(md);
+            if (keep.empty()) ++out.meshesEmptied; else ++out.meshesTouched;
+            continue;
+        }
         if (kind[m] != 2) { out.trisAfter += md.indices.size() / 3; continue; }
         size_t kept = 0, pairs = 0, back = 0;
         for (size_t i = firstTri[m]; i < firstTri[m + 1]; ++i) {
@@ -716,38 +1078,47 @@ inline bool bakeVisibility(const HslScene& scene, const HomeWorld& world, const 
         }
         const bool cull = opt.cull && kept > 0 && (turnable[m] ? pairs * 2 <= kept : pairs == 0 && back == 0);
         // the kept triangles by the side they're seen from: 0 the front (or only ever edge-on), 1 the back, 2 both (when
-        // its back is drawn anyway, all in 0)
-        std::vector<u32> group[3];
+        // its back is drawn anyway, all in 0), and by how near an eye comes (band b: from 2^b m, the first from 0)
+        static constexpr int kBands = 8;   // (static: the lambda below reads it without capturing it, as MSVC requires)
+        auto bandOf = [](float d) { return d < 2 ? 0 : std::min(kBands - 1, static_cast<int>(std::log2(d))); };
+        std::vector<u32> group[3][kBands];
         for (size_t i = firstTri[m]; i < firstTri[m + 1]; ++i) {
             const uint8_t seen = keeps(i);
             const uint8_t side = seen & 3;
             const u32* t = &md.indices[tris[i].index];
             if (!seen) { if (!covered[i]) out.removed[m].insert(out.removed[m].end(), t, t + 3); continue; }
-            std::vector<u32>& g = group[!cull || side <= 1 ? 0 : side == 2 ? 1 : 2];
+            std::vector<u32>& g = group[!cull || side <= 1 ? 0 : side == 2 ? 1 : 2][opt.merge ? bandOf(nearestEye[i]) : 0];
             g.insert(g.end(), t, t + 3);
         }
         // fewer triangles where nothing changes: each group on its own, its edges kept where they are (they meet the
-        // others there)
+        // others there), within what a pixel shows from the nearest an eye comes
         if (opt.merge && kept) {
             float wm[16];
             if (md.hasWorldMatrix) std::memcpy(wm, md.worldMatrix, sizeof wm); else trsToMat4(md.transform, wm);
             const meshsimplify::Mesh shape(md, wm, pinnedNormals(md));
-            for (std::vector<u32>& g : group) {
-                const size_t was = g.size() / 3;
-                g = shape.simplify(g);
-                out.trisMerged += was - g.size() / 3;
-                kept -= was - g.size() / 3;
-            }
+            for (auto& bands : group)
+                for (int b = 0; b < kBands; ++b) {
+                    std::vector<u32>& g = bands[b];
+                    const size_t was = g.size() / 3;
+                    g = shape.simplify(g, meshsimplify::toleranceAt(b ? std::exp2(static_cast<float>(b)) : 0.0f));
+                    out.trisMerged += was - g.size() / 3;
+                    kept -= was - g.size() / 3;
+                }
         }
+        for (auto& bands : group)   // (back together, nearest band first)
+            for (int b = 1; b < kBands; ++b) { bands[0].insert(bands[0].end(), bands[b].begin(), bands[b].end()); std::vector<u32>().swap(bands[b]); }
         // ...then turned to face the side seen, or drawn as a pair back to back
         std::vector<u32>& keep = out.indices[m];
-        keep = group[0];
-        for (size_t k = 0; k + 2 < group[1].size(); k += 3) keep.insert(keep.end(), {group[1][k], group[1][k + 2], group[1][k + 1]});
-        for (size_t k = 0; k + 2 < group[2].size(); k += 3) {
-            keep.insert(keep.end(), group[2].begin() + k, group[2].begin() + k + 3);
-            keep.insert(keep.end(), {group[2][k], group[2][k + 2], group[2][k + 1]});
+        const std::vector<u32>& front = group[0][0];
+        const std::vector<u32>& backOnly = group[1][0];
+        const std::vector<u32>& both = group[2][0];
+        keep = front;
+        for (size_t k = 0; k + 2 < backOnly.size(); k += 3) keep.insert(keep.end(), {backOnly[k], backOnly[k + 2], backOnly[k + 1]});
+        for (size_t k = 0; k + 2 < both.size(); k += 3) {
+            keep.insert(keep.end(), both.begin() + k, both.begin() + k + 3);
+            keep.insert(keep.end(), {both[k], both[k + 2], both[k + 1]});
         }
-        out.trisFlipped += group[1].size() / 3;
+        out.trisFlipped += backOnly.size() / 3;
         out.trisAfter += kept;
         if (std::getenv("FH_VIS_DEBUG"))
             std::fprintf(stderr, "[optimize] %-50s kept %zu: back only %zu, both sides %zu; outside %d; sides apart %d\n", md.name.c_str(), kept, back, pairs,

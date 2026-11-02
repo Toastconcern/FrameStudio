@@ -584,6 +584,62 @@ int main() {
         ck(std::fabs(l.viewDepth(hd) - 3) < 0.05f && o.viewDepth(hd) == 8.0f, "view depth: a wall 3 m ahead is 3 m; nothing ahead, 8",
            l.viewDepth(hd), o.viewDepth(hd));
     }
+    {   // Draw Floor's brush on the walkable area: erase floor, paint it onto a table top, the later dab wins, saved
+        HomeWorld w;
+        w.spawns.push_back(WorldPoint{});
+        w.colliders.push_back(quadC(WorldCollider::Solid, {-6, 0, -6, 6, 0, -6, 6, 0, 6, -6, 0, 6}));
+        w.colliders.push_back(quadC(WorldCollider::Solid, {1.5f, 0.75f, -2.5f, 2.5f, 0.75f, -2.5f, 2.5f, 0.75f, -1.5f, 1.5f, 0.75f, -1.5f}));
+        auto bake = [&](const HomeWorld& hw) {
+            std::vector<WalkSource> src; std::vector<std::vector<float>> sp; std::vector<std::vector<uint32_t>> si;
+            walkColliderSources(hw, src, sp, si);
+            return buildWalkGrid(src, walkSeeds(hw), WalkParams{}, nullptr, nullptr, &hw.walkPaint);
+        };
+        auto g0 = bake(w);
+        ck(g0->walkable(3, 3, 0) && !g0->walkable(2, -2, 0.75f), "unpainted: the floor walks, the table top doesn't");
+        WalkStroke er; er.pos[0] = 3; er.pos[2] = 3; er.radius = 0.6f; er.erase = true;
+        WalkStroke pt; pt.pos[0] = 2; pt.pos[1] = 0.75f; pt.pos[2] = -2; pt.radius = 0.4f;
+        w.walkPaint = {er, pt};
+        auto g1 = bake(w);
+        ck(!g1->walkable(3, 3, 0) && g1->walkable(0, 0, 0) && g1->walkable(4, 4, 0), "an erased dab takes the floor under it, only that");
+        ck(g1->walkable(2, -2, 0.75f), "a painted dab makes the table top floor");
+        ck(g1->walkable(2.8f, -2, 0) || !g1->walkable(2, -2, 0), "painting the table top doesn't paint the floor under it");
+        WalkStroke back = er; back.erase = false;
+        w.walkPaint.push_back(back);
+        ck(bake(w)->walkable(3, 3, 0), "painting over an erased spot brings it back (the later dab wins)");
+        // painted over nothing: past the floor's edge (it ends at x = 6), at its level, and over a hole under nothing
+        WalkStroke out; out.pos[0] = 6.8f; out.pos[1] = 0; out.pos[2] = 0; out.radius = 0.7f;
+        HomeWorld w2 = w;
+        w2.walkPaint.push_back(out);
+        auto g2 = bake(w2);
+        ck(!g1->walkable(7.0f, 0, 0) && g2->walkable(7.0f, 0, 0) && g2->walkable(6.0f, 0, 0), "floor painted past the edge, over nothing, is floor (joined on)");
+        ck(!g2->walkable(2, -2, 0) || g2->walkable(2.8f, -2, 0), "...and it makes no floor where something is in the way");
+        HomeWorld r;
+        ck(worldFromJson(worldToJson(w), r) && r.walkPaint.size() == 3 && r.walkPaint[0].erase && !r.walkPaint[2].erase &&
+           std::fabs(r.walkPaint[1].pos[1] - 0.75f) < 1e-4f, "the dabs are saved in world.json");
+    }
+    {   // a seat's stand-up spot: in front when there's room, round the coffee table in front of it when there isn't
+        HomeWorld w;
+        w.spawns.push_back(WorldPoint{});
+        w.colliders.push_back(quadC(WorldCollider::Solid, {-6, 0, -6, 6, 0, -6, 6, 0, 6, -6, 0, 6}));
+        auto bake = [&](const HomeWorld& hw) {
+            std::vector<WalkSource> src; std::vector<std::vector<float>> sp; std::vector<std::vector<uint32_t>> si;
+            walkColliderSources(hw, src, sp, si);
+            return buildWalkGrid(src, walkSeeds(hw), WalkParams{}, nullptr, nullptr, &hw.walkPaint);
+        };
+        const float seat[3] = {2, 0.45f, 2};                        // facing -Z (yaw 0)
+        float spot[3];
+        auto g0 = bake(w);
+        const bool open = g0->standUpSpot(seat, 0, spot);   // (before ck: its arguments are read in any order)
+        ck(open && spot[2] < seat[2] - 0.4f && std::fabs(spot[0] - seat[0]) < 0.05f, "open floor: you stand up in front of the seat", spot[0], spot[1], spot[2]);
+        WorldCollider table; table.kind = WorldCollider::Box; table.role = WorldCollider::Solid;   // a coffee table right in front of it
+        table.half[0] = 0.6f; table.half[1] = 0.22f; table.half[2] = 0.35f;
+        table.world[12] = 2; table.world[13] = 0.22f; table.world[14] = 1.2f;
+        w.colliders.push_back(table);
+        auto g1 = bake(w);
+        const bool found = g1->standUpSpot(seat, 0, spot);
+        ck(found && g1->walkable(spot[0], spot[2], spot[1]) && !(std::fabs(spot[0] - 2) < 0.6f && std::fabs(spot[2] - 1.2f) < 0.35f),
+           "a coffee table in front: you stand up beside it, not on it", spot[0], spot[1], spot[2]);
+    }
     std::printf("%d failed\n", fails);
     return fails;
 }

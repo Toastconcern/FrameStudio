@@ -68,6 +68,14 @@ struct WorldGravity {
     bool hidden = false;                // Frame Studio's view only
 };
 
+// A dab of Studio's floor brush (Draw Floor): the walkable area's floor under it, on whatever surface is there, is
+// floor (painted) or not (erased), whatever the bake would say. In order: a later dab over an earlier one wins.
+struct WalkStroke {
+    float pos[3] = {0, 0, 0};           // where it touched the surface (world)
+    float radius = 0.3f;                // across XZ (m)
+    bool erase = false;
+};
+
 struct WalkGrid;                        // src/walkgrid.h: the walkable area, baked from the home's geometry and these colliders
 
 struct HomeWorld {
@@ -78,11 +86,12 @@ struct HomeWorld {
     std::vector<float> walkPositions;   // legacy walkable triangles (v1 files): read as one walkable-floor area
     std::vector<u32> walkIndices;
     std::vector<WorldGravity> gravity;  // empty: down is -Y everywhere
+    std::vector<WalkStroke> walkPaint;  // the floor painted on / erased by hand (applied by every walkable-area bake)
     float fallLimit = 30;               // falling further than this (metres) puts you back at the spawn
     std::string origin;                 // "meta" (converted), "studio" (edited) or "" (none)
     std::string walkGrid;               // the walkable area Frame Studio baked (walkgrid.h encoding); "": Frame Home bakes one at load
     std::shared_ptr<const WalkGrid> walkGridCache;   // walkGrid decoded, or one just built (never saved)
-    bool empty() const { return spawns.empty() && seats.empty() && hotspots.empty() && colliders.empty() && walkIndices.empty() && gravity.empty() && walkGrid.empty(); }
+    bool empty() const { return spawns.empty() && seats.empty() && hotspots.empty() && colliders.empty() && walkIndices.empty() && gravity.empty() && walkGrid.empty() && walkPaint.empty(); }
 };
 
 namespace world_detail {
@@ -169,6 +178,16 @@ inline std::string worldToJson(const HomeWorld& w) {
         o += '}';
     }
     o += "]";
+    if (!w.walkPaint.empty()) {        // x, y, z, radius, erase (0 / 1) per dab
+        o += ",\n\"walkPaint\":[";
+        for (size_t i = 0; i < w.walkPaint.size(); ++i) {
+            const WalkStroke& k = w.walkPaint[i];
+            if (i) o += ',';
+            const float v[5] = {k.pos[0], k.pos[1], k.pos[2], k.radius, k.erase ? 1.0f : 0.0f};
+            for (int j = 0; j < 5; ++j) { if (j) o += ','; num(o, v[j]); }
+        }
+        o += ']';
+    }
     if (!w.walkGrid.empty()) o += ",\n\"walkGrid\":" + q(w.walkGrid);
     return o + "}\n";
 }
@@ -210,6 +229,14 @@ inline bool worldFromJson(const std::string& json, HomeWorld& w) {
             readF(v["world"], g.world, 16); readF(v["half"], g.half, 3);
             g.radius = static_cast<float>(v["radius"].asFloat()); g.priority = static_cast<int>(v["priority"].asFloat()); g.hidden = v["hidden"].boolVal;
             w.gravity.push_back(g);
+        }
+        const auto& wp = d["walkPaint"];
+        for (size_t i = 0; i + 4 < wp.size(); i += 5) {
+            WalkStroke k;
+            for (int j = 0; j < 3; ++j) k.pos[j] = static_cast<float>(wp[i + j].asFloat());
+            k.radius = static_cast<float>(wp[i + 3].asFloat());
+            k.erase = wp[i + 4].asFloat() > 0.5;
+            if (std::isfinite(k.pos[0]) && std::isfinite(k.pos[1]) && std::isfinite(k.pos[2]) && k.radius > 0) w.walkPaint.push_back(k);
         }
         w.walkGrid = d["walkGrid"].asString();
         if (d.has("fallLimit")) w.fallLimit = static_cast<float>(d["fallLimit"].asFloat());

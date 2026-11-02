@@ -587,6 +587,15 @@ private:
             to[0] = st.pos[0] + c * ex + s * ez;
             to[2] = st.pos[2] - s * ex + c * ez;
         }
+        // the seat's own spot when you can stand there; else the nearest good one round the seat (walkgrid.h standUpSpot)
+        if (byStick)
+            if (const WalkGrid* g = runtime_.grid()) {
+                float h;
+                if (!(g->floorAt(to[0], to[2], st.pos[1], 0.3f, 2.0f, h) && g->walkable(to[0], to[2], h))) {
+                    float spot[3];
+                    if (g->standUpSpot(st.pos, st.yaw, spot)) { to[0] = spot[0]; to[2] = spot[2]; }
+                }
+            }
         float f = st.pos[1] - 0.45f;
         if (runtime_.hasFloor() && runtime_.floorAt(to[0], to[2], st.pos[1], 0.3f, 2.0f, f)) {}
         else if (byStick) { to[0] = head[0]; to[2] = head[2]; runtime_.floorAt(to[0], to[2], st.pos[1], 0.3f, 2.0f, f); }

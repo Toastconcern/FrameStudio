@@ -42,7 +42,7 @@ template <typename T> struct Table {
 // cullBack: written (version 16 on) when the scene holds any one-sided mesh; otherwise the file stays readable by older
 // versions, and none is.
 void writeMesh(Writer& w, const MeshData& m, Table<TexSource>& tex, Table<std::vector<u16>>& half, const std::vector<u32>* indices, int cullBack,
-               const std::vector<float>* normals, bool v17) {
+               const std::vector<float>* normals, bool v17, bool v19) {
     w.str(m.name);
     w.str(m.path);
     w.u(static_cast<u32>(m.components.size()));
@@ -90,6 +90,7 @@ void writeMesh(Writer& w, const MeshData& m, Table<TexSource>& tex, Table<std::v
     w.fa(m.animXform, 16); w.fa(m.uvXform, 6); w.vec(m.skinBindPos); w.vec(m.skinJoints); w.fa(m.skinBox, 6);
     if (cullBack >= 0 || v17) w.b(cullBack > 0);
     if (v17) { w.str(m.video.empty() ? std::string() : videoMemberName(m.video)); w.f(m.videoNear); w.f(m.videoFar); w.f(m.videoVolume); }
+    if (v19) w.b(m.blendDepthWrite);
 }
 
 void readMesh(Reader& r, MeshData& m, const std::vector<std::shared_ptr<const TexSource>>& tex,
@@ -148,6 +149,7 @@ void readMesh(Reader& r, MeshData& m, const std::vector<std::shared_ptr<const Te
     if (version >= 13) { r.fa(m.animXform, 16); r.fa(m.uvXform, 6); m.skinBindPos = r.vec<float>(); m.skinJoints = r.vec<float>(); r.fa(m.skinBox, 6); }
     if (version >= 16) m.cullBack = r.b();
     if (version >= 17) { m.video = r.str(); m.videoNear = r.f(); m.videoFar = r.f(); m.videoVolume = r.f(); }
+    if (version >= 19) m.blendDepthWrite = r.b();
 }
 
 // The world layer in binary (world.json is the editable form): mesh colliders and walkable surfaces are
@@ -169,7 +171,7 @@ int sameMesh(const WorldCollider& c, const std::vector<MeshData>& meshes) {
 }
 
 void writeWorld(Writer& w, const HomeWorld& wd, const std::vector<MeshData>& meshes, const std::vector<char>* thinned, const std::string& walkGrid,
-                bool v17) {
+                bool v17, bool v18) {
     w.str(wd.origin);
     for (const auto* list : {&wd.spawns, &wd.seats, &wd.hotspots}) {
         w.u(static_cast<u32>(list->size()));
@@ -192,6 +194,8 @@ void writeWorld(Writer& w, const HomeWorld& wd, const std::vector<MeshData>& mes
     if (v17) {
         w.u(static_cast<u32>(wd.walkPaint.size()));
         for (const WalkStroke& k : wd.walkPaint) { w.fa(k.pos, 3); w.f(k.radius); w.b(k.erase); }
+        if (v18)
+            for (const WalkStroke& k : wd.walkPaint) { w.pod(k.shape); w.f(k.yaw); w.fa(k.centre, 2); w.fa(k.half, 2); w.vec(k.outline); }
     }
 }
 
@@ -226,6 +230,9 @@ void readWorld(Reader& r, HomeWorld& wd, u32 version, std::vector<std::pair<size
     if (version >= 17) {
         wd.walkPaint.resize(r.count(17));
         for (WalkStroke& k : wd.walkPaint) { if (r.bad) break; r.fa(k.pos, 3); k.radius = r.f(); k.erase = r.b(); }
+        if (version >= 18)
+            for (WalkStroke& k : wd.walkPaint) { if (r.bad) break; k.shape = r.pod<int>(); k.yaw = r.f(); r.fa(k.centre, 2); r.fa(k.half, 2); k.outline = r.vec<float>(); }
+        wd.walkPaint.erase(std::remove_if(wd.walkPaint.begin(), wd.walkPaint.end(), [](const WalkStroke& k) { return !k.valid(); }), wd.walkPaint.end());
     }
     worldAdoptLegacyWalkable(wd);
 }
@@ -304,13 +311,15 @@ bool bakeScene(const HslScene& scene, std::vector<u8>& out, std::string& error, 
         cull[i] = vis && i < vis->cullBack.size() ? vis->cullBack[i] : meshes[i]->cullBack;
         anyCull = anyCull || cull[i];
     }
-    const bool v17 = sceneNeedsV17(s);
+    // What the file holds follows from the one version it's written as (a newer part makes every older one go in too).
+    const u32 version = sceneBakeVersionFor(s, anyCull);
+    const bool v17 = version >= 17, v18 = version >= 18, v19 = version >= 19;
     for (size_t i = 0; i < s.meshes.size(); ++i)
         writeMesh(mw, *meshes[i], tex, half, vis && vis->changed[i] ? &vis->indices[i] : nullptr, anyCull ? cull[i] : -1,
-                  vis && vis->changed[i] && i < vis->normals.size() && !vis->normals[i].empty() ? &vis->normals[i] : nullptr, v17);
+                  vis && vis->changed[i] && i < vis->normals.size() && !vis->normals[i].empty() ? &vis->normals[i] : nullptr, v17, v19);
 
     Writer w{out};
-    w.u(kMagic); w.u(sceneBakeVersionFor(s, anyCull));
+    w.u(kMagic); w.u(version);
     w.u(static_cast<u32>(s.apkPaths.size()));
     for (size_t i = 0; i < s.apkPaths.size(); ++i) {
         w.str(s.apkPaths[i]);
@@ -333,7 +342,7 @@ bool bakeScene(const HslScene& scene, std::vector<u8>& out, std::string& error, 
         std::string walkGrid = options && !options->walkGrid.empty() ? options->walkGrid : s.world.walkGrid;
         if (walkGrid.empty())
             if (const std::shared_ptr<const WalkGrid> g = bakeWalkGrid(s, world, WalkParams{})) walkGrid = encodeWalkGrid(*g);
-        writeWorld(w, world, s.meshes, vis ? &vis->changed : nullptr, walkGrid, v17);
+        writeWorld(w, world, s.meshes, vis ? &vis->changed : nullptr, walkGrid, v17, v18);
     }
     // The shaders as the Frame's GPU runs them (shader_bake.h): each program's prepared forms, and per distinct set
     // of material values its meshes have, the fragment shader with them baked in.

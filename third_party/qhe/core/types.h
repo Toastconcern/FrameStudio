@@ -382,6 +382,9 @@ struct MeshData {
     bool  bakeLightmapVtx = false;
     std::vector<float> uvs2;        // uv1 = the lightmap unwrap (StdData a_texcoords.zw @16)
     bool alphaToCoverage = false;   // SHAD forward pass: cut-out foliage (alpha-to-coverage, opaque queue)
+    // SHAD forward pass: alpha-blended AND writing depth (Del Mar's desert_cliff floors, shellenvblend, unlitalpha). Without
+    // depth writes a blended slab drew its own curb walls and underside over its top face as black bands and rings.
+    bool blendDepthWrite = false;
     std::vector<float> normals;     // authored NORMAL (VS sem 1), xyz per vertex; zero where a part has none
     std::vector<float> tangents;    // authored TANGENT (VS sem 2), xyzw per vertex (w = handedness); zero if none
     float lightmapPower[3] = {1.0f, 1.0f, 1.0f};

@@ -32,9 +32,43 @@
 #include <unordered_map>
 
 #define LOG(...)  do { std::fprintf(stderr, "[render] " __VA_ARGS__); std::fputc('\n', stderr); } while (0)
-#define VK_OK(x)  ([&]() { VkResult r_ = (x); if (r_ != VK_SUCCESS) { LOG("%s failed: %d", #x, r_); return false; } return true; }())
+#define VK_OK(x)  ([&]() { VkResult r_ = (x); if (r_ != VK_SUCCESS) { LOG("%s failed: %s (%d)", #x, vkResultName(r_), r_); return false; } return true; }())
 
 namespace {
+
+// The VkResult codes a log reader can't look up from the number alone.
+const char* vkResultName(VkResult result) {
+    switch (result) {
+        case VK_ERROR_OUT_OF_HOST_MEMORY: return "VK_ERROR_OUT_OF_HOST_MEMORY";
+        case VK_ERROR_OUT_OF_DEVICE_MEMORY: return "VK_ERROR_OUT_OF_DEVICE_MEMORY";
+        case VK_ERROR_INITIALIZATION_FAILED: return "VK_ERROR_INITIALIZATION_FAILED";
+        case VK_ERROR_DEVICE_LOST: return "VK_ERROR_DEVICE_LOST";
+        case VK_ERROR_LAYER_NOT_PRESENT: return "VK_ERROR_LAYER_NOT_PRESENT";
+        case VK_ERROR_EXTENSION_NOT_PRESENT: return "VK_ERROR_EXTENSION_NOT_PRESENT";
+        case VK_ERROR_FEATURE_NOT_PRESENT: return "VK_ERROR_FEATURE_NOT_PRESENT";
+        case VK_ERROR_INCOMPATIBLE_DRIVER: return "VK_ERROR_INCOMPATIBLE_DRIVER";
+        case VK_ERROR_TOO_MANY_OBJECTS: return "VK_ERROR_TOO_MANY_OBJECTS";
+        case VK_ERROR_FORMAT_NOT_SUPPORTED: return "VK_ERROR_FORMAT_NOT_SUPPORTED";
+        case VK_ERROR_SURFACE_LOST_KHR: return "VK_ERROR_SURFACE_LOST_KHR";
+        case VK_ERROR_OUT_OF_DATE_KHR: return "VK_ERROR_OUT_OF_DATE_KHR";
+        default: return "VkResult";
+    }
+}
+
+// What a failed vkCreateInstance means for the person at the PC: almost always the graphics driver, not the app.
+std::string instanceFailureAdvice(VkResult result) {
+    switch (result) {
+        case VK_ERROR_INCOMPATIBLE_DRIVER:
+            return "No Vulkan driver is registered on this computer (the Vulkan loader found none, or none new enough). "
+                   "Reinstall your graphics driver.";
+        case VK_ERROR_EXTENSION_NOT_PRESENT:
+            return "The graphics driver lacks a Vulkan extension the window needs. Update your graphics driver.";
+        case VK_ERROR_LAYER_NOT_PRESENT:
+            return "A Vulkan layer is registered but missing. Update or reinstall the app that installed it.";
+        default:
+            return "Vulkan couldn't start (" + std::string(vkResultName(result)) + "). Update your graphics driver.";
+    }
+}
 
 // SPIR-V a home brought (its .fenv, or made from it) fit to hand the driver: spv_check.h. A malformed module is said
 // and its meshes skipped, as a module the driver refuses is.
@@ -770,7 +804,11 @@ bool HslRenderer::init(uint32_t eyeWidth, uint32_t eyeHeight) {
     ici.pApplicationInfo = &app;
     ici.enabledExtensionCount = static_cast<uint32_t>(iext.size());
     ici.ppEnabledExtensionNames = iext.data();
-    if (!VK_OK(vkCreateInstance(&ici, nullptr, &instance_))) return false;
+    if (VkResult created = vkCreateInstance(&ici, nullptr, &instance_); created != VK_SUCCESS) {
+        initError = instanceFailureAdvice(created);
+        LOG("vkCreateInstance failed: %s (%d). %s", vkResultName(created), created, initError.c_str());
+        return false;
+    }
 #ifdef FH_USE_VOLK
     volkLoadInstance(instance_);
 #endif
@@ -1634,7 +1672,7 @@ int HslRenderer::programFor(const ShaderProgramSrc& src) {
     p.fs = module(src.frag);
     p.src = &src;
     p.foldBlocks = spvspec::blocksRead(src.frag);
-    const std::vector<u32> alpha = src.prepared && shaderbake::bakedUsable(src.fragAlpha) ? src.fragAlpha : shaderbake::alphaOnly(src.frag);
+    const std::vector<u32> alpha = cutDepthShader(src.prepared && shaderbake::bakedUsable(src.fragAlpha) ? src.fragAlpha : shaderbake::alphaOnly(src.frag));
     if (!alpha.empty()) p.fsAlpha = module(alpha);
     if (!p.vs || !p.fs) {                        // SPIR-V the driver rejects: this program's meshes are skipped
         LOG("shader module failed: %s", src.path.c_str());
@@ -1725,8 +1763,17 @@ void HslRenderer::writeSharedSets(Program& p) {
     if (!writes.empty()) vkUpdateDescriptorSets(device_, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
 }
 
-VkPipeline HslRenderer::pipelineFor(Program& p, int blend, bool cull, bool sky, bool a2c, CutPass cut, int variant) {
-    const uint32_t key = static_cast<uint32_t>(blend) * 2 + (cull ? 1 : 0) + (sky ? 16 : 0) + (a2c ? 32 : 0) + static_cast<uint32_t>(cut) * 64;
+std::vector<u32> HslRenderer::cutDepthShader(const std::vector<u32>& alphaOnly) const {
+    if (alphaOnly.empty() || samples_ != VK_SAMPLE_COUNT_1_BIT) return alphaOnly;
+    std::vector<u32> masked = shaderbake::coverageFromAlpha(alphaOnly);
+    if (masked.empty()) return alphaOnly;   // (its colour written a component at a time: the card's whole depth, as before)
+    return masked;
+}
+
+VkPipeline HslRenderer::pipelineFor(Program& p, int blend, bool cull, bool sky, bool a2c, CutPass cut, int variant, bool blendDepth) {
+    blendDepth = blendDepth && blend == 1;
+    const uint32_t key = static_cast<uint32_t>(blend) * 2 + (cull ? 1 : 0) + (sky ? 16 : 0) + (a2c ? 32 : 0) + static_cast<uint32_t>(cut) * 64 +
+                         (blendDepth ? 256 : 0);
     Program::Variant* var = variant >= 0 && static_cast<size_t>(variant) < p.variants.size() ? &p.variants[variant] : nullptr;
     std::map<uint32_t, VkPipeline>& pipes = var ? var->pipelines : p.pipelines;
     auto it = pipes.find(key);
@@ -1766,14 +1813,19 @@ VkPipeline HslRenderer::pipelineFor(Program& p, int blend, bool cull, bool sky, 
     msi.rasterizationSamples = samples_;
     // Cut-out foliage: the SHAD pass state enables alpha-to-coverage for the animvege surfaces (HSR Studio's
     // world packets: exactly those pipelines). Matched by path until the SHAD pass-state table is decoded.
-    msi.alphaToCoverageEnable = samples_ != VK_SAMPLE_COUNT_1_BIT && blend == 0 && (a2c || has(lower(p.path), "animvege")) ? VK_TRUE : VK_FALSE;
+    // With one sample there is no coverage to share out: the cut-out's depth pass writes its own mask from alpha
+    // (cutDepthShader) and its shading pass keeps to the samples that pass left at its depth (EQUAL below), as with MSAA.
+    const bool cutout = blend == 0 && (a2c || has(lower(p.path), "animvege"));
+    msi.alphaToCoverageEnable = samples_ != VK_SAMPLE_COUNT_1_BIT && cutout ? VK_TRUE : VK_FALSE;
     VkPipelineDepthStencilStateCreateInfo dsi = {VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
     // The sky goes behind everything. Meta's skybox shader places it at the clip-space depth the native renderer
     // expects, which is not ours, so its depth comes from the viewport instead: drawn after the opaque meshes with
     // the depth range pinned to the far plane (0, reversed-Z) it fills exactly the samples nothing covers, and the
     // covered ones are rejected before shading (drawn first with no depth test, it was shaded across the whole view).
     dsi.depthTestEnable = sky && skyFirst() ? VK_FALSE : VK_TRUE;
-    dsi.depthWriteEnable = blend == 0 && !sky && cut != kCutShade ? VK_TRUE : VK_FALSE;
+    // Blended passes write no depth, except those Meta's pass state says do (blendDepth): a see-through walkway slab
+    // drawn without it showed its own curb walls and underside through its top face (Del Mar's black bands and rings).
+    dsi.depthWriteEnable = (blend == 0 || blendDepth) && !sky && cut != kCutShade ? VK_TRUE : VK_FALSE;
     dsi.depthCompareOp = VK_COMPARE_OP_GREATER_OR_EQUAL;     // reversed-Z: clear 0, near -> 1
     // A cut-out's shading pass: the samples whose depth is its own (the depth pass wrote it there through the same
     // alpha-to-coverage mask, and nothing nearer covered it) are exactly the ones alpha-to-coverage with GREATER_OR_EQUAL
@@ -1781,7 +1833,7 @@ VkPipeline HslRenderer::pipelineFor(Program& p, int blend, bool cull, bool sky, 
     // before shading (Turnip ran it after: every frond layer was shaded). Desert Terrace 2-4% less GPU time.
     // FH_CUT_GE=1: the old way (A/B).
     static const bool cutEqual = std::getenv("FH_CUT_GE") == nullptr;
-    if (cutEqual && cut == kCutShade && msi.alphaToCoverageEnable) {
+    if (cutEqual && cut == kCutShade && cutout) {
         msi.alphaToCoverageEnable = VK_FALSE;
         dsi.depthCompareOp = VK_COMPARE_OP_EQUAL;
     }
@@ -3155,6 +3207,7 @@ bool HslRenderer::uploadMesh(const MeshData& md, int sceneIndex) {
     gm.skybox = md.isSkybox;
     gm.alphaToCoverage = (md.alphaToCoverage || (maskCutout && gm.blend == 0)) && !std::getenv("FH_NO_A2C");
     if (gm.alphaToCoverage && gm.blend == 1) gm.blend = 0;
+    gm.blendDepth = gm.blend == 1 && md.blendDepthWrite && !std::getenv("FH_NO_BLEND_DEPTH");   // (FH_NO_BLEND_DEPTH=1: A/B)
     {   // one line per shader: the pipeline state this home's meshes get
         static std::set<std::string> seen;
         if (seen.insert(md.shaderPath).second)
@@ -3259,7 +3312,7 @@ bool HslRenderer::uploadMesh(const MeshData& md, int sceneIndex) {
     // Compile this mesh's pipeline now, while loading: compiling on first sight froze the frame whenever new
     // objects came into view (the pipeline cache makes it near-instant on later opens).
     const auto tp0 = std::chrono::steady_clock::now();
-    pipelineFor(p, gm.blend, gm.cull, gm.skybox, gm.alphaToCoverage, kCutNone, gm.variant);
+    pipelineFor(p, gm.blend, gm.cull, gm.skybox, gm.alphaToCoverage, kCutNone, gm.variant, gm.blendDepth);
     if (gm.alphaToCoverage && gm.blend == 0 && (gm.variant >= 0 ? p.variants[gm.variant].fsAlpha : p.fsAlpha)) {
         // ...and a cut-out's two passes (render(): its depth from the alpha-only shader, then shaded): made on first
         // sight, they were a compile in the middle of a frame the first time a fern came into view.
@@ -3305,7 +3358,7 @@ bool HslRenderer::uploadMesh(const MeshData& md, int sceneIndex) {
             const u8* b = static_cast<const u8*>(q);
             for (size_t k = 0; k < n; ++k) h = (h ^ b[k]) * 0x100000001B3ull;
         };
-        const int state[5] = {gm.program, gm.variant, gm.alphaToCoverage ? 1 : 0, gm.cull ? 1 : 0, gm.blend};
+        const int state[6] = {gm.program, gm.variant, gm.alphaToCoverage ? 1 : 0, gm.cull ? 1 : 0, gm.blend, gm.blendDepth ? 1 : 0};
         mix(state, sizeof state); mix(gm.color, 16); mix(gm.uvXform, sizeof gm.uvXform);
         mix(lookSig.data(), lookSig.size() * 8);
         gm.lookHash = h | 1;
@@ -3361,7 +3414,7 @@ int HslRenderer::variantFor(Program& p, const std::map<uint32_t, std::vector<u8>
         Program::Variant var;
         var.fs = module(*code);
         if (var.fs) {
-            if (!alpha->empty()) var.fsAlpha = module(*alpha);
+            if (!alpha->empty()) var.fsAlpha = module(cutDepthShader(*alpha));
             if (const char* dir = std::getenv("FH_DUMP_SPV")) {   // diagnostics: the specialized shader beside the shipped one
                 std::string name = p.path;
                 for (char& ch : name) if (ch == '/' || ch == '\\') ch = '_';
@@ -3746,7 +3799,7 @@ void HslRenderer::buildBatches() {
             bm.program = first.program; bm.variant = first.variant; bm.set2 = first.set2;
             std::memcpy(bm.color, first.color, 16);
             std::memcpy(bm.uvXform, first.uvXform, sizeof bm.uvXform);
-            bm.blend = first.blend; bm.cull = first.cull; bm.alphaToCoverage = first.alphaToCoverage;
+            bm.blend = first.blend; bm.cull = first.cull; bm.alphaToCoverage = first.alphaToCoverage; bm.blendDepth = first.blendDepth;
             b.sorted = first.blend != 0;
             const float id[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
             std::memcpy(bm.baseWorld, id, 64);
@@ -4298,7 +4351,7 @@ void HslRenderer::render(const EyeView eyes[2], float timeSec) {
         if (gm.blend != 0 && gm.color[3] <= 0.0f && programs_[gm.program].clay) return;
         if (cut != kCutDepth) tris += gm.indexCount / 3;
         Program& p = programs_[gm.program];
-        VkPipeline pipe = pipelineFor(p, gm.blend, gm.cull, gm.skybox, gm.alphaToCoverage, cut, gm.variant);
+        VkPipeline pipe = pipelineFor(p, gm.blend, gm.cull, gm.skybox, gm.alphaToCoverage, cut, gm.variant, gm.blendDepth);
         if (!pipe) return;
         if (noBindCache) boundPipe = VK_NULL_HANDLE, boundLayout = VK_NULL_HANDLE, boundVbo = boundIbo = VK_NULL_HANDLE;
         if (pipe != boundPipe) { vkCmdBindPipeline(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe); boundPipe = pipe; ++pipeBinds; }

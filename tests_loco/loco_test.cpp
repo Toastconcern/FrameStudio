@@ -454,7 +454,10 @@ int main() {
         };
         mesh("floor", {-20, 0, -20, 20, 0, -20, 20, 0, 20, -20, 0, 20});
         mesh("wall", {-10, 0, -3, 10, 0, -3, 10, 3, -3, -10, 3, -3});
-        Locomotion l; l.setWorld(walkWorld(sc)); l.setOptions(1, 1, 0, 30, 2);
+        // starting at the origin facing the wall (with no spawn, Frame Home would turn you to the open side: spawn_pick.h)
+        HomeWorld gw = walkWorld(sc);
+        gw.spawns.emplace_back();
+        Locomotion l; l.setWorld(gw); l.setOptions(1, 1, 0, 30, 2);
         float m[12], t[3];
         const float hand[3] = {0.2f, 1.2f, 0};
         handPose(hand, 0, 0.25f, -1, m);

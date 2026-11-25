@@ -3,11 +3,16 @@
 #include <cstring>
 #include <cmath>
 #include <algorithm>
+#include <type_traits>
 
 // RENDMESH FlatBuffer parser — 1:1 replica of
 // arvr/projects/mhe/modules/renderer/code/source/asset/MeshAssetHandler.cpp
 // + MeshAssetBuilder.cpp (sub_1816448 in libshell_current)
 //
+// One part of a parsed mesh: its index range in the concatenated index list and the vertices it owns. Each part
+// draws with its own material (the entity's MaterialPlatformComponent materials[part]).
+struct RendMeshPart { u32 part = 0, firstIndex = 0, indexCount = 0, firstVertex = 0, vertexCount = 0; };
+
 // Confirmed 4-level hierarchy:
 //   Root → LOD [0] → Part [0] → VS [0] → VB (stride-20) + IB (u16)
 
@@ -24,7 +29,8 @@ inline bool parseRendMesh(const std::vector<u8>& data,
                           std::vector<float>* uvs3 = nullptr,         // sem5 idx2 (uv2): animvege packed per-vertex flutter phase/pivot
                           std::vector<float>* uvs4 = nullptr,         // sem5 idx3 (uv3): animvege packed per-vertex flutter data
                           std::vector<float>* normals = nullptr,      // sem1 NORMAL (f16x3 / f32x3)
-                          std::vector<float>* tangents = nullptr) {   // sem2 TANGENT (f16x4 / f32x4), w = handedness
+                          std::vector<float>* tangents = nullptr,     // sem2 TANGENT (f16x4 / f32x4), w = handedness
+                          std::vector<RendMeshPart>* parts = nullptr) {   // each part read: its number and ranges
     if (data.size() < 14 || memcmp(data.data() + 4, "MESH", 4) != 0)
         return false;
 
@@ -417,6 +423,7 @@ inline bool parseRendMesh(const std::vector<u8>& data,
         // homes (desert-terrace, HSR-cooked Clay) write u32. Read as u16, a u32 buffer turns every high half (0)
         // into "vertex 0" and the mesh explodes into spikes converging on one point. Tell them apart by the data:
         // u32 when the part needs it (>= 65536 vertices) or when (nearly) every odd u16 word is zero.
+        const size_t firstIndex = indices.size();
         bool idx32 = false;
         if (ibCount % 4 == 0 && ibCount >= 12) {
             if (nVerts > 65535) idx32 = true;
@@ -450,6 +457,7 @@ inline bool parseRendMesh(const std::vector<u8>& data,
             }
         }
         if (std::getenv("HSR_RMSTRUCT")) fprintf(stderr, "[RMSTRUCT]   indices %s\n", idx32 ? "u32" : "u16");
+        if (parts) parts->push_back({pi, (u32)firstIndex, (u32)(indices.size() - firstIndex), base, nVerts});
         if (std::getenv("HSR_RMVTX") && stride >= 28 && nVerts > 1000) {
             float mn[3]={1e9f,1e9f,1e9f}, mx[3]={-1e9f,-1e9f,-1e9f};
             for (u32 i = base; i < base+nVerts; ++i) for (int c=0;c<3;c++){ float p=positions[i*3+c]; if(p<mn[c])mn[c]=p; if(p>mx[c])mx[c]=p; }
@@ -462,6 +470,38 @@ inline bool parseRendMesh(const std::vector<u8>& data,
     }
 
     return totalV > 0 && !indices.empty();
+}
+
+// Cuts a parsed mesh down to the parts with keep[k] set (parts as parseRendMesh listed them): their triangles, and only
+// the vertices those use, every per-vertex list compacted alike.
+inline void keepMeshParts(MeshData& m, const std::vector<RendMeshPart>& parts, const std::vector<bool>& keep) {
+    const size_t nv = m.positions.size() / 3;
+    std::vector<u32> remap(nv, 0xFFFFFFFFu), order, idx;
+    for (size_t k = 0; k < parts.size() && k < keep.size(); ++k) {
+        if (!keep[k]) continue;
+        const size_t end = std::min<size_t>(static_cast<size_t>(parts[k].firstIndex) + parts[k].indexCount, m.indices.size());
+        for (size_t i = parts[k].firstIndex; i < end; ++i) {
+            const u32 v = m.indices[i] < nv ? m.indices[i] : 0;
+            if (remap[v] == 0xFFFFFFFFu) { remap[v] = static_cast<u32>(order.size()); order.push_back(v); }
+            idx.push_back(remap[v]);
+        }
+    }
+    idx.resize(idx.size() / 3 * 3);
+    auto gather = [&](auto& list, size_t width) {
+        if (list.empty()) return;
+        std::remove_reference_t<decltype(list)> out(order.size() * width);
+        for (size_t j = 0; j < order.size(); ++j)
+            for (size_t c = 0; c < width; ++c) {
+                const size_t from = static_cast<size_t>(order[j]) * width + c;
+                if (from < list.size()) out[j * width + c] = list[from];
+            }
+        list.swap(out);
+    };
+    gather(m.positions, 3); gather(m.uvs, 2); gather(m.uvs2, 2); gather(m.uvs3, 2); gather(m.uvs4, 2);
+    gather(m.normals, 3); gather(m.tangents, 4); gather(m.colors, 4); gather(m.boneIndices, 4); gather(m.boneWeights, 4);
+    m.indices.swap(idx);
+    m.nVerts = static_cast<u32>(m.positions.size() / 3);
+    m.nIdx = static_cast<u32>(m.indices.size());
 }
 
 // The material a mesh was exported with: LOD[0] -> Part[0] field[3] is a whole nested MATLMATL buffer (shader +

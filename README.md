@@ -88,7 +88,7 @@ the same release channel.
 - **Open** Meta homes (HSL, Clay, glTF), `.fenv` environments and Blender or Unity models; pair rooms with vistas.
 - **Edit**: move, rotate, scale, hide and delete objects, with undo and auto-saved versions. A navigation gizmo in
   the viewport corner orbits the view or snaps it to an axis.
-- **Shape the walkable area**: auto-generated surfaces, drawn floors, spawns, seats, hotspots, gravity zones.
+- **Shape the navmesh**: auto-generated surfaces, drawn floors, spawns, seats, hotspots, gravity zones.
 - **Set the mood**: a background sound, a picture, and per-world settings you can set or calculate.
 - **Save and send**: baked `.fenv` files that leave out what can't be seen, sent to the headset in one click, or
   packed with others into one `.fbundle` to share or install together ([bundles](docs/bundles.md)).

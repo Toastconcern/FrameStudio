@@ -51,6 +51,8 @@ class HslRenderer {
 public:
     // Device setup on the GPU and with the extensions SteamVR requires.
     bool init(uint32_t eyeWidth, uint32_t eyeHeight);
+    // Why init() failed, said for the person at the PC (empty when it worked or there's nothing more to say than the log).
+    std::string initError;
     // Uploads a home (replacing any previous one).
     bool load(const HslScene& scene);
     // Incremental load: beginLoad, then loadStep(ms) once per frame until it returns true.
@@ -302,6 +304,7 @@ private:
         int skinUbo = -1;                           // index in ubos of the sbSkinningMatrices buffer
         int video = -1;                             // a video screen: its videos_ entry
         bool alphaToCoverage = false;               // cut-out foliage (SHAD pass state)
+        bool blendDepth = false;                    // alpha-blended and writing depth (MeshData::blendDepthWrite)
         bool dynamic = false;                       // animated on the CPU: host-visible vertices, rewritten per frame
         uint32_t posGen = 0, uvGen = 0;             // the MeshData posGen / uvGen its vertex buffer holds
         uint32_t skinGen = 0;                       // the MeshData skinGen its skinning buffer holds
@@ -410,7 +413,12 @@ private:
     // Cut-out (alpha-to-coverage) meshes in two passes: kCutDepth writes their depth from fsAlpha (Meta's shader
     // computing only its alpha), kCutShade shades them with depth writes off, the front-most sample alone passing.
     enum CutPass { kCutNone = 0, kCutDepth = 1, kCutShade = 2 };
-    VkPipeline pipelineFor(Program& p, int blend, bool cull, bool sky = false, bool a2c = false, CutPass cut = kCutNone, int variant = -1);
+    // blendDepth: an alpha-blended pass that writes depth (MeshData::blendDepthWrite).
+    VkPipeline pipelineFor(Program& p, int blend, bool cull, bool sky = false, bool a2c = false, CutPass cut = kCutNone, int variant = -1,
+                           bool blendDepth = false);
+    // A cut-out depth pass's shader (alpha-only) as this target needs it: with one sample, also writing its coverage
+    // mask from alpha (shaderbake::coverageFromAlpha), as alpha-to-coverage does with MSAA. As it is otherwise.
+    std::vector<u32> cutDepthShader(const std::vector<u32>& alphaOnly) const;
     // The variant of p for a mesh whose set-2 uniform buffers hold `set2` (binding -> bytes): made on first use.
     int variantFor(Program& p, const std::map<uint32_t, std::vector<u8>>& set2);
     shaderbake::SceneConstants sceneConsts_;    // the scene-wide uniform bytes that never change (shader_bake.h)

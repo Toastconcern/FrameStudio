@@ -2,6 +2,7 @@
 #include "core/types.h"
 #include <cstring>
 #include <cstdlib>
+#include <unordered_map>
 #include <vector>
 #include <string>
 #include "smolv.h"
@@ -92,6 +93,55 @@ inline bool scanSpirvModules(const std::vector<u8>& data, std::vector<SpirvBlob>
     return !out.empty();
 }
 
+// True when a fragment shader's colour output (location 0) takes its alpha straight from a push constant or a
+// uniform: the material's one alpha over the whole surface. A blended pass like that is a GLOW (Vista's sun_star: rgb =
+// star intensity x tint, alpha = the tint's alpha) that adds its light on device; alpha-blended, its black surround
+// covered the sky as a solid square. Shaders whose alpha varies per pixel (textures, fades) keep alpha-blend.
+inline bool fragmentAlphaIsUniform(const std::vector<u32>& code) {
+    constexpr u32 kOpConstant = 43, kOpVariable = 59, kOpLoad = 61, kOpStore = 62, kOpAccessChain = 65,
+                  kOpDecorate = 71, kOpCompositeConstruct = 80, kDecorationLocation = 30,
+                  kStorageUniform = 2, kStorageOutput = 3, kStoragePushConstant = 9;
+    std::unordered_map<u32, size_t> definedAt;          // result id -> word index of its instruction
+    std::unordered_map<u32, u32> location, storage;     // variable id -> Location / storage class
+    std::vector<std::pair<u32, u32>> stores;            // (pointer, value)
+    auto opAt = [&](size_t i) { return code[i] & 0xFFFFu; };
+    for (size_t i = 5; i < code.size();) {
+        const u32 op = code[i] & 0xFFFFu, count = code[i] >> 16;
+        if (count == 0 || i + count > code.size()) return false;
+        if (op == kOpDecorate && count >= 4 && code[i + 2] == kDecorationLocation) location[code[i + 1]] = code[i + 3];
+        else if (op == kOpVariable && count >= 4) storage[code[i + 2]] = code[i + 3];
+        else if (op == kOpStore && count >= 3) stores.emplace_back(code[i + 1], code[i + 2]);
+        if ((op == kOpConstant || op == kOpLoad || op == kOpAccessChain || op == kOpCompositeConstruct) && count >= 3)
+            definedAt[code[i + 2]] = i;
+        i += count;
+    }
+    // A loaded value is uniform when its pointer is a push-constant / uniform variable or an access chain into one.
+    auto isUniformValue = [&](u32 id) {
+        auto def = definedAt.find(id);
+        if (def == definedAt.end()) return false;
+        // (a constant alpha, such as 1.0 written by a pass that blends, says nothing about a glow: not that)
+        if (opAt(def->second) != kOpLoad) return false;
+        u32 pointer = code[def->second + 3];
+        if (auto chain = definedAt.find(pointer); chain != definedAt.end() && opAt(chain->second) == kOpAccessChain)
+            pointer = code[chain->second + 3];
+        auto sc = storage.find(pointer);
+        return sc != storage.end() && (sc->second == kStoragePushConstant || sc->second == kStorageUniform);
+    };
+    bool sawColourStore = false;
+    for (auto [pointer, value] : stores) {
+        auto sc = storage.find(pointer);
+        if (sc == storage.end() || sc->second != kStorageOutput) continue;
+        if (auto loc = location.find(pointer); loc != location.end() && loc->second != 0) continue;
+        auto def = definedAt.find(value);
+        if (def == definedAt.end() || opAt(def->second) != kOpCompositeConstruct) continue;   // (debug-view paths)
+        const size_t at = def->second, count = code[at] >> 16;
+        if (count < 5) continue;                         // a vec4 built from at least two parts: the last is alpha
+        if (!isUniformValue(code[at + count - 1])) return false;
+        sawColourStore = true;
+    }
+    return sawColourStore;
+}
+
 // FAITHFUL variant selection (reversed from the RENDSHAD format, NOT heuristics): the SHAD FlatBuffer
 // holds a `passes` vector [ "forward", "forward_debug", ... ] and a `stages` vector (each stage = a
 // SPIR-V byte blob). For COLOUR rendering libshell uses the **forward** pass; "forward_debug" is the
@@ -99,7 +149,7 @@ inline bool scanSpirvModules(const std::vector<u8>& data, std::vector<SpirvBlob>
 // grabbed -> wrong/dark output). Stages are laid out 2-per-pass in pass order (vert, frag), so the
 // forward pass's modules are stages[2*fwdIdx] (vert) + stages[2*fwdIdx+1] (frag). Extract ONLY those.
 inline bool parseRendShadForward(const std::vector<u8>& data, std::vector<SpirvBlob>& out, bool* outTransparent=nullptr,
-                                 bool* outAlphaToCoverage=nullptr) {
+                                 bool* outAlphaToCoverage=nullptr, bool* outUniformAlpha=nullptr, bool* outDepthWrite=nullptr) {
     const u8* d = data.data(); const size_t N = data.size();
     auto rd16 = [&](size_t o)->u16{ return (o+2<=N)? loadUnaligned<u16>(d+o):0; };
     auto rdi32= [&](size_t o)->i32{ return (o+4<=N)? loadUnaligned<i32>(d+o):0; };
@@ -216,6 +266,11 @@ inline bool parseRendShadForward(const std::vector<u8>& data, std::vector<SpirvB
         // alphaToCoverage: Calming's animvegepacked; desert-terrace's palmtreefoliage). Field 4 alone
         // (unlitdoublesidedskinned) is not.
         if (outAlphaToCoverage) *outAlphaToCoverage = vtField(pt2,2) != 0 && vtField(pt2,4) == 0 && vtField(pt2,5) == 0;
+        // Field 3 is depth write: present on every opaque and cut-out pass, and on the blended passes of surfaces that
+        // are solid where they are seen (Del Mar's desert_cliff walkways, unlitalpha cards, shellenvblend, Vista's
+        // cloud_flow); omitted on the blended passes that never hide anything (fog, flames, petals, sun_star, water,
+        // iblblend, backdrop_blend). Blended without it, a walkway slab drew its curb walls over its own top face.
+        if (outDepthWrite) *outDepthWrite = vtField(pt2,3) != 0;
     }
     if (std::getenv("HSR_SHADDBG")) {   // dump the forward pass table fields (find the blend/pipeline-state field)
         size_t pe2 = passesBase + (size_t)fwdIdx*4; size_t pt2 = pe2 + rd32(pe2);
@@ -239,6 +294,7 @@ inline bool parseRendShadForward(const std::vector<u8>& data, std::vector<SpirvB
     }
     SpirvBlob v,f;
     if (!stageSpirv(vsIdx, v) || !stageSpirv(fsIdx, f)) return false;
+    if (outUniformAlpha) *outUniformAlpha = fragmentAlphaIsUniform(f.stageType == 4 ? f.code : v.code);
     if (haveRefl) {                                    // v210 stripped modules: restore OpName/OpMemberName
         spirvSet2ImageBindings(v.code, refl.imageBindings);
         spirvSet2ImageBindings(f.code, refl.imageBindings);

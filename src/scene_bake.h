@@ -11,7 +11,7 @@
 #include <string>
 #include <vector>
 
-constexpr u32 kSceneBakeVersion = 17;  // 2: world; 3: HDR maps as ASTC, binary world; 4: roles; 5: mesh refs; 6: gravity; 7: mesh paths; 8: ambience name; 9: compressed 8-bit lightmaps; 10: reflection cube as ASTC; 11: walkable area (and simplified colliders); 12: prepared and specialized shaders; 13: Clay / glTF CPU animation; 14: wall spots removed; 15: the environment has splats (nothing new in here: they're .fenv members, and a reader older than splats must refuse it rather than show it without them); 16: meshes' cullBack (the visibility trim's one-sided meshes); 17: video screens (MeshData::video, the .fvid a .fenv member) and the world's painted floor (walkPaint)
+constexpr u32 kSceneBakeVersion = 19;  // 2: world; 3: HDR maps as ASTC, binary world; 4: roles; 5: mesh refs; 6: gravity; 7: mesh paths; 8: ambience name; 9: compressed 8-bit lightmaps; 10: reflection cube as ASTC; 11: walkable area (and simplified colliders); 12: prepared and specialized shaders; 13: Clay / glTF CPU animation; 14: wall spots removed; 15: the environment has splats (nothing new in here: they're .fenv members, and a reader older than splats must refuse it rather than show it without them); 16: meshes' cullBack (the visibility trim's one-sided meshes); 17: video screens (MeshData::video, the .fvid a .fenv member) and the world's painted floor (walkPaint); 18: painted floor in shapes (square, rectangle, polygon); 19: blended meshes that write depth (MeshData::blendDepthWrite)
 // What a scene is written as: the oldest version that holds it, so one without splats or one-sided meshes stays 14
 // (older Frame Homes still open it). A reader of a file needs at least this.
 constexpr u32 kSceneBakeVersionNoSplats = 14;
@@ -23,8 +23,20 @@ inline bool sceneNeedsV17(const HslScene& scene) {
     for (const MeshData& m : scene.meshes) if (!m.video.empty()) return true;
     return false;
 }
+// Version 18 holds painted floor in other shapes than round: needed only by a world with some.
+inline bool worldNeedsV18(const HomeWorld& w) {
+    for (const WalkStroke& k : w.walkPaint) if (k.shape != WalkStroke::Round) return true;
+    return false;
+}
+// Version 19 holds which see-through meshes write depth (Meta's pass state): needed only by a scene with some.
+inline bool sceneNeedsV19(const HslScene& scene) {
+    for (const MeshData& m : scene.meshes) if (m.blendDepthWrite) return true;
+    return false;
+}
 inline u32 sceneBakeVersionFor(const HslScene& scene, bool cullBack) {
-    if (sceneNeedsV17(scene)) return kSceneBakeVersion;
+    if (sceneNeedsV19(scene)) return kSceneBakeVersion;
+    if (worldNeedsV18(scene.world)) return 18;
+    if (sceneNeedsV17(scene)) return 17;
     return cullBack ? kSceneBakeVersionCullBack : scene.splats.empty() ? kSceneBakeVersionNoSplats : kSceneBakeVersionSplats;
 }
 // The .fenv member a video screen's clip is stored as (a baked scene names it so).

@@ -140,11 +140,13 @@ object's details show in Properties, on the right. Shift+A adds things where you
 
 ### 3. Save
 
-1. Choose **File > Save to My Environments** (Ctrl+S).
-2. Studio bakes the home into one `.fenv` file and puts it in My Environments under its name.
+1. Choose **File > Save** (Ctrl+S).
+2. Studio bakes the whole environment into one `.fenv` file and puts it in My Environments
+   (`Documents\Frame Studio\Environments`) under its name.
 
-After the first save, the menu item is called **Save** and writes to the same file. **File > Save As...** saves a
-copy somewhere else.
+Saving again writes to the same file. Save always keeps environments in My Environments: one opened from anywhere
+else becomes a new one there the first time you save it. **File > Export...** (Ctrl+E) writes a copy anywhere you
+choose.
 
 ### 4. Send it to the headset
 

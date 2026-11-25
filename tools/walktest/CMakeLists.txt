@@ -5,6 +5,8 @@
 #   walkcompat save|check <apk> <file>   a saved area (FWG1 from an older build, or FWG2) against a fresh bake
 #   audiotest <file|apk...>      decodes sounds (WAV, MP3, FLAC, Ogg Vorbis / Opus) and homes' ambience
 #   walkgaps <apk>               floors left out of the area and what's between them and it
+#   furniturecheck <apk[+vista]> tables and seats are never walked on (named ones, and small raised floors by shape)
+#   painttest                    painted floor: through plants, the shapes (square, rectangle, polygon), kept in world.json
 #   listcolliders <apk>          the world's box / sphere / capsule colliders
 #   animcheck <apk> <fenv> [sweep s]   a Clay / glTF home's animation from the APK against the baked .fenv (bit for bit)
 #   animrender <home> <prefix> <size> <t,t,...>   the home drawn at those animation times (APK against .fenv)
@@ -46,7 +48,7 @@ add_library(frame-scene STATIC ${R}/src/hsl_scene.cpp ${R}/src/scene_bake.cpp ${
 target_include_directories(frame-scene PUBLIC ${R}/src ${TP}/stb ${TP}/qhe ${TP}/miniz ${TP}/cgltf ${TP}/ufbx ${TP}/acl/includes ${TP}/rtm/includes ${TP}/astcenc/Source)
 set_source_files_properties(${TP}/qhe/cook/hzanim_acl.cpp PROPERTIES COMPILE_OPTIONS "-flax-vector-conversions")
 target_link_libraries(frame-scene PUBLIC miniz lzma zstd smolv meshoptimizer astcenc-sse4.1-static pthread)
-foreach(t walktest walkviz walkfeel walkcompat)
+foreach(t walktest walkviz walkfeel walkcompat painttest)
     add_executable(${t} ${t}.cpp)
     target_link_libraries(${t} frame-scene)
 endforeach()
@@ -66,8 +68,22 @@ target_include_directories(audiotest PRIVATE ${TP}/miniaudio)
 target_link_libraries(audiotest frame-scene opusfile dl m)
 add_executable(walkgaps walkgaps.cpp)
 target_link_libraries(walkgaps frame-scene)
+add_executable(furniturecheck furniturecheck.cpp)
+target_link_libraries(furniturecheck frame-scene)
 add_executable(listcolliders listcolliders.cpp)
 target_link_libraries(listcolliders frame-scene)
+# metafloor <apk> [out.png]: Meta's floor (its colliders' tops) against the walkable area, cell by cell (Meta mode)
+add_executable(metafloor metafloor.cpp)
+target_link_libraries(metafloor frame-scene)
+# walkthrough <apk> [n]: an object set to Walk through gives the area it gives deleted (meshes and Meta's colliders)
+add_executable(walkthrough walkthrough.cpp)
+target_link_libraries(walkthrough frame-scene)
+# navmeshcheck <apk> [nometa]: the walkable area made into navmeshes (src/navmesh.h) and walked on them alone gives the same area
+# grasscheck <apk> [all]: what each mesh is as grass (name, how it's drawn, shape, texture) and what the walkable area takes it for
+add_executable(grasscheck grasscheck.cpp)
+target_link_libraries(grasscheck frame-scene)
+add_executable(navmeshcheck navmeshcheck.cpp)
+target_link_libraries(navmeshcheck frame-scene meshoptimizer)
 add_executable(listmeshes listmeshes.cpp)
 target_link_libraries(listmeshes frame-scene)
 add_executable(filecheck filecheck.cpp)
@@ -94,6 +110,9 @@ if(WIN32)   # (MinGW from WSL: run it on the PC's GPU; lavapipe can't run the re
 else()
     target_link_libraries(worldrender dl)
 endif()
+# pngsheet <out.png> <x> <y> <radius> <scale> <in.png>...: one square cut from several pictures, side by side
+add_executable(pngsheet pngsheet.cpp)
+target_link_libraries(pngsheet frame-scene)
 # animcheck <home.apk> <home.fenv>: a Clay / glTF home's animation from its APK and from the baked .fenv, step by step
 add_executable(animcheck animcheck.cpp)
 target_link_libraries(animcheck frame-scene)
@@ -108,3 +127,7 @@ target_link_libraries(wallcheck frame-scene)
 # bakecmp <home> <home>: both baked as loaded, byte for byte (a .fenv re-baked against its APK's bake)
 add_executable(bakecmp bakecmp.cpp)
 target_link_libraries(bakecmp frame-scene)
+# blenderexport <apk[+vista]|fenv> <out.glb> [threads] [maxTextureSide]: the home and its walk layer as .glb files for Blender
+# (src/blender_export.h), read back with cgltf and checked against the scene
+add_executable(blenderexport blenderexport.cpp ${R}/src/blender_export.cpp)
+target_link_libraries(blenderexport frame-scene)

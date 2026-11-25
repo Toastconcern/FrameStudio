@@ -26,6 +26,7 @@
 #include "gravity.h"
 #include "guide_geom.h"
 #include "world_runtime.h"
+#include "spawn_pick.h"
 
 #include <openvr.h>
 
@@ -132,6 +133,10 @@ public:
     void toSpawn() {
         float x = 0, z = 0, y = 0, yaw = 0;
         if (!world_.spawns.empty()) { const WorldPoint& s = world_.spawns[0]; x = s.pos[0]; y = s.pos[1]; z = s.pos[2]; yaw = s.yaw; }
+        else if (const WalkGrid* g = runtime_.grid()) {     // none: where Frame Studio's Auto spawn goes (spawn_pick.h)
+            float at[3];
+            if (spawnpick::pick(*g, at, yaw)) { x = at[0]; y = at[1]; z = at[2]; }
+        }
         float f;
         if (runtime_.floorAt(x, z, y + 0.5f, 0.6f, 3.0f, f)) y = f;
         rigYaw_ = yaw; rigX_ = x; rigZ_ = z; floorY_ = targetFloor_ = y;
@@ -560,14 +565,18 @@ private:
     void leaveSeat(const float headT[16], float head[3], const float R[16]) {
         if (seated_ < 0) return;
         const WorldPoint& st = world_.seats[seated_];
-        const float c = std::cos(st.yaw), s = std::sin(st.yaw);
-        float ex = st.exit[0], ez = st.exit[2];
-        if (std::hypot(ex, ez) < 0.05f) { ex = 0; ez = -0.5f; }
-        jump_[0] = st.pos[0] + c * ex + s * ez;
-        jump_[2] = st.pos[2] - s * ex + c * ez;
-        float f;
-        if (!runtime_.hasFloor() || !runtime_.floorAt(jump_[0], jump_[2], st.pos[1], 0.3f, 2.0f, f)) { standUp(head, true); return; }
-        jump_[1] = f;
+        // where it stands you up when you can walk there, else the nearest good spot round it (WalkGrid::seatExit)
+        const WalkGrid* g = runtime_.grid();
+        if (!g || !g->seatExit(st, jump_)) {
+            const float c = std::cos(st.yaw), s = std::sin(st.yaw);
+            float ex = st.exit[0], ez = st.exit[2];
+            if (std::hypot(ex, ez) < 0.05f) { ex = 0; ez = -0.5f; }
+            jump_[0] = st.pos[0] + c * ex + s * ez;
+            jump_[2] = st.pos[2] - s * ex + c * ez;
+            float f;
+            if (!runtime_.hasFloor() || !runtime_.floorAt(jump_[0], jump_[2], st.pos[1], 0.3f, 2.0f, f)) { standUp(head, true); return; }
+            jump_[1] = f;
+        }
         jumpSeat_ = -1;
         std::fprintf(stderr, "frame-home: getting up from %s\n", st.name.c_str());
         startJump(headT, head, R, teleport_ == 2);
@@ -590,11 +599,8 @@ private:
         // the seat's own spot when you can stand there; else the nearest good one round the seat (walkgrid.h standUpSpot)
         if (byStick)
             if (const WalkGrid* g = runtime_.grid()) {
-                float h;
-                if (!(g->floorAt(to[0], to[2], st.pos[1], 0.3f, 2.0f, h) && g->walkable(to[0], to[2], h))) {
-                    float spot[3];
-                    if (g->standUpSpot(st.pos, st.yaw, spot)) { to[0] = spot[0]; to[2] = spot[2]; }
-                }
+                float spot[3];
+                if (g->seatExit(st, spot)) { to[0] = spot[0]; to[2] = spot[2]; }
             }
         float f = st.pos[1] - 0.45f;
         if (runtime_.hasFloor() && runtime_.floorAt(to[0], to[2], st.pos[1], 0.3f, 2.0f, f)) {}

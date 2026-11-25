@@ -126,7 +126,7 @@ public:
         }
         for (const WorldCollider& c : w.colliders) {
             if (c.role == WorldCollider::Trigger) continue;
-            const float floorUp = c.role == WorldCollider::Solid ? 0.7f : c.role == WorldCollider::Floor || c.role == WorldCollider::Walkable ? 0.5f : 0.0f;
+            const float floorUp = c.role == WorldCollider::Solid ? 0.7f : c.role == WorldCollider::Floor || c.role == WorldCollider::Walkable || c.role == WorldCollider::Navmesh ? 0.5f : 0.0f;
             const bool blocks = c.role == WorldCollider::Solid || c.role == WorldCollider::Wall || c.role == WorldCollider::Object;
             const bool allWall = c.role == WorldCollider::Wall || c.role == WorldCollider::Object;   // blocks at any slope
             if (c.kind == WorldCollider::Mesh) {

@@ -120,7 +120,7 @@ inline void build(const HomeWorld& w, const WalkGrid* g, std::vector<GuideVertex
     }
     size_t meshEdges = 0;
     for (const WorldCollider& c : w.colliders) {
-        const C col = c.role == WorldCollider::Trigger ? kTrigger : c.role == WorldCollider::Object ? kObject : c.role == WorldCollider::Walkable ? kWalkable : kSolid;
+        const C col = c.role == WorldCollider::Trigger ? kTrigger : c.role == WorldCollider::Object ? kObject : c.role == WorldCollider::Walkable || c.role == WorldCollider::Navmesh ? kWalkable : kSolid;
         switch (c.kind) {
             case WorldCollider::Box: box(o, c.world, c.half, col); break;
             case WorldCollider::Sphere: {

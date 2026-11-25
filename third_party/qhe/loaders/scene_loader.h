@@ -676,6 +676,7 @@ public:
                             // moats). They become invisible walls (Object): they stop you, and their tops, metres up, are
                             // never floor. Flatter ones stay surfaces (floors, ceilings, a desk's top).
                             if (col.role == WorldCollider::Solid && !entityDrawn(ent) && verticalExtent(col) >= 2.0f) col.role = WorldCollider::Object;
+                            col.home = true;                   // (the home's own: what it's walked on)
                             world.colliders.push_back(std::move(col));
                         }
                     }
@@ -1258,10 +1259,18 @@ public:
             if (sp) {
                 auto surfData = readAsset(*sp);
                 if (!surfData.empty()) {
-                    std::vector<SpirvBlob> tmpBlobs; bool passTransparent = false, passA2C = false;
-                    bool parsed = parseRendShadForward(surfData, tmpBlobs, &passTransparent, &passA2C);
+                    std::vector<SpirvBlob> tmpBlobs; bool passTransparent = false, passA2C = false, uniformAlpha = false, passDepthWrite = false;
+                    bool parsed = parseRendShadForward(surfData, tmpBlobs, &passTransparent, &passA2C, &uniformAlpha, &passDepthWrite);
                     if (passTransparent) { md.useBlend = true; log("  [blend] '%s' forward pass = ALPHA-BLENDED (blend state omitted)", md.name.c_str()); }
+                    if (passTransparent && uniformAlpha) {   // one alpha for the whole surface: a glow that adds light
+                        md.additive = true;
+                        log("  [blend] '%s' blended pass with uniform alpha = ADDITIVE glow", md.name.c_str());
+                    }
                     md.alphaToCoverage = passA2C;
+                    // A blended pass that writes depth (SHAD field 3): drawn blended, hiding what's behind it, its own
+                    // far faces included. (Only the pass's own blend: the name rules below see an opaque pass state.)
+                    md.blendDepthWrite = passTransparent && passDepthWrite && !uniformAlpha;
+                    if (md.blendDepthWrite) log("  [blend] '%s' blended pass writes depth", md.name.c_str());
                     if (std::getenv("HSR_BLENDDBG")) log("  [blendchk] '%s' surf=%zuB parsed=%d transp=%d sp=%s", md.name.c_str(), surfData.size(), (int)parsed, (int)passTransparent, sp->c_str());
                 }
             }
@@ -1501,6 +1510,9 @@ public:
         std::set<std::string> claimedPaths;
         size_t fallbackMatIdx = 0;  // cycles through fallbackMats for no-matRef entities
         size_t unrefTexIdx = 0;     // cycles through unrefTextures for no-mat prod entities
+        // The parts of multi-material entities beyond the first material's: each its own mesh with its own material,
+        // added after every entity's mesh (so the meshes already listed keep their places: saved edits name them by index).
+        std::vector<MeshData> partMeshes;
 
         // ── Baked-LIGHTMAP OVERRIDE map (THE warm room lighting). V205 binds each mesh's baked lightmap
         //    (t_<mesh>_lmhdr[2].hdr under .../lightmaps/) BY NAME, NOT via material textureValues — so they
@@ -1817,9 +1829,10 @@ public:
                        log("  DUMPMESH wrote %zu bytes -> %s", meshData.size(), fn.c_str()); }
               }
             }
+            std::vector<RendMeshPart> meshParts;
             if (!parseRendMesh(meshData, md.positions, md.uvs, md.indices,
                                &md.boneIndices, &md.boneWeights, md.name.c_str(), &md.uvs2, &md.bonePalette, &md.colors, &md.uvs3, &md.uvs4,
-                               &md.normals, &md.tangents)) {
+                               &md.normals, &md.tangents, &meshParts)) {
                 recordSkip("RENDMESH parse failed: " + (meshPath ? *meshPath : md.name));
                 log("  SKIP: RENDMESH parse failed");
                 failedCount++;
@@ -1917,23 +1930,31 @@ public:
                 if (obj.skyboxRefl.ing) decodeReflCube(obj.skyboxRefl, md);
             }
 
-            // Path 1: HSTF-provided matRefs (MaterialPlatformComponent — prod envs)
-            for (auto& matRef : obj.matRefs) {
+            // Path 1: HSTF-provided matRefs (MaterialPlatformComponent — prod envs). materials[i] is the material of
+            // the mesh's part i: an entity with several (Del Mar's Palm_Trees_02_new: a patio shellenv material on part
+            // 0, the palm materials on parts 1 and 2) is split below into a mesh per material. Drawn whole with the
+            // first, its fronds and trunk sampled the patio atlas (dark, striped, pink-flecked palms).
+            static const bool noPartMaterials = std::getenv("FH_NO_PART_MATERIALS") != nullptr;   // A/B: drawn whole, as before
+            const bool perPart = obj.matRefs.size() > 1 && meshParts.size() > 1 && !noPartMaterials;
+            MeshData preMaterial;                    // the geometry as parsed, for the other materials' parts
+            if (perPart) preMaterial = md;
+            int appliedMat = -1;
+            auto applyMatRef = [&](const AssetKey& matRef, MeshData& md) -> bool {
                 const std::string* matPath = resolve(matRef);
                 if (!matPath) {
                     log("  Material not in manifest: ing=%016llX tgt=%08X",
                         (unsigned long long)matRef.ing, matRef.tgt);
-                    continue;
+                    return false;
                 }
                 log("  Material: %s", matPath->c_str());
                 // A "pbrlightmap_tiled" material (e.g. rugA) is genuinely TILED -> keep its cooked block
                 // (Tint + GlobalTile) like the room; only the plain-unwrap props (bowls/vases) strip it.
                 md.tiled = (matPath->find("_tiled") != std::string::npos);
                 auto matData = readAsset(*matPath);
-                if (matData.empty()) { recordSkip("material data empty: "+*matPath); log("  Material data empty"); continue; }
+                if (matData.empty()) { recordSkip("material data empty: "+*matPath); log("  Material data empty"); return false; }
 
                 MatlmatlInfo matInfo;
-                if (!parseMatlmatl(matData, matInfo)) { recordSkip("MATLMATL parse failed: "+*matPath); log("  MATLMATL parse failed"); continue; }
+                if (!parseMatlmatl(matData, matInfo)) { recordSkip("MATLMATL parse failed: "+*matPath); log("  MATLMATL parse failed"); return false; }
                 log("  Shader: ing=%016llX  Tex: ing=%016llX",
                     (unsigned long long)matInfo.shaderIng, (unsigned long long)matInfo.texIng);
                 if (std::getenv("HSR_DUMPMAT2") &&
@@ -1943,8 +1964,10 @@ public:
                     log("  MATDUMP %s -> %s (%zu bytes) texIngs=%zu", md.name.c_str(), fn.c_str(), matData.size(), matInfo.texIngs.size());
                 }
 
-                if (applyMat(matInfo, md)) { gotTex = true; break; }
-            }
+                return applyMat(matInfo, md);
+            };
+            for (size_t mi = 0; mi < obj.matRefs.size(); ++mi)
+                if (applyMatRef(obj.matRefs[mi], md)) { gotTex = true; appliedMat = static_cast<int>(mi); break; }
 
             // Path 1b: no MaterialPlatformComponent -> the material the mesh was exported with (nested in the
             // RENDMESH), which is what libshell draws it with. Horror's SM_skybox (unlit + skybox_d.png) and the
@@ -2039,6 +2062,37 @@ public:
             // didn't already get a lightmap from its material and it has lightmap UVs (uv1) to sample.
             meshes.push_back(std::move(md));
             loadedCount++;
+
+            // A mesh per material: the parts of each material but the one applied above get their own mesh (that
+            // material applied to it); the mesh above keeps the rest. A material that doesn't load leaves its parts
+            // where they were.
+            if (perPart && appliedMat >= 0) {
+                std::vector<int> partMat(meshParts.size());
+                for (size_t k = 0; k < meshParts.size(); ++k)
+                    partMat[k] = meshParts[k].part < obj.matRefs.size() ? static_cast<int>(meshParts[k].part) : appliedMat;
+                std::vector<bool> moved(meshParts.size(), false);
+                std::vector<MeshData> split;
+                for (size_t mi = 0; mi < obj.matRefs.size(); ++mi) {
+                    if (static_cast<int>(mi) == appliedMat) continue;
+                    std::vector<bool> sel(meshParts.size(), false);
+                    bool any = false;
+                    for (size_t k = 0; k < meshParts.size(); ++k) if (partMat[k] == static_cast<int>(mi)) sel[k] = any = true;
+                    if (!any) continue;
+                    MeshData pm = preMaterial;
+                    keepMeshParts(pm, meshParts, sel);
+                    if (pm.indices.empty()) continue;
+                    if (!applyMatRef(obj.matRefs[mi], pm)) { log("  part material %zu didn't load: its parts keep the first material", mi); continue; }
+                    for (size_t k = 0; k < meshParts.size(); ++k) if (sel[k]) moved[k] = true;
+                    log("  part material %zu -> a mesh of its own (%u verts, %u tris)", mi, pm.nVerts, pm.nIdx / 3);
+                    split.push_back(std::move(pm));
+                }
+                if (!split.empty() && !std::all_of(moved.begin(), moved.end(), [](bool b) { return b; })) {
+                    std::vector<bool> stay(meshParts.size());
+                    for (size_t k = 0; k < meshParts.size(); ++k) stay[k] = !moved[k];
+                    keepMeshParts(meshes.back(), meshParts, stay);
+                    for (MeshData& pm : split) partMeshes.push_back(std::move(pm));
+                }
+            }
         }
 
         // ── Step 8: Load any __mesh_sub_targets__ files not claimed by Step 7.
@@ -2103,6 +2157,9 @@ public:
                 loadedCount++;
             }
         }
+
+        // Multi-material entities' other parts, each a mesh with its own material (after every other mesh: see Step 7).
+        for (MeshData& pm : partMeshes) { meshes.push_back(std::move(pm)); loadedCount++; }
 
         // The scene's reflection cube when no sky mesh brought one (carried by the first mesh, like a sky's would be)
         if (sceneRefl.ing && !meshes.empty() &&

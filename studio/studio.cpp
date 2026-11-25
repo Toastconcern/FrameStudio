@@ -17,6 +17,9 @@
 #include "loaders/rendmesh_parser.h"
 #include "hsl_scene.h"
 #include "world_gen.h"
+#include "spawn_pick.h"
+#include "navmesh.h"
+#include "blender_export.h"
 #include "surface_mesh.h"
 #include "fenv.h"
 #include "fenv_bundle.h"
@@ -45,6 +48,7 @@ extern "C" int stbi_info_from_memory(const unsigned char* buffer, int len, int* 
 #include <imgui.h>
 #include <imgui_internal.h>              // the self-test reads ImGui's ID-conflict detector
 #include <ImGuizmo.h>                   // needs imgui.h first
+#include "mesh_edit.h"                   // (after ImGuizmo and the world)
 #include <backends/imgui_impl_vulkan.h>
 #ifdef _WIN32
 #include <backends/imgui_impl_win32.h>
@@ -80,6 +84,7 @@ extern "C" int stbi_info_from_memory(const unsigned char* buffer, int len, int* 
 #include <set>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <vector>
 
 #ifdef _WIN32
@@ -396,7 +401,9 @@ int categorize(const std::string& name, const std::string& surface, bool skybox)
     std::string n = name + " " + surface;
     for (char& c : n) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
     if (anyOf(n, {"emiss", "light", "lamp", "glow", "candle", "sconce", "globe", "lantern", "neon"})) return kLights;
-    if (anyOf(n, {"plant", "leaves", "leaf", "tree", "bush", "grass", "flower", "branch", "vege", "fern", "vine", "moss"})) return kPlants;
+    // plants by their words (the Draw tool brushes through them: "street" isn't a tree, "ravine" no vine; walkgrid.h),
+    // but not ground with grass on it ("GrassGround": the brush lands on that)
+    if (walkNameIsPlant(walkNameWords(name + " " + surface)) && !walkNameIsGround(name)) return kPlants;
     if (anyOf(n, {"terrain", "ground", "rock", "boulder", "cliff", "mountain", "water", "lake", "river", "waterfall", "sand",
                   "island", "ocean", "sea", "fog", "cloud", "hill", "dirt", "gravel", "shore"})) return kTerrain;
     if (anyOf(n, {"wall", "floor", "ceiling", "cieling", "beam", "trim", "window", "door", "platform", "moat", "blocker", "blkt",
@@ -446,9 +453,10 @@ enum WorldKind { kSpawn, kSeat, kHotspot, kCollider, kGravity, kWorldKinds };
 const char* kWorldNames[kWorldKinds] = {"Spawns", "Seats", "Teleport Hotspots", "Walls & Surfaces", "Gravity Zones"};
 
 // What the viewport can show, each with its own switch (View > Show, the explorer's World headers).
-enum ShowCat { kShowSpawns, kShowSeats, kShowHotspots, kShowFloors, kShowWalls, kShowSolidMeshes, kShowTriggers, kShowGravity, kShowWalkArea, kShowUnreached, kShowCats };
-const char* kShowNames[kShowCats] = {"Spawn points", "Seats", "Teleport hotspots", "Drawn floors", "Surface shapes", "Surface & collider meshes", "Triggers", "Gravity zones", "Walkable area", "Floors out of reach"};
-const uint32_t kShowColors[kShowCats] = {0x3fd2ff, 0x5fe07a, 0xffd84a, 0x4cd964, 0xff7a2e, 0xffa033, 0x9a9a9a, 0xc07aff, 0x2ec756, 0x808080};
+enum ShowCat { kShowSpawns, kShowSeats, kShowHotspots, kShowFloors, kShowWalls, kShowSolidMeshes, kShowTriggers, kShowGravity, kShowWalkArea, kShowUnreached, kShowSteps, kShowCats };
+const char* kShowNames[kShowCats] = {"Spawn points", "Seats", "Teleport hotspots", "Drawn floors", "Surface shapes", "Surface & collider meshes", "Triggers", "Gravity zones", "Navmesh", "Floors out of reach",
+                                     "Steps & ledges"};
+const uint32_t kShowColors[kShowCats] = {0x3fd2ff, 0x5fe07a, 0xffd84a, 0x4cd964, 0xff7a2e, 0xffa033, 0x9a9a9a, 0xc07aff, 0x2ec756, 0x808080, 0xff3fa4};
 
 // A gravity zone's kind (WorldGravity::Kind), as Studio names and explains it.
 const char* kGravityNames[3] = {"Direction", "Planet", "Walk on any surface"};
@@ -461,28 +469,42 @@ const char* kGravityHelp[3] = {
 // enough, and where it's too steep to walk up it's a wall (WorldCollider::Solid). A thing that isn't a floor (a vase,
 // a sofa, a lamp) gets a Collider: it stops you, you never stand on it (Object). Or you walk through it (Trigger).
 // (Older files' Floor and Wall roles are read as Solid: core/world.h.)
-const char* kRoleNames[6] = {"Surface", "Surface", "Surface", "Walk through", "Collider", "Drawn floor"};
-const char* kRoleHelp[6] = {
+// The key held with a drag for more of a thing (Draw Seats: a row). Cmd on a Mac, where ImGui reads Cmd as Ctrl and
+// makes Ctrl+click a right-click.
+#ifdef __APPLE__
+#define FS_MOD_KEY "Cmd"
+#else
+#define FS_MOD_KEY "Ctrl"
+#endif
+
+const char* kRoleHelp[7] = {
     "Walk on it where it's flat enough; where it's too steep to walk up, it's a wall.",
     "Walk on it where it's flat enough; where it's too steep to walk up, it's a wall.",
     "Walk on it where it's flat enough; where it's too steep to walk up, it's a wall.",
     "Doesn't block or carry you (Meta's trigger volumes).",
     "Stops you: you don't walk through it, and never stand on it.",
-    "A floor drawn on a thing (Draw Floor): you can always stand on it, even on furniture."};
-const uint32_t kRoleColors[6] = {0xffa033, 0x4cd964, 0xff7a2e, 0x9a9a9a, 0xb07aff, 0x4cd964};
+    "A floor drawn on a thing (Draw Floor): you can always stand on it, even on furniture.",
+    "A piece of the navmesh (where you walk). A home with pieces is walked on them alone, exactly on their faces. Tab edits its corners."};
+const uint32_t kRoleColors[7] = {0xffa033, 0x4cd964, 0xff7a2e, 0x9a9a9a, 0xb07aff, 0x4cd964, 0x2ec756};
 
 // What an object is for the player: a Surface (one linked Solid collider of all its triangles: walkable where it's
 // flat enough, a wall where it's too steep to walk up), walked through, or left to the walkable area (Auto).
 enum SurfaceMode { kSurfNone, kSurfSolid, kSurfObject, kSurfTrigger, kSurfModes };
 const char* kSurfNames[kSurfModes] = {"Auto", "Surface", "Collider", "Walk through"};
 const char* kSurfHelp[kSurfModes] = {
-    "Automatic: the walkable area decides from its shape (floors you can reach and stand under headroom; anything in the way blocks).",
-    "Walk on it where it's flat enough; where it's too steep to walk up, it's a wall.",
-    "A thing, not a floor: it stops you (you don't walk through it) and you never stand on it.",
-    "Left out: you walk through it (leaves, curtains, light shafts). A trigger volume."};
+    "Automatic: the navmesh decides from its shape (floors you can reach and stand under headroom; anything in the way blocks).",
+    "Collision on, and you can stand on it: walk on it where it's flat enough; where it's too steep to walk up, it's a wall.",
+    "Collision on: it stops you (you don't walk through it), and you never stand on it.",
+    "No collision: you walk straight through it (leaves, curtains, light shafts). A trigger volume."};
 constexpr float kFloorCos = 0.766f;        // cos 40 deg: steeper than this is wall, never floor
 constexpr uint32_t kFloorTint = 0x4cd964, kWallTint = 0xff7a2e;
-const char* kAutoPrefix = "Auto ";        // surfaces World > Auto-generate made (a re-run replaces them)
+const char* kAutoPrefix = "Auto ";
+const char* kMakeNavmeshTip = "Edit the navmesh's corners (Tab): it's made into pieces first, one for each area you can walk apart (Meta's\n"
+                              "navmesh where the home has one), and from then on the home is walked on them alone, exactly on their\n"
+                              "faces. Click corners, move them with the gizmo; X deletes, E extrudes, F fills. Tab when done.";
+const char* kResetWalkTip = "Deletes the navmesh (one undo step): its pieces, what Auto-generate made, the painted floor and the saved\n"
+                            "area go. Nothing is walkable then, and it isn't made again by itself: Auto-generate or Add Navmesh does.\n"
+                            "What you placed or drew yourself (walls, seats, spawns, floors) stays.";        // surfaces World > Auto-generate made (a re-run replaces them)
 
 enum class Tool { Move, Rotate, Scale, DrawFloor };
 
@@ -501,7 +523,8 @@ uint32_t kWidgetHover = 0x373737, kWidgetActive = 0x3d3d3d;
 uint32_t kBlue = 0x2f6fe0, kBlueHover = 0x4886ef, kBlueActive = 0x265cbb, kSelect = 0x293a5a;
 uint32_t kOrange = 0xffa033, kText = 0xe6e6e6, kDim = 0x9a9a9a, kHeading = 0xc3c3c3;
 uint32_t kLine = 0x2f2f2f, kSplit = 0x0e0e0e;                       // hairlines between things, and the gutter between areas
-uint32_t kHeader = 0x1a1a1a, kPanelBox = 0x242424;                   // an area's header strip; a Properties panel
+uint32_t kHeader = 0x1a1a1a, kPanelBox = 0x242424;                   // an area's header strip; a Properties panel's body
+uint32_t kPanelHead = 0x2a2a2a;                                      // ...and its header row (a little lighter, as Blender's)
 uint32_t kViewBg = 0x2c2c2c;                                         // the 3D viewport behind the home
 uint32_t kToolBg = 0x191919, kToolHover = 0x202020;                 // the viewport's toolbar and navigation buttons
 uint32_t kDanger = 0x4a2420, kDangerHover = 0xd4463a;               // Delete, Remove, Cancel the load
@@ -533,6 +556,7 @@ const ThemeDef kThemes[] = {
     {"Contrast",    0x000000, 0x121212, 0x121212, 0x8a8a8a, 0x606060, 0x1e1e1e, 0xffffff, 0xd4d4d4, 0x9ecbff, 0x1d5fd6, 0x174fb4, 0x8ae8a3, 0xff9b93, 0xc2352a, 0xa02219},
     {"Paper",       0xf2e7d3, 0xfdf6e8, 0xfdf6e8, 0x8a785f, 0xcdb99a, 0xe6d7ba, 0x2b2620, 0x665b4c, 0x1f5591, 0x2f5d96, 0x24507f, 0x2b6136, 0xa3291a, 0xa3291a, 0x872015},
     {"Light",       0xffffff, 0xfafafa, 0xffffff, 0xc4c4c4, 0xe0e0e0, 0xf6f6f6, 0x1a1a1a, 0x6b6b6b, 0x1a4f9c, 0x1a5fd0, 0x144ba8, 0x1f6b34, 0xa32218, 0xa32218, 0x8a1d14},
+    {"Blender",     0x1d1d1d, 0x303030, 0x282828, 0x6a6a6a, 0x262626, 0x3d3d3d, 0xe6e6e6, 0x9d9d9d, 0x71a8ff, 0x4772b3, 0x5680c2, 0x74c98c, 0xef8078, 0xc2352a, 0xd4463a},
 };
 constexpr int kThemeCount = static_cast<int>(sizeof(kThemes) / sizeof(kThemes[0]));
 int g_theme = 0;   // the chosen theme (index into kThemes), saved in studio-settings.txt
@@ -546,6 +570,7 @@ void applyThemeColors(const ThemeDef& t) {
     kListAlt = mix(t.panel, t.hover, 0.6f);
     kHeader = mix(t.bg, t.panel, 0.5f);
     kPanelBox = mix(t.panel, t.hover, 0.7f);
+    kPanelHead = mix(kPanelBox, t.border, 0.12f);
     kWidget = mix(t.panel, t.border, 0.30f);
     kWidgetHover = mix(t.panel, t.border, 0.50f);
     kWidgetActive = mix(t.panel, t.border, 0.68f);
@@ -713,6 +738,32 @@ struct Studio {
     std::string homeName;
     std::vector<Object> objects;
     int selected = -1;
+    // More objects selected with it (Ctrl+click or Shift+click in the view or the Outliner). `selected` stays the one
+    // the gizmo and the Object tab show.
+    std::vector<int> alsoSelected;
+    bool isSelected(int i) const { return i == selected || std::find(alsoSelected.begin(), alsoSelected.end(), i) != alsoSelected.end(); }
+    // Every object selected, the gizmo's first; deleted ones left out.
+    std::vector<int> selectedObjects() const {
+        std::vector<int> out;
+        if (selected >= 0 && selected < static_cast<int>(objects.size()) && !objects[selected].deleted) out.push_back(selected);
+        for (int i : alsoSelected)
+            if (i >= 0 && i < static_cast<int>(objects.size()) && !objects[i].deleted && i != selected) out.push_back(i);
+        return out;
+    }
+    // Shift+click on an object: in the selection, or out of it if it was.
+    void toggleSelected(int i) {
+        if (i == selected) {
+            selected = -1;
+            if (!alsoSelected.empty()) { selected = alsoSelected.back(); alsoSelected.pop_back(); }
+        } else if (auto it = std::find(alsoSelected.begin(), alsoSelected.end(), i); it != alsoSelected.end()) {
+            alsoSelected.erase(it);
+        } else {
+            if (selected >= 0) alsoSelected.push_back(selected);
+            selected = i;
+        }
+        splatSel = -1;
+        wKind = wIndex = -1;
+    }
     std::vector<SplatItem> splatItems;      // per HslScene::splats entry
     int splatSel = -1;                      // the selected splat object (selected and wKind are -1 then)
     bool dirty = false;
@@ -732,7 +783,7 @@ struct Studio {
     int wKind = -1, wIndex = -1;
     bool showWorld = true;
     // What the viewport shows. View only: the per-item eyes (hidden) are kept with the world layer.
-    bool showCat[kShowCats] = {true, true, true, true, true, false, false, true, true, true};
+    bool showCat[kShowCats] = {true, true, true, true, true, false, false, true, true, false, true};   // (floors out of reach: never shown)
     bool showMeshes = true;                 // the home's own objects
     bool isolating = false;                 // View > Show Only Selected (I)
     int isoObject = -1, isoKind = -1, isoIndex = -1, isoSplat = -1;
@@ -1370,6 +1421,7 @@ struct Studio {
     void open(std::vector<std::string> paths, bool pair = true) {
         if (paths.size() == 1 && isFenvBundlePath(paths[0])) { openBundle(paths[0]); return; }   // a bundle: its environments, listed
         if (paths.empty() || loadState == 1 || saving) return;
+        if (blenderBusy) { note("Wait for the Blender export to finish"); return; }   // (it reads this home's meshes)
         if (pair) carry = Carry();                                     // another environment: nothing carries over
         if (pair && !pairVista(paths)) return;                         // asked which vista: opens from the picker
         if (!confirmDiscard()) return;
@@ -1441,7 +1493,7 @@ struct Studio {
 
     bool isLoading() const { return loadState == 1 || uploading || texLoading; }
     // Whether the window's picture can change without any input: the frame pacer stops drawing when it can't.
-    bool viewChangesByItself() const { return isLoading() || saving || flying || (scene && animPlaying) || walkJob; }   // (a walk bake: shown when done)
+    bool viewChangesByItself() const { return isLoading() || saving || flying || walking || (scene && animPlaying) || walkJob; }   // (a walk bake: shown when done)
 
     // After loadPromptAfter seconds: keep waiting (asked again a minute later), stop loading, or close Studio now.
     void loadPrompt() {
@@ -1541,6 +1593,11 @@ struct Studio {
 
     void finishLoad() {
         if (benchFrames > 0 && --benchFrames == 0) benchPick();
+        finishBlenderExport();
+        // a rectangle's or polygon's corners go when its tool does (another tool, Draw Wall or Seats, another shape)
+        if (!shapeCorners.empty() && !(tool == Tool::DrawFloor && drawWhat == DrawWhat::Floor &&
+                                       (floorShape == FloorShape::Rect || floorShape == FloorShape::Polygon)))
+            shapeCorners.clear();
         if (!saving && saver.joinable()) {
             saver.join();
             if (!savedEnvironment.empty()) { recentInfo.erase(savedEnvironment + "|"); addRecent({savedEnvironment}); savedEnvironment.clear(); }
@@ -1595,13 +1652,15 @@ struct Studio {
         selected = -1;
         wKind = wIndex = -1;
         isolating = false;
+        dropViewActions();
         worldEdited = false;
         dirty = false;
         homePaths = loadingPaths;
         homeName = displayName(homePaths);
-        // A home or models: a new one. So is an environment opened out of a bundle: its .fenv is a scratch copy
-        // (bundle-unpacked, emptied the next time a member is opened), and Save must not write the changes there.
-        if (!carry.any) envFile = homePaths.size() == 1 && isFenvPath(homePaths[0]) && !inBundleScratch(homePaths[0]) ? homePaths[0] : std::string();
+        // Save keeps everything in My Environments: an environment that lives there saves back into itself; anything
+        // else (a home or models, a .fenv from Downloads or a bundle, an auto-saved version) is a new one there, named
+        // on its first save. Export writes a copy anywhere.
+        if (!carry.any) envFile = homePaths.size() == 1 && isFenvPath(homePaths[0]) && inLibrary(homePaths[0]) ? homePaths[0] : std::string();
         autosavedAt = std::chrono::steady_clock::now();
         addRecent(homePaths);
         takeCarriedPastes();                          // (a reload: what was pasted in comes along)
@@ -1635,8 +1694,13 @@ struct Studio {
             o.surface = s == std::string::npos ? prog : prog.substr(b == std::string::npos ? 0 : b + 1, s - (b == std::string::npos ? 0 : b + 1));
             o.skybox = md.isSkybox;
             o.triangles = md.indices.size() / 3;
-            o.category = categorize(o.name, o.surface, o.skybox);
             o.label = cleanName(o.name);
+            o.category = categorize(o.label, o.surface, o.skybox);   // (its own name: not its file's, "treehouse_world.fbx.Sky_mat")
+            if (o.category != kPlants && o.category != kSky && (md.useBlend || md.alphaTest)) {   // (grass, ferns, flowers by their look: cut away, leafy, low)
+                float f[16];
+                if (md.hasWorldMatrix) std::memcpy(f, md.worldMatrix, sizeof f); else trsToMat4(md.transform, f);
+                if (meshLook(md, f).grass && !walkNameIsStructure(o.label)) o.category = kPlants;
+            }
             o.folders.clear();
             for (size_t a = 0; a <= md.path.size();) {                 // a template instance and its root often share
                 const size_t b = std::min(md.path.find('/', a), md.path.size());   // a name: one folder, not two
@@ -1879,17 +1943,17 @@ struct Studio {
         if (!picked.empty()) addSoundFile(picked.front());
     }
 
-    // In ENVIRONMENT: how loud the home's own ambience plays, and a background sound of your own.
+    // Scene > Sound: how loud the home's own ambience plays, a background sound of your own, and saving either.
     void soundPanel() {
         const SoundState before = sound;
-        auto percent = [&](const char* id, float& v, const char* on, const char* off, const char* tip, AudioPlayer& p) {
+        auto percent = [&](const char* label, const char* id, float& v, const char* tipText, AudioPlayer& p) {
+            fieldLabel(label);
             int pc = static_cast<int>(std::lround(v * 100));
-            ImGui::SetNextItemWidth(-1);
-            const bool changed = ImGui::SliderInt(id, &pc, 0, 100, pc ? on : off);
+            const bool changed = ImGui::SliderInt(id, &pc, 0, 100, pc ? "%d%%" : "Off");
             // a drag is one undo step, taken when the value first changes (a click alone isn't an edit)
             if (ImGui::IsItemActivated()) { soundFieldBefore = before; soundFieldPushed = false; }
             if (changed && !soundFieldPushed) { pushSoundUndo(soundFieldBefore); soundFieldPushed = true; }
-            if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", tip);
+            tip(tipText);
             if (!changed) return;
             const bool wasOff = v <= 0;
             v = pc / 100.0f;
@@ -1898,32 +1962,41 @@ struct Studio {
             dirty = true;
             updateTitle();
         };
-        if (!scene->ambientOgg.empty())
-            percent("##homevolume", sound.s.homeVolume, "Home's own sound %d%%", "Home's own sound: off",
-                    "How loud the home's own ambience plays (in Frame Home too). Off: only your background sound.", ambience);
-        ImGui::Spacing();
+        const bool own = !scene->ambientOgg.empty();
+        if (own)
+            percent("Home's sound", "##homevolume", sound.s.homeVolume,
+                    "How loud the home's own ambience (an Ogg loop) plays, in Frame Home too. Off: only your background sound.", ambience);
+        else {
+            fieldLabel("Home's sound");
+            ImGui::TextUnformatted(scene->ambientSource.empty() ? "None of its own" : "FMOD bank (ambience bed)");
+        }
+        fieldLabel("Background");
         if (sound.bytes) {
-            ImGui::PushStyleColor(ImGuiCol_Text, hex(kOrange));
-            ImGui::TextWrapped("♪ %s", sound.name.c_str());
-            ImGui::PopStyleColor();
-            if (!addedSound.ok && ImGui::IsItemHovered()) ImGui::SetTooltip("It isn't playing here (no audio device?): see studio.log");
-            percent("##soundvolume", sound.s.volume, "Background sound %d%%", "Background sound: silent",
-                    "How loud your background sound plays, here and in Frame Home.", addedSound);
-            if (rowButton("Replace…", true)) chooseSound();
-            if (rowButton("Remove")) {
-                pushSoundUndo(before);
-                sound.bytes.reset();
-                sound.s.file.clear();
-                sound.s.name.clear();
-                sound.name.clear();
-                addedSound.stop();
-                setStatus("Background sound removed");
-            }
-        } else {
-            if (ImGui::Button("Add Background Sound…")) chooseSound();
-            ImGui::PushTextWrapPos(0);
-            ImGui::TextDisabled("Loops behind the home, on the Frame too. Ogg, Opus, WAV, MP3 or FLAC — or drop one on the window.");
-            ImGui::PopTextWrapPos();
+            ImGui::TextUnformatted(sound.name.c_str());
+            tip(addedSound.ok ? nullptr : "It isn't playing here (no audio device?): see studio.log");
+            percent("Volume", "##soundvolume", sound.s.volume, "How loud your background sound plays, here and in Frame Home.", addedSound);
+        } else ImGui::TextDisabled("None");
+        buttonRow(sound.bytes ? 2 : 1);
+        if (rowButton(sound.bytes ? "Replace…" : "Add Sound…", "A sound that loops behind the home, on the Frame too: Ogg, Opus, WAV, MP3 or FLAC\n"
+                                                                "(or drop one on the window)"))
+            chooseSound();
+        if (sound.bytes && rowButton("Remove", nullptr, true, Look::Danger)) {
+            pushSoundUndo(before);
+            sound.bytes.reset();
+            sound.s.file.clear();
+            sound.s.name.clear();
+            sound.name.clear();
+            addedSound.stop();
+            setStatus("Background sound removed");
+        }
+        // the sounds it uses, to keep: the home's own ambience (an Ogg file) and the one added to it
+        const int saves = (own ? 1 : 0) + (sound.bytes ? 1 : 0);
+        if (saves) {
+            buttonRow(saves);
+            if (own && rowButton("Save Home's Sound…", "The home's own ambience as it plays (Ogg Vorbis)"))
+                saveSoundAs(scene->ambientOgg, (scene->ambientName.empty() ? shownName() + " ambience" : scene->ambientName) + ".ogg");
+            if (sound.bytes && rowButton("Save Added Sound…", "Your background sound as you added it"))
+                saveSoundAs(*sound.bytes, sound.name.empty() ? sound.s.file : sound.name);
         }
     }
 
@@ -1941,7 +2014,7 @@ struct Studio {
 
     void closeHome() {
         // Not mid-load: the upload steps in finishLoad still use the scene.
-        if (!scene || saving || uploading || texLoading || loadState == 1 || !confirmDiscard()) return;
+        if (!scene || saving || uploading || texLoading || loadState == 1 || blenderBusy || !confirmDiscard()) return;
         if (loader.joinable() && loadState != 1) loader.join();
         vkDeviceWaitIdle(renderer.device());
         screens.stop();
@@ -1951,6 +2024,7 @@ struct Studio {
         sound = SoundState();
         dropWalkJob();
         scene.reset();
+        dropViewActions();
         walkShown.reset(); walkReport = WalkReport{}; walkSig = 0; walkPending = walkSaveNext = walkAsStored = false;
         renderer.setStaticGuide({}); walkGuideOn = false;
         resetTrim();
@@ -2394,18 +2468,46 @@ struct Studio {
         return narrow(dst.wstring());
     }
 
-    // File > Save (Ctrl+S): the environment, into its own file: an environment opened saves back into itself; a Meta
-    // home or models opened is a new one, saved into My Environments under its name the first time.
-    std::string envFile;                    // the .fenv it saves to ("" = new: named on its first save)
+    // File > Save (Ctrl+S): the whole environment (its homes or baked scene, edits, world layer, models, sound, sky
+    // and picture) as one .fenv in My Environments (Documents\Frame Studio\Environments): back into its own file
+    // there, or a new one under its name the first time. File > Export writes the same anywhere else.
+    std::string envFile;                    // the .fenv in My Environments it saves to ("" = new: named on its first save)
+    // The file in My Environments an environment called `name` saves to: "<name>.fenv", or "<name> 2.fenv"... when
+    // another environment has that name already. keep: its own file now, which it may keep.
+    static fs::path libraryFileFor(const std::string& name, const fs::path& keep) {
+        const std::wstring stem = fileStem(name);
+        std::error_code ec;
+        fs::path p = libraryDir() / (stem + L".fenv");
+        for (int n = 2; fs::exists(p, ec) && !(!keep.empty() && fs::equivalent(p, keep, ec)); ++n)
+            p = libraryDir() / (stem + L" " + std::to_wstring(n) + L".fenv");
+        return p;
+    }
+    // The name is the file's: an environment renamed since it was saved has its file in My Environments renamed to
+    // match before it's saved again (its old name leaves Open Recent).
+    void renameToName() {
+        const fs::path now(widen(envFile));
+        const fs::path want = libraryFileFor(shownName(), now);
+        std::error_code ec;
+        if (want == now || fs::equivalent(want, now, ec)) return;
+        if (fs::exists(now, ec)) {
+            fs::rename(now, want, ec);
+            if (ec) { setStatus("Couldn't rename " + narrow(now.filename().wstring()) + " to " + narrow(want.filename().wstring()) + ": " + ec.message()); return; }
+        }
+        recent.erase(std::remove(recent.begin(), recent.end(), std::vector<std::string>{envFile}), recent.end());
+        envFile = narrow(want.wstring());
+        if (homePaths.size() == 1 && isFenvPath(homePaths[0]) && fs::path(widen(homePaths[0])) == now) homePaths[0] = envFile;
+    }
+    // A file right in My Environments (not its Versions, nor anywhere else).
+    static bool inLibrary(const std::string& path) {
+        std::error_code ec;
+        const fs::path dir = fs::path(widen(path)).parent_path();
+        return fs::equivalent(dir, libraryDir(), ec);
+    }
     void saveToLibrary() {
         if (saving) { saveQueued = true; return; }                     // after the one under way (an auto-save)
         if (!scene || uploading || !splatBudgetOk("Save")) return;
-        if (envFile.empty()) {
-            const std::wstring name = fileStem(shownName());
-            fs::path p = libraryDir() / (name + L".fenv");
-            for (int n = 2; fs::exists(p); ++n) p = libraryDir() / (name + L" " + std::to_wstring(n) + L".fenv");
-            envFile = narrow(p.wstring());
-        }
+        if (envFile.empty()) envFile = narrow(libraryFileFor(shownName(), {}).wstring());
+        else renameToName();
         if (!saveEnvironment(envFile)) return;                         // (didn't start: still unsaved)
         dirty = false;                                                 // (back on if the save fails)
         updateTitle();
@@ -2472,16 +2574,70 @@ struct Studio {
         return name;
     }
 
-    // File > Save As: the open home with its edits, world layer, models and a thumbnail, as one .fenv anywhere.
-    void saveEnvironmentDialog() {
-        if (!scene || saving || uploading || !splatBudgetOk("Save")) return;
-        const std::string name = suggestedFileName(shownName());
-        const std::string path = platform::saveFile("Save as a Frame environment", name + ".fenv", {{"Frame environment", {"*.fenv"}}}, "fenv");
+    // File > Export for Blender: the environment as glTF (.glb: each object with its textures, the sky) and, beside it,
+    // "<name>_navmesh.glb": the walkable area alone, with the colliders and the spawns, seats and hotspots (one file to
+    // delete or edit apart). Written on a worker; the meshes aren't changed meanwhile (animation waits, nothing pastes).
+    std::thread blenderJob;
+    std::atomic<bool> blenderBusy{false};
+    std::atomic<float> blenderProgress{0};
+    std::mutex blenderMutex;
+    std::string blenderResult;                 // (set by the worker when done: shown in the status bar)
+    void exportBlenderDialog() {
+        if (!scene || saving || uploading || blenderBusy) return;
+        const std::string path = platform::saveFile("Export for Blender", suggestedFileName(shownName()) + ".glb",
+                                                    {{"glTF binary (Blender, other 3D tools)", {"*.glb"}}}, "glb");
         if (path.empty()) return;
-        envFile = path;                                                // Save goes there from now on
-        if (!saveEnvironment(envFile)) return;                         // (didn't start: still unsaved)
-        dirty = false;
-        updateTitle();
+        std::vector<blender::ExportObject> out;
+        for (const Object& o : objects) {
+            if (o.deleted || o.hidden || o.scene < 0 || o.scene >= static_cast<int>(scene->meshes.size())) continue;
+            blender::ExportObject e;
+            e.mesh = o.scene;
+            mul(o.pivot, o.offset, e.world);
+            e.name = o.label.empty() ? o.name : o.label;
+            e.folders = o.folders;
+            out.push_back(std::move(e));
+        }
+        if (blenderJob.joinable()) blenderJob.join();
+        blenderBusy = true;
+        blenderProgress = 0;
+        note("Exporting for Blender\u2026");
+        const std::shared_ptr<const WalkGrid> walk = walkShown;
+        const HomeWorld world = scene->world;
+        const HslScene* sc = scene.get();
+        blenderJob = std::thread([this, sc, out = std::move(out), walk, world, path] {
+            blender::ExportOptions opt;
+            opt.progress = [this](float f, const char*) { blenderProgress = f; };
+            blender::ExportStats stats;
+            std::string err;
+            const std::string nav = blender::navmeshPathFor(path);
+            const bool ok = exportBlender(*sc, out, walk.get(), world, path, nav, err, opt, &stats);
+            std::lock_guard<std::mutex> l(blenderMutex);
+            blenderResult = ok ? "Exported for Blender: " + narrow(fs::path(widen(path)).filename().wstring()) + " and " +
+                                     narrow(fs::path(widen(nav)).filename().wstring()) + " (the navmesh, colliders and spawns: its own file)"
+                               : "Couldn't export for Blender: " + err;
+            blenderBusy = false;
+        });
+    }
+    void finishBlenderExport() {   // (each frame: the worker's result into the status bar)
+        if (blenderBusy) { char b[64]; std::snprintf(b, sizeof b, "Exporting for Blender\u2026 %.0f%%", blenderProgress * 100); note(b); return; }
+        if (!blenderJob.joinable()) return;
+        blenderJob.join();
+        std::lock_guard<std::mutex> l(blenderMutex);
+        note(blenderResult);
+    }
+
+    // File > Export (Ctrl+Shift+S): the whole environment, as Save writes it, as a .fenv anywhere: a copy to share or
+    // keep elsewhere. Save still goes to My Environments, and what's unsaved there stays unsaved.
+    void exportEnvironmentDialog() {
+        if (!scene || saving || uploading || !splatBudgetOk("Export")) return;
+        const std::string name = suggestedFileName(shownName());
+        const std::string path = platform::saveFile("Export the environment", name + ".fenv", {{"Frame environment", {"*.fenv"}}}, "fenv");
+        if (path.empty()) return;
+        if (!envFile.empty()) {
+            std::error_code ec;
+            if (fs::equivalent(fs::path(widen(path)), fs::path(widen(envFile)), ec)) { saveToLibrary(); return; }   // (that's Save)
+        }
+        saveEnvironment(path, false);
     }
 
     // remember: list it under Open Recent (not for the installer's own copies). False when it couldn't start.
@@ -2715,7 +2871,7 @@ struct Studio {
         worldSettings = keep;
         tuning = true;
         const std::string host8 = hostArg();
-        const u32 needs = trimOnSave ? kSceneBakeVersion : sceneBakeVersionFor(*scene);   // (a trimmed save draws meshes one side only: 16)
+        const u32 needs = trimOnSave ? std::max(kSceneBakeVersionCullBack, sceneBakeVersionFor(*scene)) : sceneBakeVersionFor(*scene);   // (a trimmed save draws meshes one side only: 16)
         tuner = std::thread([this, fenv, host8, needs] {
             const std::wstring ssh = sshTool(L"ssh") + L"-o BatchMode=yes -o ConnectTimeout=8 " + widen(host8) + L" ";
             const std::wstring scp = sshTool(L"scp") + L"-q -o BatchMode=yes -o ConnectTimeout=8 ";
@@ -2792,21 +2948,234 @@ struct Studio {
         unsigned char* px = bytes.empty() ? nullptr : stbi_load_from_memory(bytes.data(), static_cast<int>(bytes.size()), &w, &h, &c, 4);
         if (!px) { platform::message("Frame Studio", "That isn't a picture Frame Studio can read: " + narrow(src.filename().wstring()), platform::Icon::Warning); return; }
         stbi_image_free(px);
+        std::string ext = narrow(src.extension().wstring());
+        for (char& ch : ext) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+        if (!setEnvImage(bytes, ext)) platform::message("Frame Studio", "Couldn't copy the picture beside the edits.", platform::Icon::Warning);
+    }
+    // A picture's bytes (a file of type ext, ".png") as the environment's picture: copied beside the edits as
+    // "<home>.image-<hash><ext>", which Save puts in the .fenv. False: it couldn't be written.
+    bool setEnvImage(const std::vector<u8>& bytes, const std::string& ext) {
         uint32_t hsh = 2166136261u;
         for (u8 b : bytes) hsh = (hsh ^ b) * 16777619u;
         char hx[16];
         std::snprintf(hx, sizeof hx, "%08x", hsh);
-        std::string ext = narrow(src.extension().wstring());
-        for (char& ch : ext) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
         const std::string name = frameName(homePaths.front()) + ".image-" + hx + ext;
         std::error_code ec;
         fs::create_directories(editsFile().parent_path(), ec);
         std::ofstream out(editsFile().parent_path() / fs::u8path(name), std::ios::binary);
         out.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
-        if (!out) { platform::message("Frame Studio", "Couldn't copy the picture beside the edits.", platform::Icon::Warning); return; }
+        if (!out) return false;
         envImage = name;
         dirty = true;
         updateTitle();
+        return true;
+    }
+
+    // ── The picture taken from the view (Environment > Picture > Take from View, F12): the viewport shows the
+    //    picture's 16:9 frame with nothing of the editor in it (no markers, walkable area, selection); Enter or
+    //    Take Picture renders exactly that frame at 1920 x 1080 at the start of the next frame and makes it the
+    //    environment's picture (the headset's Environments panel shows pictures 16:9). ──
+    static constexpr float kPictureAspect = 16.0f / 9.0f;
+    static constexpr uint32_t kPictureWidth = 1920, kPictureHeight = 1080;
+    bool framingPicture = false;            // the viewport shows the picture's frame
+    bool pictureWanted = false;             // take it at the start of the next frame (before the UI draws the view)
+    // The picture's share of the viewport across and down: the biggest 16:9 rectangle in its middle.
+    void pictureShare(float& across, float& down) const {
+        const float va = viewSize.y > 1 ? viewSize.x / viewSize.y : kPictureAspect;
+        across = down = 1;
+        if (va > kPictureAspect) across = kPictureAspect / va;
+        else down = va / kPictureAspect;
+    }
+    void framePicture(bool on) {
+        framingPicture = on && scene;
+        walkGuideDirty = true;
+    }
+    // Frame loop, before sizeViewport: renders the frame asked for at the picture's size, reads it back, and puts
+    // the renderer back to the viewport's size (sizeViewport makes the view's texture again).
+    void takeRequestedPicture() {
+        if (!pictureWanted) return;
+        pictureWanted = false;
+        if (!scene || viewSize.x < 8 || viewSize.y < 8) return;
+        float across, down;
+        pictureShare(across, down);
+        const float tyView = std::tan(kFovY * 0.5f), txView = tyView * viewSize.x / viewSize.y;
+        renderer.resize(kPictureWidth, kPictureHeight);
+        viewW = viewH = 0;                                  // (sizeViewport: back to the view's size, its texture again)
+        renderer.setSelection(-1);
+        if (walkGuideOn) { renderer.setStaticGuide({}); walkGuideOn = false; }
+        walkGuideDirty = true;
+        const int keptView = renderer.debugView();
+        if (keptView != HslRenderer::kViewNormal) renderer.setDebugView(HslRenderer::kViewNormal);
+        float pose[16], view[16];
+        cam.pose(pose);
+        invert(pose, view);
+        EyeView eye;
+        eye.proj = rendererProjection(txView * across, tyView * down);
+        std::memcpy(eye.view.m, view, 64);
+        std::memcpy(eye.position, &pose[12], 12);
+        EyeView eyes[2] = {eye, eye};
+        renderer.render(eyes, scene->animate ? animTime : animBase + animTime);
+        std::vector<u8> rgba;
+        const bool read = renderer.readback(0, rgba) && rgba.size() >= static_cast<size_t>(kPictureWidth) * kPictureHeight * 4;
+        if (keptView != HslRenderer::kViewNormal) renderer.setDebugView(keptView);
+        rendered = false;
+        if (!read) { setStatus("Couldn't read the picture back from the GPU."); return; }
+        for (size_t i = 3; i < rgba.size(); i += 4) rgba[i] = 255;
+        std::vector<u8> png;
+        stbi_write_png_to_func([](void* ctx, void* data, int size) {
+            auto* v = static_cast<std::vector<u8>*>(ctx);
+            v->insert(v->end(), static_cast<u8*>(data), static_cast<u8*>(data) + size);
+        }, &png, kPictureWidth, kPictureHeight, 4, rgba.data(), kPictureWidth * 4);
+        if (png.empty() || !setEnvImage(png, ".png")) { setStatus("Couldn't save the picture beside the edits."); return; }
+        framingPicture = false;
+        setStatus("Picture taken: it's this environment's picture now (saved with it).");
+    }
+    // ── Walk mode (V): the home as someone walking round it sees it. W A S D walk on the walkable area the way Frame
+    //    Home's stick does (sliding along its edges, up and down stairs, never off it), eyes 1.6 m over the floor; drag
+    //    to look round, Shift to run. Nothing of the editor is drawn over it. V or Esc puts the editor's view back. ──
+    bool walking = false;
+    Camera walkKeptCam;                     // the editor's view while walking, back when walking stops
+    float walkFeet[3] = {0, 0, 0};          // where the walker stands, on the floor
+    float walkEyeY = 0;                     // the eyes' height, following the floor smoothly (no jolt on a stair)
+    static constexpr float kWalkSpeed = 1.4f, kRunSpeed = 3.2f;   // m/s
+    bool cleanView() const { return framingPicture || walking; }   // the view without the editor's markers over it
+    // Starts on the floor the view looks at (when it's walkable), else at the first spawn, else where a spawn would go.
+    void startWalking() {
+        if (!scene || walking) return;
+        float at[3] = {0, 0, 0}, yaw = cam.yaw;
+        bool found = false;
+        float hit[3];
+        if (walkShown && pickSurface(viewPos.x + viewSize.x * 0.5f, viewPos.y + viewSize.y * 0.5f, hit)) {
+            float h;
+            if (walkShown->floorAt(hit[0], hit[2], hit[1] + 0.3f, 0.4f, 0.6f, h) && walkShown->walkable(hit[0], hit[2], h)) {
+                at[0] = hit[0]; at[1] = h; at[2] = hit[2];
+                found = true;
+            }
+        }
+        if (!found && !scene->world.spawns.empty()) {
+            const WorldPoint& sp = scene->world.spawns[0];
+            std::copy_n(sp.pos, 3, at);
+            yaw = sp.yaw;
+            float h;
+            if (walkShown && walkShown->floorAt(at[0], at[2], at[1] + 0.5f, 0.6f, 3.0f, h)) at[1] = h;
+            found = true;
+        }
+        if (!found && walkShown) found = spawnpick::pick(*walkShown, at, yaw);
+        if (!found) {                                       // no floor known: under the camera, a standing height down
+            float e[3];
+            cam.eye(e);
+            at[0] = e[0]; at[1] = e[1] - spawnpick::kEyeHeight; at[2] = e[2];
+        }
+        walkKeptCam = cam;
+        walking = true;
+        drag = -1;
+        std::copy_n(at, 3, walkFeet);
+        walkEyeY = at[1] + spawnpick::kEyeHeight;
+        cam.yaw = yaw;
+        cam.pitch = 0;
+        placeWalkCamera();
+        walkGuideDirty = true;
+    }
+    void stopWalking() {
+        if (!walking) return;
+        walking = false;
+        cam = walkKeptCam;
+        walkGuideDirty = true;
+    }
+    // What's under way in the view that belongs to the home it started in: a stroke, a shape's corners, walking, the
+    // picture's frame. Dropped when another home opens or this one closes (none of it carries to another).
+    void dropViewActions() {
+        painting = false;
+        strokePath.clear();
+        shapeCorners.clear();
+        shapeEndSet = false;
+        walking = false;                    // (not back to the kept camera: that was the other home's)
+        framingPicture = pictureWanted = false;
+        alsoSelected.clear();
+    }
+    void placeWalkCamera() {
+        cam.dist = 0.05f;
+        float f[3];
+        cam.forward(f);
+        const float eye[3] = {walkFeet[0], walkEyeY, walkFeet[2]};
+        for (int k = 0; k < 3; ++k) cam.pivot[k] = eye[k] + f[k] * cam.dist;
+    }
+    // One frame of walking: look (a drag, or the arrow keys), then the step, along the walkable area.
+    void walkStep(bool hovered) {
+        ImGuiIO& io = ImGui::GetIO();
+        const float dt = std::min(0.1f, io.DeltaTime);
+        const bool dragging = hovered && (ImGui::IsMouseDown(ImGuiMouseButton_Left) || ImGui::IsMouseDown(ImGuiMouseButton_Right) || ImGui::IsMouseDown(ImGuiMouseButton_Middle));
+        if (dragging) {
+            cam.yaw -= io.MouseDelta.x * 0.004f;
+            cam.pitch = std::clamp(cam.pitch - io.MouseDelta.y * 0.004f, -1.45f, 1.45f);
+        }
+        if (!io.WantTextInput) {
+            if (ImGui::IsKeyDown(ImGuiKey_LeftArrow)) cam.yaw += 1.8f * dt;
+            if (ImGui::IsKeyDown(ImGuiKey_RightArrow)) cam.yaw -= 1.8f * dt;
+            if (ImGui::IsKeyDown(ImGuiKey_UpArrow)) cam.pitch = std::min(1.45f, cam.pitch + 1.2f * dt);
+            if (ImGui::IsKeyDown(ImGuiKey_DownArrow)) cam.pitch = std::max(-1.45f, cam.pitch - 1.2f * dt);
+        }
+        float ahead = 0, aside = 0;
+        if (!io.WantTextInput) {
+            ahead += ImGui::IsKeyDown(ImGuiKey_W) ? 1.0f : 0.0f;
+            ahead -= ImGui::IsKeyDown(ImGuiKey_S) ? 1.0f : 0.0f;
+            aside += ImGui::IsKeyDown(ImGuiKey_D) ? 1.0f : 0.0f;
+            aside -= ImGui::IsKeyDown(ImGuiKey_A) ? 1.0f : 0.0f;
+        }
+        const float len = std::hypot(ahead, aside);
+        if (len > 0) {
+            const float speed = (io.KeyShift ? kRunSpeed : kWalkSpeed) * dt / len;
+            const float sy = std::sin(cam.yaw), cy = std::cos(cam.yaw);   // ahead: (-sin, -cos); right: (cos, -sin)
+            const float dx = (-sy * ahead + cy * aside) * speed, dz = (-cy * ahead - sy * aside) * speed;
+            if (walkShown) {
+                walkShown->move(walkFeet[0], walkFeet[2], walkFeet[1], dx, dz);
+                float h;
+                if (walkShown->floorAt(walkFeet[0], walkFeet[2], walkFeet[1], walkShown->p.step, walkShown->p.step + 0.3f, h)) walkFeet[1] = h;
+            } else {
+                walkFeet[0] += dx;
+                walkFeet[2] += dz;
+            }
+        }
+        walkEyeY += (walkFeet[1] + spawnpick::kEyeHeight - walkEyeY) * std::min(1.0f, dt * 12);
+        placeWalkCamera();
+    }
+    void drawWalkHint(ImDrawList* dl) {
+        const char* hint = "Walking  \u00b7  W A S D to walk, drag to look, Shift to run  \u00b7  F12: picture  \u00b7  V or Esc: back to editing";
+        const ImVec2 ts = ImGui::CalcTextSize(hint);
+        const ImVec2 tp(viewPos.x + (viewSize.x - ts.x) * 0.5f, viewPos.y + 14 * scale);
+        dl->AddRectFilled(ImVec2(tp.x - 10 * scale, tp.y - 6 * scale), ImVec2(tp.x + ts.x + 10 * scale, tp.y + ts.y + 6 * scale), IM_COL32(20, 20, 20, 200), 3 * scale);
+        dl->AddText(tp, IM_COL32(235, 235, 235, 255), hint);
+        if (!walkShown) {
+            const char* why = "No navmesh yet: walking freely at this height";
+            const ImVec2 ws = ImGui::CalcTextSize(why);
+            dl->AddText(ImVec2(viewPos.x + (viewSize.x - ws.x) * 0.5f, tp.y + ts.y + 14 * scale), IM_COL32(255, 200, 120, 255), why);
+        }
+    }
+
+    // While framing: the area outside the picture dimmed, its frame with thirds, and how to take it.
+    void drawPictureFrame(ImDrawList* dl) {
+        if (!framingPicture) return;
+        float across, down;
+        pictureShare(across, down);
+        const ImVec2 size(viewSize.x * across, viewSize.y * down);
+        const ImVec2 a(viewPos.x + (viewSize.x - size.x) * 0.5f, viewPos.y + (viewSize.y - size.y) * 0.5f), b(a.x + size.x, a.y + size.y);
+        const ImVec2 v0 = viewPos, v1(viewPos.x + viewSize.x, viewPos.y + viewSize.y);
+        const ImU32 shade = IM_COL32(0, 0, 0, 150);
+        dl->AddRectFilled(v0, ImVec2(v1.x, a.y), shade);
+        dl->AddRectFilled(ImVec2(v0.x, b.y), v1, shade);
+        dl->AddRectFilled(ImVec2(v0.x, a.y), ImVec2(a.x, b.y), shade);
+        dl->AddRectFilled(ImVec2(b.x, a.y), ImVec2(v1.x, b.y), shade);
+        dl->AddRect(a, b, IM_COL32(255, 255, 255, 200), 0, 0, 1.5f * scale);
+        for (int k = 1; k <= 2; ++k) {
+            const float x = a.x + size.x * k / 3, y = a.y + size.y * k / 3;
+            dl->AddLine(ImVec2(x, a.y), ImVec2(x, b.y), IM_COL32(255, 255, 255, 45), 1);
+            dl->AddLine(ImVec2(a.x, y), ImVec2(b.x, y), IM_COL32(255, 255, 255, 45), 1);
+        }
+        const char* hint = "Line up the picture (fly: hold right mouse + W A S D  \u00b7  walk: V)    Enter: Take Picture    Esc: Cancel";
+        const ImVec2 ts = ImGui::CalcTextSize(hint);
+        const ImVec2 tp(viewPos.x + (viewSize.x - ts.x) * 0.5f, b.y - ts.y - 12 * scale);
+        dl->AddRectFilled(ImVec2(tp.x - 10 * scale, tp.y - 6 * scale), ImVec2(tp.x + ts.x + 10 * scale, tp.y + ts.y + 6 * scale), IM_COL32(20, 20, 20, 210), 3 * scale);
+        dl->AddText(tp, IM_COL32(235, 235, 235, 255), hint);
     }
     // A .fenv's thumbnail when it has no picture of its own: the home as you first see it in Frame Home, from the first
     // spawn (standing on the floor under it, eyes 1.6 m up, facing its way, a little down). One frame drawn from there
@@ -2851,6 +3220,27 @@ struct Studio {
         }
         cam = kept;
         return png;
+    }
+
+    // One frame from eyes at `eye` looking along yaw / pitch, without the selection or the walkable area, read back as
+    // RGBA (w x h, top row first); the view is put back after. Empty: nothing was drawn.
+    std::vector<u8> viewPicture(const float eye[3], float yaw, float pitch, uint32_t& w, uint32_t& h) {
+        const Camera kept = cam;
+        cam.yaw = yaw;
+        cam.pitch = pitch;
+        cam.dist = 0.5f;
+        float fwd[3];
+        cam.forward(fwd);
+        for (int k = 0; k < 3; ++k) cam.pivot[k] = eye[k] + fwd[k] * cam.dist;
+        renderer.setSelection(-1);
+        if (walkGuideOn) { renderer.setStaticGuide({}); walkGuideOn = false; walkGuideDirty = true; }   // (back next frame)
+        renderViewport(!viewTex);
+        std::vector<u8> rgba;
+        w = renderer.width();
+        h = renderer.height();
+        if (!rendered || w <= 8 || h <= 8 || !renderer.readback(0, rgba) || rgba.size() < static_cast<size_t>(w) * h * 4) rgba.clear();
+        cam = kept;
+        return rgba;
     }
 
     // The picture as the .fenv's thumbnail: 512 px wide, PNG (empty: none chosen, or it doesn't read).
@@ -2917,7 +3307,7 @@ struct Studio {
         std::vector<std::string> old;                                  // the pair as separately sent before
         for (const auto& p : homePaths) old.push_back(frameName(p));
         const std::string editsName = frameName(homePaths.front()), host8 = hostArg();
-        const u32 needs = trimOnSave ? kSceneBakeVersion : sceneBakeVersionFor(*scene);   // (a trimmed save draws meshes one side only: 16)
+        const u32 needs = trimOnSave ? std::max(kSceneBakeVersionCullBack, sceneBakeVersionFor(*scene)) : sceneBakeVersionFor(*scene);   // (a trimmed save draws meshes one side only: 16)
         sender = std::thread([this, fenv, old, editsName, host8, needs] {
             const std::wstring ssh = sshTool(L"ssh") + L"-o BatchMode=yes -o ConnectTimeout=8 ";
             const std::wstring scp = sshTool(L"scp") + L"-q -o BatchMode=yes -o ConnectTimeout=8 ";
@@ -3002,6 +3392,29 @@ struct Studio {
 
     int surfaceIndex(const Object& o) const { const std::vector<int> v = surfaceParts(o); return v.empty() ? -1 : v[0]; }
 
+    // Grass: grass, ferns, flowers, weeds, moss, leaves on the ground (low things that grow, and that you walk through),
+    // by its look (low, upright, cut out round leafy green: hsl_scene's meshLook) or by its name, low and standing up.
+    // Not a lawn lying flat (ground), not a bush, a hedge or a tree, not a fence (whatever its texture).
+    bool isGrassObject(const Object& o) const {
+        if (!canHaveCollision(o)) return false;
+        const MeshData& md = scene->meshes[o.scene];
+        float f[16];
+        mul(o.pivot, o.offset, f);
+        const MeshLook look = meshLook(md, f);
+        if (look.flat || walkNameIsStructure(o.label)) return false;
+        if (look.grass) return true;
+        static const char* const kGrass[] = {"grass", "fern", "flower", "weed", "clover", "moss", "reed", "petal", "bracken", "frond", "leaf", "leaves",
+                                             "seaweed", "kelp", "daisy", "tulip", "lily", "lilies", "dandelion", "tuft"};
+        bool named = false;
+        for (const std::string& t : walkNameWords(o.label))
+            for (const char* r : kGrass) {
+                const size_t n = std::strlen(r);
+                if (t.size() >= n && (t.compare(0, n, r) == 0 || t.compare(t.size() - n, n, r) == 0 || (t.size() > n && t.back() == 's' && t.compare(t.size() - n - 1, n, r) == 0)))
+                    named = true;
+            }
+        return named && look.pieceHeight > 0 && look.pieceHeight <= 1.2f && look.up < 0.6f;
+    }
+
     // The object's SurfaceMode, read off the roles of its parts.
     int surfaceMode(const Object& o) const {
         const std::vector<int> parts = surfaceParts(o);
@@ -3017,6 +3430,17 @@ struct Studio {
     }
 
     // Opaque, solid, not a distant backdrop or the sky.
+    // Whether you can give an object collision yourself (its Collision buttons, the right-click menu): any mesh but
+    // the sky and far backdrops, see-through and glowing ones too (a glass wall, a hedge of cut-out leaves).
+    bool canHaveCollision(const Object& o) const {
+        if (!scene || o.deleted || o.skybox || o.scene < 0 || o.scene >= static_cast<int>(scene->meshes.size())) return false;
+        const MeshData& md = scene->meshes[o.scene];
+        if (md.indices.empty() || md.positions.empty()) return false;
+        float mn[3], mx[3];
+        worldBounds(o, mn, mx);
+        return mx[0] - mn[0] < 200 && mx[1] - mn[1] < 200 && mx[2] - mn[2] < 200;
+    }
+    // Whether the automatic passes (Auto-generate, World > All Meshes) treat it as solid: not see-through or glowing.
     bool canBeSurface(const Object& o) const {
         if (!scene || o.deleted || o.skybox || o.scene < 0 || o.scene >= static_cast<int>(scene->meshes.size())) return false;
         const MeshData& md = scene->meshes[o.scene];
@@ -3144,7 +3568,7 @@ struct Studio {
         pushWorldUndo();
         const int count = wKind >= 0 ? worldCount(wKind) : 0;
         for (size_t i : objs)
-            if (mode == kSurfNone || canBeSurface(objects[i])) makeSurface(objects[i], mode);
+            if (mode == kSurfNone || canHaveCollision(objects[i])) makeSurface(objects[i], mode);
         if (wKind >= 0 && worldCount(wKind) != count) wKind = wIndex = -1;   // (surfaces made or removed: the selected index moved)
         worldReplaced();
     }
@@ -3166,6 +3590,64 @@ struct Studio {
     // ── Draw Floor: a floor drawn on an object's faces, by hand (the brush) or all its flat faces at once. It's its own
     //    collider (Walkable, linked as "<object>#floor"): always floor, even on a table; the object still blocks. ──
     float floorBrush = 0.3f;                // the brush's radius (m)
+    // Draw Floor's shapes: the round or the square brush (dragged: dabs), a rectangle (dragged corner to corner) or a
+    // polygon (clicked corner by corner: a click on the first corner, Enter or a double-click closes it; Backspace
+    // takes the last corner back, Esc drops it). Shift: it erases. The square and the rectangle line up with the
+    // view, and with the world's axes when the view is within 8 degrees of them.
+    enum class FloorShape { Round, Square, Rect, Polygon, kCount };
+    FloorShape floorShape = FloorShape::Round;
+    static const char* floorShapeName(FloorShape f) {
+        return f == FloorShape::Square ? "Square" : f == FloorShape::Rect ? "Rectangle" : f == FloorShape::Polygon ? "Polygon" : "Round";
+    }
+    std::vector<std::array<float, 3>> shapeCorners;   // a rectangle's pressed corner / a polygon's corners so far
+    ImVec2 toScreen(const float* p, const float* vp) const {   // a world point on the viewport (behind the camera: far off)
+        float c[4];
+        for (int k = 0; k < 4; ++k) c[k] = vp[k] * p[0] + vp[4 + k] * p[1] + vp[8 + k] * p[2] + vp[12 + k];
+        if (c[3] < kNear) return ImVec2(-1e9f, -1e9f);
+        return ImVec2(viewPos.x + (c[0] / c[3] * 0.5f + 0.5f) * viewSize.x, viewPos.y + (0.5f - c[1] / c[3] * 0.5f) * viewSize.y);
+    }
+    float shapeEnd[3] = {};                 // a rectangle's other corner (on the first one's level)
+    bool shapeEndSet = false;
+    float viewYaw() const {                 // the view's turn for the square and the rectangle (WalkStroke::yaw)
+        float f[3];
+        cam.forward(f);
+        float y = std::atan2(-f[0], -f[2]);
+        const float q = kPi * 0.5f, off = std::remainder(y, q);
+        if (std::fabs(off) < 8.0f * kPi / 180) y -= off;
+        return y;
+    }
+    // A rectangle from one corner to the opposite one, turned by yaw (WalkStroke's frame: local x = (cos, -sin))
+    static WalkStroke rectStroke(const float* a, const float* b, float yaw) {
+        WalkStroke k;
+        k.shape = WalkStroke::Rect;
+        std::copy_n(a, 3, k.pos);
+        k.yaw = yaw;
+        const float c = std::cos(yaw), sn = std::sin(yaw);
+        auto local = [&](const float* q, float& lx, float& lz) { lx = q[0] * c - q[2] * sn; lz = q[0] * sn + q[2] * c; };
+        float ax, az, bx, bz;
+        local(a, ax, az); local(b, bx, bz);
+        const float mx = (ax + bx) * 0.5f, mz = (az + bz) * 0.5f;
+        k.centre[0] = mx * c + mz * sn; k.centre[1] = -mx * sn + mz * c;
+        k.half[0] = std::fabs(bx - ax) * 0.5f; k.half[1] = std::fabs(bz - az) * 0.5f;
+        return k;
+    }
+    // A stroke's outline, flat at its level (a round one: 32 points round it)
+    static std::vector<std::array<float, 3>> strokeOutline(const WalkStroke& k) {
+        std::vector<std::array<float, 3>> o;
+        const float y = k.pos[1] + 0.01f;
+        if (k.shape == WalkStroke::Polygon) {
+            for (size_t i = 0; i + 1 < k.outline.size(); i += 2) o.push_back({k.outline[i], y, k.outline[i + 1]});
+        } else if (k.shape == WalkStroke::Square || k.shape == WalkStroke::Rect) {
+            const float cx = k.shape == WalkStroke::Rect ? k.centre[0] : k.pos[0], cz = k.shape == WalkStroke::Rect ? k.centre[1] : k.pos[2];
+            const float hx = k.shape == WalkStroke::Rect ? k.half[0] : k.radius, hz = k.shape == WalkStroke::Rect ? k.half[1] : k.radius;
+            const float c = std::cos(k.yaw), sn = std::sin(k.yaw);
+            static const float corner[4][2] = {{-1, -1}, {1, -1}, {1, 1}, {-1, 1}};
+            for (const auto& q : corner) { const float lx = q[0] * hx, lz = q[1] * hz; o.push_back({cx + lx * c + lz * sn, y, cz - lx * sn + lz * c}); }
+        } else {
+            for (int i = 0; i < 32; ++i) { const float a = i * 2 * kPi / 32; o.push_back({k.pos[0] + k.radius * std::cos(a), y, k.pos[2] + k.radius * std::sin(a)}); }
+        }
+        return o;
+    }
     bool painting = false;                  // a stroke is going (one undo step)
     bool brushShown = false;
     float brushAt[3] = {};
@@ -3225,9 +3707,14 @@ struct Studio {
     DrawWhat drawWhat = DrawWhat::Floor;
     float drawnWallHeight = 2.5f;           // (m)
     static constexpr float kSeatSpacing = 0.6f;   // a drawn row's seats apart (m): about one person
+    // Draw Seats: pressed where the seat goes, dragged the way it faces (a click: it faces you); Ctrl+drag: a row
+    static constexpr float kSeatAimMin = 0.15f;   // a drag shorter than this is a click (m)
+    bool seatRow = false, seatAimed = false;
+    float seatAim[3] = {};                  // where the drag is, on the seat's level
     std::vector<std::array<float, 3>> strokePath;   // a wall / seat stroke's points on the surfaces, so far
     bool drawing() const { return tool == Tool::DrawFloor; }   // the Draw mode: nothing moves in it (Arrange mode moves)
     static const char* drawWhatName(DrawWhat d) { return d == DrawWhat::Wall ? "Draw Wall" : d == DrawWhat::Seat ? "Draw Seats" : "Draw Floor"; }
+    bool seatAiming() const { return tool == Tool::DrawFloor && drawWhat == DrawWhat::Seat && painting && !seatRow && !strokePath.empty(); }
     void extendStroke(const float* at) {
         if (!strokePath.empty()) {
             const auto& b = strokePath.back();
@@ -3258,10 +3745,43 @@ struct Studio {
         for (size_t i = 0; i < in.size(); ++i) if (keep[i]) out.push_back(in[i]);
         return out;
     }
-    // A wall along the stroke: an invisible wall (World > Add > Invisible Wall's kind) per straight run, standing on
-    // the surface under it, a little longer than the run so the corners close. Returns how many.
+    // The runs a wall stroke means: its corners kept and its wobble dropped (simplifyPath), a run within 4 degrees of a
+    // multiple of 45 made exactly that, and each end that stops on open floor carried on to the solid thing it was
+    // drawn up to (a wall, a rail, a sofa: up to half a metre on), so there's no gap to slip through.
+    std::vector<std::array<float, 3>> wallRuns(const std::vector<std::array<float, 3>>& stroke) const {
+        std::vector<std::array<float, 3>> path = simplifyPath(stroke);
+        if (path.size() < 2) return path;
+        for (size_t i = 1; i < path.size(); ++i) {
+            const float dx = path[i][0] - path[i - 1][0], dz = path[i][2] - path[i - 1][2], L = std::hypot(dx, dz);
+            if (L < 0.05f) continue;
+            const float a = std::atan2(dz, dx), step = kPi / 4, snapped = std::round(a / step) * step;
+            if (std::fabs(a - snapped) > 4 * kPi / 180) continue;
+            const float mx = path[i - 1][0] + std::cos(snapped) * L - path[i][0], mz = path[i - 1][2] + std::sin(snapped) * L - path[i][2];
+            for (size_t j = i; j < path.size(); ++j) { path[j][0] += mx; path[j][2] += mz; }   // (the rest of the line comes along)
+        }
+        if (const WalkGrid* g = walkShown.get()) {
+            auto reach = [&](std::array<float, 3>& end, const std::array<float, 3>& from) {
+                const float dx = end[0] - from[0], dz = end[2] - from[2], L = std::hypot(dx, dz);
+                if (L < 0.05f) return;
+                const float ux = dx / L, uz = dz / L;
+                float h;
+                if (!g->floorAt(end[0], end[2], end[1] + 0.3f, 0.4f, 1.0f, h) || g->field(end[0], end[2], h) < 0) return;   // (it ends at something already)
+                for (float d = 0.05f; d <= 0.5f; d += 0.05f)
+                    if (g->field(end[0] + ux * d, end[2] + uz * d, h) < 0) {   // the area's edge: the thing is a body's width on
+                        end[0] += ux * (d + 0.15f);
+                        end[2] += uz * (d + 0.15f);
+                        return;
+                    }
+            };
+            reach(path.front(), path[1]);
+            reach(path.back(), path[path.size() - 2]);
+        }
+        return path;
+    }
+    // A wall along the stroke: an invisible wall (World > Add > Invisible Wall's kind) per straight run (wallRuns),
+    // standing on the floor under it, a little longer than the run so the corners close. Returns how many.
     int commitDrawnWall() {
-        const std::vector<std::array<float, 3>> path = simplifyPath(strokePath);
+        const std::vector<std::array<float, 3>> path = wallRuns(strokePath);
         if (path.size() < 2) return 0;
         HomeWorld& w = scene->world;
         int n = 1, made = 0;
@@ -3273,7 +3793,13 @@ struct Studio {
             const float dx = b[0] - a[0], dz = b[2] - a[2], L = std::hypot(dx, dz);
             if (L < 0.05f) continue;
             const float ux = dx / L, uz = dz / L;
-            const float base = std::min(a[1], b[1]) - 0.05f;   // (into the floor a bit: no gap under it)
+            float base = std::min(a[1], b[1]);
+            if (const WalkGrid* g = walkShown.get())               // the floor under it, along its length
+                for (float t = 0; t <= 1.0f; t += 0.25f) {
+                    float h;
+                    if (g->floorAt(a[0] + dx * t, a[2] + dz * t, a[1] + (b[1] - a[1]) * t + 0.3f, 0.4f, 1.0f, h)) base = std::min(base, h);
+                }
+            base -= 0.05f;                                          // (into the floor a bit: no gap under it)
             WorldCollider c;
             c.name = "Drawn wall " + std::to_string(n++);
             c.kind = WorldCollider::Box;
@@ -3288,8 +3814,9 @@ struct Studio {
         if (made) { wKind = kCollider; wIndex = static_cast<int>(w.colliders.size()) - 1; selected = -1; walkPending = true; }
         return made;
     }
-    // Seats along the stroke (one for a click), on the surface where it touched, facing the camera's side of the line
-    // (a click: facing the camera); you stand up half a metre in front. Returns how many.
+    // Seats exactly where they're drawn: one where it was pressed, facing the way it was dragged (a click: facing the
+    // camera); a row (seatRow), one every kSeatSpacing along the line facing the camera's side of it. Each stands up
+    // somewhere walkable round it. Returns how many.
     int commitDrawnSeats() {
         if (strokePath.empty()) return 0;
         float fwd[3];
@@ -3299,9 +3826,11 @@ struct Studio {
         auto yawFacing = [](float fx, float fz) { return std::atan2(-fx, -fz); };   // (yaw 0 faces -Z)
         double len = 0;
         for (size_t i = 1; i < strokePath.size(); ++i) len += std::hypot(strokePath[i][0] - strokePath[i - 1][0], strokePath[i][2] - strokePath[i - 1][2]);
-        if (len < kSeatSpacing * 0.5) {
+        if (!seatRow || len < kSeatSpacing * 0.5) {
             const auto& p = strokePath.front();
-            put.push_back({p[0], p[1], p[2], yawFacing(-fwd[0], -fwd[2])});
+            const float ax = seatAim[0] - p[0], az = seatAim[2] - p[2];
+            const bool aimed = !seatRow && seatAimed && std::hypot(ax, az) >= kSeatAimMin;
+            put.push_back({p[0], p[1], p[2], aimed ? yawFacing(ax, az) : yawFacing(-fwd[0], -fwd[2])});
         } else {
             const int count = std::max(1, static_cast<int>(std::floor(len / kSeatSpacing + 0.5)));
             const double gap = len / count;
@@ -3331,25 +3860,443 @@ struct Studio {
             autoStandUp(p);
             w.seats.push_back(p);
         }
-        if (!put.empty()) { wKind = kSeat; wIndex = worldCount(kSeat) - 1; selected = -1; walkPending = true; }
+        if (!put.empty()) { wKind = kSeat; wIndex = worldCount(kSeat) - 1; selected = -1; walkPending = true; dirty = worldEdited = true; updateTitle(); }
         return static_cast<int>(put.size());
     }
-    bool paintDab(const float* at, float radius, bool erase) {
+    bool paintDab(const float* at, float radius, bool erase, bool square = false) {
         std::vector<WalkStroke>& p = scene->world.walkPaint;
+        const int shape = square ? WalkStroke::Square : WalkStroke::Round;
+        const float yaw = square ? viewYaw() : 0.0f;
         if (p.size() > strokeFrom) {
             const WalkStroke& last = p.back();
             const float d = std::hypot(last.pos[0] - at[0], last.pos[2] - at[2]);
-            if (last.erase == erase && std::fabs(last.radius - radius) < 1e-4f && d < radius * 0.3f && std::fabs(last.pos[1] - at[1]) < 0.1f) return false;
+            if (last.erase == erase && last.shape == shape && std::fabs(last.yaw - yaw) < 1e-4f && std::fabs(last.radius - radius) < 1e-4f && d < radius * 0.3f &&
+                std::fabs(last.pos[1] - at[1]) < 0.1f) return false;
         }
         WalkStroke k;
         std::copy_n(at, 3, k.pos);
         k.radius = radius;
         k.erase = erase;
+        k.shape = shape;
+        k.yaw = yaw;
         p.push_back(k);
         walkPending = true;
         dirty = worldEdited = true;
         return true;
     }
+    // A rectangle or a polygon drawn: one stroke, one undo step (pushed by the caller). False: too small to be one.
+    bool addShape(WalkStroke k, bool erase) {
+        k.erase = erase;
+        if (!k.valid() || (k.shape == WalkStroke::Rect && (k.half[0] < 0.05f || k.half[1] < 0.05f))) return false;
+        if (k.shape == WalkStroke::Polygon) {
+            double area = 0;
+            const size_t n = k.outline.size() / 2;
+            for (size_t i = 0, j = n - 1; i < n; j = i++) area += k.outline[j * 2] * k.outline[i * 2 + 1] - k.outline[i * 2] * k.outline[j * 2 + 1];
+            if (std::fabs(area) * 0.5 < 0.01) return false;
+        }
+        scene->world.walkPaint.push_back(std::move(k));
+        walkPending = true;
+        dirty = worldEdited = true;
+        updateTitle();
+        return true;
+    }
+    bool closePolygon(bool erase) {
+        if (shapeCorners.size() < 3) return false;
+        WalkStroke k;
+        k.shape = WalkStroke::Polygon;
+        std::copy_n(shapeCorners.front().data(), 3, k.pos);
+        for (const auto& c : shapeCorners) { k.outline.push_back(c[0]); k.outline.push_back(c[2]); }
+        pushWorldUndo();
+        strokeFrom = scene->world.walkPaint.size();
+        const bool made = addShape(std::move(k), erase);
+        if (!made && !undo.empty()) undo.pop_back();
+        shapeCorners.clear();
+        return made;
+    }
+    // World > Delete Navmesh (the walkable area and the navmesh are one): its pieces, what Auto-generate made (its
+    // colliders, spawn, seats and hotspots), the painted floor and the saved area go, and the settings are Standard
+    // again. Nothing is walkable then, and nothing makes it again by itself (HomeWorld::walkNone): Auto-generate or Add
+    // Navmesh does. What you placed or drew yourself (walls, seats, spawns, floors) and the objects' own Collision
+    // settings stay. One undo step.
+    void resetWalk() {
+        if (!scene) return;
+        pushWorldUndo();
+        HomeWorld& w = scene->world;
+        int removed = 0;
+        auto drop = [&](auto& v, auto pred) {
+            const size_t n = v.size();
+            v.erase(std::remove_if(v.begin(), v.end(), pred), v.end());
+            removed += static_cast<int>(n - v.size());
+        };
+        meshEdit.end();
+        wAlso.clear();
+        drop(w.colliders, [](const WorldCollider& c) { return isAuto(c.name) || c.role == WorldCollider::Navmesh; });
+        drop(w.spawns, [](const WorldPoint& q) { return q.name == "Auto spawn"; });
+        drop(w.seats, [](const WorldPoint& q) { return isAuto(q.name); });
+        drop(w.hotspots, [](const WorldPoint& q) { return isAuto(q.name); });
+        const bool painted = !w.walkPaint.empty();
+        w.walkPaint.clear();
+        strokeFrom = 0;
+        w.walkGrid.clear();
+        w.walkGridCache.reset();
+        w.walkNone = true;
+        walkEdit = WalkParams{};
+        walkAreaPicked = false;
+        walkSaveNext = false;
+        wKind = wIndex = -1;
+        worldReplaced();
+        walkPending = true;
+        walkChanged = std::chrono::steady_clock::now();
+        note("Navmesh deleted" + std::string(removed ? ": " + std::to_string(removed) + " piece" + (removed == 1 ? "" : "s") + " and auto-generated item" + (removed == 1 ? "" : "s") + " removed" : "") +
+             (painted ? ", painted floor cleared" : "") + ". Nothing is walkable until you Auto-generate it or Add Navmesh. Ctrl+Z puts it back.");
+    }
+    // ── Navmeshes (WorldCollider::Navmesh, src/navmesh.h): the walkable area as meshes you edit ──
+    // World > Make Navmesh from Walkable Area: the area as it is now, a navmesh for each area walkable apart, in place of
+    // the navmeshes there. One undo step.
+    void makeNavmesh() {
+        if (!scene || !walkShown) { note("The navmesh isn't ready yet"); return; }
+        const std::vector<NavmeshPiece> pieces = navmeshFromWalkGrid(*walkShown);
+        if (pieces.empty()) { note("There's no navmesh to edit: Auto-generate it or Add Navmesh"); return; }
+        pushWorldUndo();
+        meshEdit.end();
+        wAlso.clear();
+        std::vector<WorldCollider>& cs = scene->world.colliders;
+        cs.erase(std::remove_if(cs.begin(), cs.end(), [](const WorldCollider& c) { return c.role == WorldCollider::Navmesh; }), cs.end());
+        const int first = static_cast<int>(cs.size());
+        size_t tris = 0;
+        for (size_t i = 0; i < pieces.size(); ++i) {
+            WorldCollider c;
+            c.name = "Navmesh " + std::to_string(i + 1);
+            c.kind = WorldCollider::Mesh;
+            c.role = WorldCollider::Navmesh;
+            c.positions = pieces[i].pos;
+            c.indices = pieces[i].idx;
+            tris += c.indices.size() / 3;
+            cs.push_back(std::move(c));
+        }
+        selected = splatSel = -1;
+        wKind = kCollider;
+        wIndex = first;
+        showWorld = true;
+        showCat[kShowWalkArea] = true;
+        worldReplaced();
+        walkSettingsChanged();
+        note("Made " + std::to_string(pieces.size()) + " navmesh" + (pieces.size() == 1 ? "" : "es") + " (" + std::to_string(tris) +
+             " triangles): the home is walked on them now. Tab edits the selected one's corners; Ctrl+Z takes them back.");
+    }
+    // Edit Navmesh: straight into edit mode on it. Not in pieces yet: made into pieces first (one per area you can walk
+    // apart, from Meta's navmesh where the home has one); in pieces: the selected one, else the biggest.
+    void editNavmesh() {
+        if (!scene) return;
+        if (scene->world.walkNone && !scene->world.hasNavmesh()) { note("There's no navmesh: Auto-generate it, Use Meta's Navmesh or Add Navmesh first"); return; }
+        if (!scene->world.hasNavmesh()) {
+            makeNavmesh();
+            if (!scene->world.hasNavmesh()) return;
+        }
+        const auto& cs = scene->world.colliders;
+        const bool onPiece = wKind == kCollider && wIndex >= 0 && wIndex < static_cast<int>(cs.size()) && cs[wIndex].role == WorldCollider::Navmesh;
+        if (!onPiece) {
+            int best = -1;
+            for (size_t i = 0; i < cs.size(); ++i)
+                if (cs[i].role == WorldCollider::Navmesh && (best < 0 || cs[i].indices.size() > cs[best].indices.size())) best = static_cast<int>(i);
+            if (best < 0) return;
+            selected = splatSel = -1;
+            walkAreaPicked = false;
+            wAlso.clear();
+            wKind = kCollider;
+            wIndex = best;
+        }
+        if (!meshEdit.active()) toggleMeshEdit();
+        if (meshEdit.active()) note("Editing the navmesh: click corners (Shift: more, drag: a box), move them with the gizmo; X deletes, E extrudes, F fills. Tab when done.");
+    }
+    // Use Meta's Navmesh: back to the navmesh the home's makers shipped (its own navmesh meshes, else its collision:
+    // Meta's floor), in place of Studio's: its pieces, what Auto-generate made, the painted floor and the saved area go,
+    // and Meta's floor is used again. One undo step.
+    void useMetaNavmesh() {
+        if (!scene) return;
+        if (!hasMetaNavmesh(*scene, scene->world)) { note("This home has no navmesh of Meta's (no navmesh mesh, no collision): its navmesh is worked out from its meshes"); return; }
+        pushWorldUndo();
+        meshEdit.end();
+        wAlso.clear();
+        HomeWorld& w = scene->world;
+        w.colliders.erase(std::remove_if(w.colliders.begin(), w.colliders.end(), [](const WorldCollider& c) { return isAuto(c.name) || c.role == WorldCollider::Navmesh; }), w.colliders.end());
+        w.spawns.erase(std::remove_if(w.spawns.begin(), w.spawns.end(), [](const WorldPoint& q) { return q.name == "Auto spawn"; }), w.spawns.end());
+        auto autoPoint = [](const WorldPoint& q) { return isAuto(q.name); };
+        w.seats.erase(std::remove_if(w.seats.begin(), w.seats.end(), autoPoint), w.seats.end());
+        w.hotspots.erase(std::remove_if(w.hotspots.begin(), w.hotspots.end(), autoPoint), w.hotspots.end());
+        w.walkPaint.clear();
+        strokeFrom = 0;
+        w.walkGrid.clear();
+        w.walkGridCache.reset();
+        w.walkNone = false;
+        w.useHomeCollision = true;
+        walkEdit = WalkParams{};
+        walkSaveNext = false;
+        wKind = wIndex = -1;
+        worldReplaced();
+        walkPending = true;
+        walkChanged = std::chrono::steady_clock::now();
+        note("Back to Meta's navmesh. Ctrl+Z puts yours back.");
+    }
+    // ── Draw Navmesh: a piece drawn corner by corner on the floor (each where it's clicked, at its height) ──
+    bool navDrawing = false;
+    std::vector<std::array<float, 3>> navPoints;
+    void startNavDraw() {
+        if (!scene) return;
+        meshEdit.end();
+        if (tool == Tool::DrawFloor) tool = Tool::Move;
+        navDrawing = true;
+        navPoints.clear();
+        showWorld = true;
+        showCat[kShowWalkArea] = true;
+        showInspectorTab(InspectorTab::Navmesh);
+    }
+    void stopNavDraw() { navDrawing = false; navPoints.clear(); }
+    // The navmesh kept whole when a piece is added to one that isn't in pieces yet (worked out, or Meta's): made into
+    // pieces first, so the new piece adds to it rather than standing for all of it.
+    void navmeshIntoPieces() {
+        if (scene && !scene->world.hasNavmesh() && !scene->world.walkNone && walkShown && walkShown->any()) makeNavmesh();
+    }
+    void finishNavDraw() {
+        if (!scene || navPoints.size() < 3) return;
+        std::vector<float> pos;
+        std::vector<uint32_t> idx;
+        if (!navmeshFromPolygon(navPoints, pos, idx)) { note("That shape crosses itself: take the last points back (Backspace) and go round"); return; }
+        for (size_t v = 1; v < pos.size(); v += 3) pos[v] += 0.01f;   // (a centimetre over what it was drawn on)
+        navmeshIntoPieces();
+        pushWorldUndo();
+        WorldCollider c;
+        int n = 1;
+        for (const WorldCollider& o : scene->world.colliders) n += o.role == WorldCollider::Navmesh;
+        c.name = "Navmesh " + std::to_string(n);
+        c.kind = WorldCollider::Mesh;
+        c.role = WorldCollider::Navmesh;
+        c.positions = std::move(pos);
+        c.indices = std::move(idx);
+        scene->world.colliders.push_back(std::move(c));
+        selected = splatSel = -1;
+        walkAreaPicked = false;
+        wAlso.clear();
+        wKind = kCollider;
+        wIndex = static_cast<int>(scene->world.colliders.size()) - 1;
+        navPoints.clear();
+        worldReplaced();
+        walkSettingsChanged();
+        note("Navmesh piece made. Draw another, Esc to stop; Tab edits its corners.");
+    }
+    // One frame in the view while drawing: the points so far, the line on to the pointer, a click adds or closes.
+    void navDrawFrame(ImDrawList* dl, const float* viewProj, bool hovered) {
+        ImGuiIO& io = ImGui::GetIO();
+        float at[3];
+        const bool on = hovered && !io.KeyAlt && pickSurface(io.MousePos.x, io.MousePos.y, at, true);
+        const ImU32 c = col(kRoleColors[WorldCollider::Navmesh]), fill = col(kRoleColors[WorldCollider::Navmesh], 0.18f);
+        std::vector<ImVec2> s;
+        for (const auto& p : navPoints) s.push_back(toScreen(p.data(), viewProj));
+        if (s.size() >= 3) dl->AddConvexPolyFilled(s.data(), static_cast<int>(s.size()), fill);   // (a rough fill: the made piece is exact)
+        for (size_t i = 0; i + 1 < s.size(); ++i) dl->AddLine(s[i], s[i + 1], c, 2.5f * scale);
+        bool overFirst = false;
+        if (!s.empty()) overFirst = s.size() >= 3 && std::hypot(io.MousePos.x - s[0].x, io.MousePos.y - s[0].y) < 12 * scale;
+        if (on && !s.empty()) {
+            const ImVec2 m = toScreen(at, viewProj);
+            dl->AddLine(s.back(), overFirst ? s[0] : m, col(kRoleColors[WorldCollider::Navmesh], 0.7f), 1.5f * scale);
+            if (s.size() >= 2 && !overFirst) dl->AddLine(m, s[0], col(kRoleColors[WorldCollider::Navmesh], 0.3f), 1.0f * scale);
+        }
+        for (size_t i = 0; i < s.size(); ++i) {
+            const float r = (i == 0 && overFirst ? 7.0f : 4.5f) * scale;
+            dl->AddRectFilled(ImVec2(s[i].x - r, s[i].y - r), ImVec2(s[i].x + r, s[i].y + r), i == 0 ? c : col(0x111111));
+            dl->AddRect(ImVec2(s[i].x - r, s[i].y - r), ImVec2(s[i].x + r, s[i].y + r), c);
+        }
+        if (on) { const ImVec2 m = toScreen(at, viewProj); dl->AddCircle(m, 5 * scale, c, 12, 2 * scale); }
+        if (hovered && !io.KeyAlt && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+            if (overFirst || (navPoints.size() >= 3 && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left))) finishNavDraw();
+            else if (on) navPoints.push_back({at[0], at[1], at[2]});
+        }
+        const char* t = navPoints.empty() ? "Draw Navmesh \u00b7 click on the floor for the first corner \u00b7 Esc stops"
+                                          : "Draw Navmesh \u00b7 click the next corner \u00b7 the first one (or Enter) closes it \u00b7 Backspace: back one \u00b7 Esc stops";
+        const ImVec2 ts = ImGui::CalcTextSize(t);
+        const ImVec2 hp(viewPos.x + (viewSize.x - ts.x) * 0.5f, viewPos.y + 10 * scale);
+        dl->AddRectFilled(ImVec2(hp.x - 10 * scale, hp.y - 5 * scale), ImVec2(hp.x + ts.x + 10 * scale, hp.y + ts.y + 5 * scale), col(kBar, 0.9f), 4 * scale);
+        dl->AddText(hp, c, t);
+    }
+
+    // World > Add Navmesh: a 2 m square of it on the floor under the view's pivot, selected, ready to edit.
+    void addNavmesh() {
+        if (!scene) return;
+        navmeshIntoPieces();
+        pushWorldUndo();
+        meshEdit.end();
+        wAlso.clear();
+        const float x = cam.pivot[0], z = cam.pivot[2];
+        float y = cam.pivot[1] - 1.6f;
+        { float f; if (floorUnder(x, z, cam.pivot[1], f)) y = f; }
+        WorldCollider c;
+        int n = 1;
+        for (const WorldCollider& o : scene->world.colliders) n += o.role == WorldCollider::Navmesh;
+        c.name = "Navmesh " + std::to_string(n);
+        c.kind = WorldCollider::Mesh;
+        c.role = WorldCollider::Navmesh;
+        c.positions = {x - 1, y + 0.01f, z - 1, x + 1, y + 0.01f, z - 1, x + 1, y + 0.01f, z + 1, x - 1, y + 0.01f, z + 1};
+        c.indices = {0, 2, 1, 0, 3, 2};   // (facing up)
+        scene->world.colliders.push_back(std::move(c));
+        selected = splatSel = -1;
+        wKind = kCollider;
+        wIndex = static_cast<int>(scene->world.colliders.size()) - 1;
+        showWorld = true;
+        showCat[kShowWalkArea] = true;
+        worldReplaced();
+        walkSettingsChanged();
+        note(std::string(scene->world.hasNavmesh() && n > 1 ? "" : "The home is walked on its navmeshes now. ") + "Tab edits its corners: E extrudes an edge, F fills a face.");
+    }
+
+    // ── Edit mode (Tab): a mesh collider's corners (studio/mesh_edit.h) ──
+    MeshEditor meshEdit;
+    void toggleMeshEdit() {
+        if (meshEdit.active()) { meshEdit.end(); return; }
+        if (!scene || wKind != kCollider || wIndex < 0 || wIndex >= worldCount(kCollider)) { note("Select a navmesh or a mesh surface to edit its corners"); return; }
+        const WorldCollider& c = scene->world.colliders[wIndex];
+        if (c.kind != WorldCollider::Mesh) { note("A box, ball or capsule: Convert to Mesh (Properties › Data) to edit its corners"); return; }
+        wAlso.clear();
+        meshEdit.begin(wIndex, c);
+        showWorld = true;
+        showCat[worldCat(kCollider, wIndex)] = true;
+        if (tool == Tool::DrawFloor) tool = Tool::Move;
+    }
+    // Edit mode ends when what it edits isn't selected, isn't a mesh, or went (an undo, a delete).
+    void keepMeshEdit() {
+        if (!meshEdit.active()) return;
+        if (!scene || wKind != kCollider || wIndex != meshEdit.collider() || wIndex >= worldCount(kCollider) ||
+            scene->world.colliders[wIndex].kind != WorldCollider::Mesh || drawing() || walking)
+            meshEdit.end();
+    }
+    void meshEdited() {
+        dirty = worldEdited = true;
+        scene->world.origin = "studio";
+        updateTitle();
+        walkPending = true;
+        walkChanged = std::chrono::steady_clock::now();
+        if (walkSaved() || scene->world.hasNavmesh()) walkSaveNext = true;
+    }
+    // Edit mode's keys (instead of the editor's while it's on).
+    void meshEditKeys(bool alt) {
+        WorldCollider& c = scene->world.colliders[meshEdit.collider()];
+        auto op = [&](bool ready, auto&& fn) { if (!ready) return; pushWorldUndo(); if (fn()) meshEdited(); else if (!undo.empty()) undo.pop_back(); };
+        const size_t sel = meshEdit.selectedCount();
+        if (ImGui::IsKeyPressed(ImGuiKey_Escape, false)) { meshEdit.end(); return; }
+        if (ImGui::IsKeyPressed(ImGuiKey_A, false)) { if (alt) meshEdit.selectAll(false); else meshEdit.toggleAll(); }
+        if (ImGui::IsKeyPressed(ImGuiKey_L, false)) meshEdit.selectLinked(c);
+        if (ImGui::IsKeyPressed(ImGuiKey_X, false) || ImGui::IsKeyPressed(ImGuiKey_Delete, false)) op(sel > 0, [&] { return meshEdit.deleteSelected(c); });
+        if (ImGui::IsKeyPressed(ImGuiKey_F, false)) op(sel >= 3, [&] { return meshEdit.fill(c); });
+        if (ImGui::IsKeyPressed(ImGuiKey_E, false)) op(sel > 0, [&] { return meshEdit.extrude(c); });
+        if (ImGui::IsKeyPressed(ImGuiKey_M, false)) op(sel >= 2, [&] { return meshEdit.merge(c); });
+        if (ImGui::IsKeyPressed(ImGuiKey_G, false)) tool = Tool::Move;
+        if (ImGui::IsKeyPressed(ImGuiKey_R, false)) tool = Tool::Rotate;
+        if (ImGui::IsKeyPressed(ImGuiKey_S, false)) tool = Tool::Scale;
+        if (ImGui::IsKeyPressed(ImGuiKey_W, false)) showWorld = !showWorld;
+        if (c.indices.empty()) {   // (every face deleted: the collider goes)
+            meshEdit.end();
+            deleteWorld();
+        }
+    }
+    // A box, ball or capsule made a mesh (Data > Convert to Mesh), so its corners can be edited.
+    void convertToMesh(WorldCollider& c) {
+        pushWorldUndo();
+        std::vector<float> pos;
+        std::vector<uint32_t> idx;
+        walkShapeMesh(c, pos, idx);   // (in the world)
+        c.kind = WorldCollider::Mesh;
+        c.positions = std::move(pos);
+        c.indices = std::move(idx);
+        c.boxes.clear();
+        c.placed = false;
+        identity(c.world);
+        meshEdited();
+    }
+    // Tool > Edit Mesh: edit mode's operations on the selected corners (each one undo step; the keys do the same).
+    void editMeshPanel(WorldCollider& c) {
+        if (!section("EDIT MESH")) return;
+        const size_t sel = meshEdit.selectedCount();
+        fieldLabel("Selected");
+        ImGui::Text("%zu of %zu corners", sel, meshEdit.cornerCount());
+        tip("Click a corner to select it, Shift+click for more, drag a box round several. Move, turn or scale them with the\n"
+            "gizmo (G, R, S). Alt+drag orbits. Esc or Tab when done.");
+        auto op = [&](const char* label, const char* tipText, bool ready, auto&& fn) {
+            if (rowButton(label, tipText, ready)) { pushWorldUndo(); if (fn()) meshEdited(); else if (!undo.empty()) undo.pop_back(); }
+        };
+        buttonRow(3);
+        if (rowButton("All (A)", "Select every corner, or none")) meshEdit.toggleAll();
+        if (rowButton("Linked (L)", "Select every corner joined to the selected ones")) meshEdit.selectLinked(c);
+        op("Delete (X)", "The selected corners go, and every face on one of them", sel > 0, [&] { return meshEdit.deleteSelected(c); });
+        buttonRow(3);
+        op("Fill (F)", "A face across the selected corners (three or more)", sel >= 3, [&] { return meshEdit.fill(c); });
+        op("Extrude (E)", "New faces out of the selected corners' open edges: move them with the gizmo", sel > 0, [&] { return meshEdit.extrude(c); });
+        op("Merge (M)", "The selected corners made one, at their middle", sel >= 2, [&] { return meshEdit.merge(c); });
+    }
+    void drawMeshEditHint(ImDrawList* dl) {
+        const char* t = "Edit mode \u00b7 click corners (Shift: more, drag: a box) \u00b7 G R S gizmo \u00b7 X delete \u00b7 F fill \u00b7 E extrude \u00b7 M merge \u00b7 L joined \u00b7 A all \u00b7 Tab done";
+        const ImVec2 ts = ImGui::CalcTextSize(t);
+        const ImVec2 at(viewPos.x + (viewSize.x - ts.x) * 0.5f, viewPos.y + 10 * scale);
+        dl->AddRectFilled(ImVec2(at.x - 10 * scale, at.y - 5 * scale), ImVec2(at.x + ts.x + 10 * scale, at.y + ts.y + 5 * scale), col(kBar, 0.9f), 4 * scale);
+        dl->AddText(at, col(kRoleColors[WorldCollider::Navmesh]), t);
+    }
+
+    // ── More than one world item selected (Ctrl or Shift+click in the Outliner): moved and deleted together ──
+    std::vector<std::pair<int, int>> wAlso;   // besides wKind / wIndex
+    int wAlsoKind = -1, wAlsoIndex = -1;      // (the item they were selected with: another selected some other way drops them)
+    bool worldAlsoSelected(int k, int i) const { return std::find(wAlso.begin(), wAlso.end(), std::make_pair(k, i)) != wAlso.end(); }
+    void toggleWorldSelected(int k, int i) {
+        if (k == wKind && i == wIndex) {   // (the main one: the next becomes it)
+            if (wAlso.empty()) { wKind = wIndex = -1; return; }
+            wKind = wAlso.back().first; wIndex = wAlso.back().second; wAlso.pop_back();
+        } else if (worldAlsoSelected(k, i)) wAlso.erase(std::find(wAlso.begin(), wAlso.end(), std::make_pair(k, i)));
+        else wAlso.emplace_back(k, i);
+        wAlsoKind = wKind; wAlsoIndex = wIndex;
+        meshEdit.end();
+    }
+    // Each frame: the others go when the main one changed some other way; ones that went are dropped.
+    void keepWorldSelection() {
+        if (wAlso.empty()) return;
+        if (wKind != wAlsoKind || wIndex != wAlsoIndex || wKind < 0) { wAlso.clear(); return; }
+        wAlso.erase(std::remove_if(wAlso.begin(), wAlso.end(), [&](const std::pair<int, int>& e) { return e.second < 0 || e.second >= worldCount(e.first); }), wAlso.end());
+    }
+    // The gizmo moved the main one from `was` to `now`: the others the same way.
+    void moveAlsoSelected(const float* was, const float* now) {
+        if (wAlso.empty()) return;
+        float inv[16], delta[16];
+        if (!invert(was, inv)) return;
+        mul(now, inv, delta);
+        for (const auto& [k, i] : wAlso) {
+            float m[16], moved[16];
+            if (!worldMatrix(k, i, m)) continue;
+            mul(delta, m, moved);
+            if (finiteMatrix(moved)) setWorldMatrix(k, i, moved);
+        }
+    }
+    void deleteWorldSelection() {
+        std::vector<std::pair<int, int>> all = wAlso;
+        all.emplace_back(wKind, wIndex);
+        std::sort(all.begin(), all.end(), [](const auto& a, const auto& b) { return a.first != b.first ? a.first < b.first : a.second > b.second; });   // (last first: the indices stay good)
+        pushWorldUndo();
+        HomeWorld& w = scene->world;
+        const bool hadNavmesh = w.hasNavmesh();
+        for (const auto& [k, i] : all) {
+            if (i < 0 || i >= worldCount(k)) continue;
+            switch (k) {
+                case kSpawn: w.spawns.erase(w.spawns.begin() + i); break;
+                case kSeat: w.seats.erase(w.seats.begin() + i); break;
+                case kHotspot: w.hotspots.erase(w.hotspots.begin() + i); break;
+                case kCollider: w.colliders.erase(w.colliders.begin() + i); break;
+                case kGravity: w.gravity.erase(w.gravity.begin() + i); break;
+            }
+        }
+        if (hadNavmesh && !w.hasNavmesh()) w.walkNone = true;   // (the last navmesh piece: no navmesh)
+        wAlso.clear();
+        wKind = wIndex = -1;
+        meshEdit.end();
+        if (isolating) { isolating = false; refreshVisibility(); }
+        worldReplaced();
+        note("Deleted " + std::to_string(all.size()) + " items");
+    }
+
     void clearPaint() {
         if (!scene || scene->world.walkPaint.empty()) return;
         pushWorldUndo();
@@ -3376,9 +4323,10 @@ struct Studio {
     float brushLevel = 0;                   // the height the floor brush last painted or touched at (painting over nothing keeps it)
     bool brushLevelKnown = false;
     // The surface under a viewport pixel (any shown object), world point.
-    bool pickSurface(float px, float py, float* hit) {
+    // throughPlants: plants left as Auto or Walk through aren't hit (the Draw tools reach the ground under grass)
+    bool pickSurface(float px, float py, float* hit, bool throughPlants = false) {
         float t;
-        if (pickRay(px, py, -1, &t, nullptr) < 0) return false;
+        if (pickRay(px, py, -1, &t, nullptr, throughPlants) < 0) return false;
         const float ty = std::tan(kFovY * 0.5f), tx = ty * viewSize.x / viewSize.y;
         const float u = (px - viewPos.x) / viewSize.x, v = (py - viewPos.y) / viewSize.y;
         float pose[16];
@@ -3475,14 +4423,14 @@ struct Studio {
         // out for saving, and the viewport's picture of it (with the guide's categories as they were when it started)
         std::shared_ptr<const WalkGrid> stored;
         std::string encoded;
-        bool encodedSet = false, guideWalk = false, guideGrey = false, guideBuilt = false;
+        bool encodedSet = false, guideWalk = false, guideGrey = false, guideSteps = false, guideBuilt = false;
         std::vector<GuideVertex> guide;
         const WalkGrid* guideOf = nullptr;  // (grid or stored)
         ~WalkJob() { if (thread.joinable()) thread.join(); }
     };
     std::unique_ptr<WalkJob> walkJob;
     std::shared_ptr<const WalkGrid> walkGuideGrid;   // a guide built on the bake thread: for this area...
-    bool walkGuideWalk = false, walkGuideGrey = false;   // ...these categories
+    bool walkGuideWalk = false, walkGuideGrey = false, walkGuideSteps = false;   // ...these categories
     std::vector<GuideVertex> walkGuideReady;
     // Waits for a bake in progress and drops it (an edit it was saving is saved by the next one).
     void dropWalkJob() {
@@ -3539,7 +4487,11 @@ struct Studio {
             mix(n, sizeof n); mix(c.mesh.data(), c.mesh.size());
         }
         for (const auto* v : {&w.spawns, &w.seats, &w.hotspots}) for (const WorldPoint& p : *v) { mix(p.pos, 12); mix(&p.yaw, 4); mix(p.exit, 12); }
-        for (const WalkStroke& k : w.walkPaint) { mix(k.pos, 12); mix(&k.radius, 4); mix(&k.erase, 1); }
+        mix(&w.useHomeCollision, 1);
+        for (const WalkStroke& k : w.walkPaint) {
+            mix(k.pos, 12); mix(&k.radius, 4); mix(&k.erase, 1); mix(&k.shape, 4); mix(&k.yaw, 4); mix(k.centre, 8); mix(k.half, 8);
+            if (!k.outline.empty()) mix(k.outline.data(), k.outline.size() * 4);
+        }
         const bool saved = !w.walkGrid.empty();
         mix(&saved, 1);
         mix(&walkEdit, sizeof walkEdit);
@@ -3571,14 +4523,17 @@ struct Studio {
             if (g_selfTestRun) rebakeWalk();   // (the self-test checks the area the frame after an edit)
             else startWalkBake();
         }
-        const bool walkOn = walkShown && showWorld && (showCat[kShowWalkArea] || showCat[kShowUnreached]) && !(isolating && isoObject < 0 && isoKind >= 0);
-        const bool trimmedOn = showTrimmed && showWorld && !trimmedGuide.empty();
+        const bool walkOn = walkShown && showWorld && !cleanView() && (showCat[kShowWalkArea] || showCat[kShowUnreached]) && !(isolating && isoObject < 0 && isoKind >= 0);
+        const bool trimmedOn = showTrimmed && showWorld && !cleanView() && !trimmedGuide.empty();
         const bool on = walkOn || trimmedOn;
-        const int mix = (walkOn ? 1 : 0) | (trimmedOn ? 2 : 0);   // what's in it: a change rebuilds it
+        const int mix = (walkOn ? 1 : 0) | (trimmedOn ? 2 : 0) |   // what's in it: a change rebuilds it
+                        (walkOn ? (showCat[kShowWalkArea] ? 4 : 0) | (showCat[kShowUnreached] ? 8 : 0) | (showCat[kShowSteps] ? 16 : 0) : 0);
         if (on != walkGuideOn || mix != walkGuideMix || (on && walkGuideDirty)) {
             walkGuideMix = mix;
             std::vector<GuideVertex> v;
-            if (walkOn && walkGuideGrid == walkShown && walkGuideWalk == showCat[kShowWalkArea] && walkGuideGrey == showCat[kShowUnreached]) v.swap(walkGuideReady);
+            if (walkOn && walkGuideGrid == walkShown && walkGuideWalk == showCat[kShowWalkArea] && walkGuideGrey == showCat[kShowUnreached] &&
+                walkGuideSteps == showCat[kShowSteps])
+                v.swap(walkGuideReady);
             else if (walkOn) v = walkGuide();
             walkGuideGrid.reset();
             walkGuideReady.clear();
@@ -3753,6 +4708,7 @@ struct Studio {
         job->sig = walkSignature();
         job->guideWalk = showCat[kShowWalkArea];
         job->guideGrey = showCat[kShowUnreached];
+        job->guideSteps = showCat[kShowSteps];
         WalkJob* j = job.get();
         const HslScene* sc = scene.get();
         job->thread = std::thread([j, sc] {
@@ -3762,7 +4718,7 @@ struct Studio {
             if (j->asStored) j->stored = j->world.walkGridCache ? j->world.walkGridCache : decodeWalkGrid(j->world.walkGrid);
             if (j->save && j->grid && !j->asStored) { j->encoded = encodeWalkGrid(*j->grid); j->encodedSet = true; }
             const WalkGrid* shown = j->asStored && j->stored ? j->stored.get() : j->grid.get();
-            if (shown && (j->guideWalk || j->guideGrey)) { j->guide = walkGuideOf(*shown, j->guideWalk, j->guideGrey); j->guideOf = shown; j->guideBuilt = true; }
+            if (shown && (j->guideWalk || j->guideGrey)) { j->guide = walkGuideOf(*shown, j->guideWalk, j->guideGrey, j->guideSteps); j->guideOf = shown; j->guideBuilt = true; }
             j->done = true;
         });
         walkJob = std::move(job);
@@ -3785,6 +4741,7 @@ struct Studio {
             walkGuideGrid = walkShown;
             walkGuideWalk = j->guideWalk;
             walkGuideGrey = j->guideGrey;
+            walkGuideSteps = j->guideSteps;
             walkGuideReady = std::move(j->guide);
         }
     }
@@ -3799,6 +4756,8 @@ struct Studio {
         walkReport = rep;
         walkShown = g;
         walkGuideDirty = true;
+        if (g && moveSeatExitsOntoArea(*g) && !asStored) dirty = worldEdited = true;
+        if (g && g->any() && scene->world.spawns.empty()) addAutoSpawn(*g);   // (where you start: shown, and saved with it)
         if (save && g && !asStored) {
             std::string enc = encoded ? *encoded : encodeWalkGrid(*g);
             if (enc != scene->world.walkGrid) {
@@ -3811,6 +4770,25 @@ struct Studio {
         }
         walkSaveNext = false;
         walkSig = walkSignature();
+    }
+
+    // Every seat stands you up somewhere you can walk: a stand-up spot the area doesn't cover (the area changed, the seat
+    // or the things round it moved, the spot was dragged off it) is moved to the nearest good one round the seat
+    // (WalkGrid::seatExit). Spots on the area stay where they are. True: one moved.
+    bool moveSeatExitsOntoArea(const WalkGrid& g) {
+        if (!scene) return false;
+        bool moved = false;
+        for (WorldPoint& st : scene->world.seats) {
+            float spot[3];
+            bool own = false;
+            if (!g.seatExit(st, spot, &own) || own) continue;
+            const float c = std::cos(st.yaw), sn = std::sin(st.yaw), dx = spot[0] - st.pos[0], dz = spot[2] - st.pos[2];
+            st.exit[0] = c * dx - sn * dz;
+            st.exit[1] = 0;
+            st.exit[2] = sn * dx + c * dz;
+            moved = true;
+        }
+        return moved;
     }
 
     // Changes to the settings save the area with the home (one undo step per change).
@@ -3840,8 +4818,8 @@ struct Studio {
     }
 
     // The viewport's picture of it (the renderer's guide pass: depth-tested, a quarter strength behind things).
-    std::vector<GuideVertex> walkGuide() const { return walkGuideOf(*walkShown, showCat[kShowWalkArea], showCat[kShowUnreached]); }
-    static std::vector<GuideVertex> walkGuideOf(const WalkGrid& g, bool showWalk, bool showGrey) {   // (the bake thread's too)
+    std::vector<GuideVertex> walkGuide() const { return walkGuideOf(*walkShown, showCat[kShowWalkArea], showCat[kShowUnreached], showCat[kShowSteps]); }
+    static std::vector<GuideVertex> walkGuideOf(const WalkGrid& g, bool showWalk, bool showGrey, bool steps) {   // (the bake thread's too)
         std::vector<GuideVertex> v;
         const float cs = g.p.cell, lift = 0.025f;
         auto vert = [&](float x, float y, float z, const float* c) { GuideVertex q; q.pos[0] = x; q.pos[1] = y; q.pos[2] = z; std::memcpy(q.rgba, c, 16); v.push_back(q); };
@@ -3872,6 +4850,49 @@ struct Studio {
                           const float t0[3] = {e0[0], y0 + 0.06f, e0[2]}, t1[3] = {e1[0], y1 + 0.06f, e1[2]};
                           quad(e0, e1, t1, t0, kEdge);
                       });
+        // Steps & ledges: where you go up a step onto other floor (a stair, a kerb, a raised platform's edge), in one
+        // colour of its own: the riser, and a band along the top of it. Not a ramp: each side is level a cell back.
+        if (showWalk && steps) {
+            static const float kRiser[4] = {1.0f, 0.25f, 0.64f, 0.75f}, kLip[4] = {1.0f, 0.25f, 0.64f, 0.95f};
+            constexpr float kMinStep = 0.06f, kLevel = 0.03f, kLipWidth = 0.08f;
+            auto levelAt = [&](int x, int z, float y) {
+                if (!g.inside(x, z)) return false;
+                for (const WalkSpan* s = g.begin(x, z); s != g.end(x, z); ++s)
+                    if ((s->flags & kWalkOk) && std::fabs(s->hi - y) <= kLevel) return true;
+                return false;
+            };
+            for (int z = 0; z < g.nz; ++z)
+                for (int x = 0; x < g.nx; ++x)
+                    for (const WalkSpan* a = g.begin(x, z); a != g.end(x, z); ++a) {
+                        if (!(a->flags & kWalkOk)) continue;
+                        for (int dir = 0; dir < 2; ++dir) {
+                            const int dx = dir == 0, dz = dir == 1, bx = x + dx, bz = z + dz;
+                            if (!g.inside(bx, bz)) continue;
+                            for (const WalkSpan* b = g.begin(bx, bz); b != g.end(bx, bz); ++b) {
+                                const float dh = b->hi - a->hi;
+                                if (!(b->flags & kWalkOk) || std::fabs(dh) < kMinStep || std::fabs(dh) > g.p.step + 0.02f) continue;
+                                if (!levelAt(x - dx, z - dz, a->hi) || !levelAt(bx + dx, bz + dz, b->hi)) continue;
+                                const float lo = std::min(a->hi, b->hi) + lift, hi = std::max(a->hi, b->hi) + lift;
+                                const float up = dh > 0 ? 1.0f : -1.0f;   // which way the higher floor is (+x / +z: 1)
+                                if (dir == 0) {                           // the border between them, along z
+                                    const float xb = g.ox + (x + 1) * cs, z0 = g.oz + z * cs, z1 = z0 + cs;
+                                    const float r0[3] = {xb, lo, z0}, r1[3] = {xb, lo, z1}, r2[3] = {xb, hi, z1}, r3[3] = {xb, hi, z0};
+                                    quad(r0, r1, r2, r3, kRiser);
+                                    const float l0[3] = {xb, hi + 0.003f, z0}, l1[3] = {xb, hi + 0.003f, z1};
+                                    const float l2[3] = {xb + up * kLipWidth, hi + 0.003f, z1}, l3[3] = {xb + up * kLipWidth, hi + 0.003f, z0};
+                                    quad(l0, l1, l2, l3, kLip);
+                                } else {                                  // along x
+                                    const float zb = g.oz + (z + 1) * cs, x0 = g.ox + x * cs, x1 = x0 + cs;
+                                    const float r0[3] = {x0, lo, zb}, r1[3] = {x1, lo, zb}, r2[3] = {x1, hi, zb}, r3[3] = {x0, hi, zb};
+                                    quad(r0, r1, r2, r3, kRiser);
+                                    const float l0[3] = {x0, hi + 0.003f, zb}, l1[3] = {x1, hi + 0.003f, zb};
+                                    const float l2[3] = {x1, hi + 0.003f, zb + up * kLipWidth}, l3[3] = {x0, hi + 0.003f, zb + up * kLipWidth};
+                                    quad(l0, l1, l2, l3, kLip);
+                                }
+                            }
+                        }
+                    }
+        }
         // floors left out (can't be reached): runs along x of cells at one height
         if (!showGrey) return v;
         struct Run { int x0, x1; float h; };
@@ -3910,6 +4931,9 @@ struct Studio {
         int replaced = 0, kept = 0;
         bool spawnAdded = false;
         int walls = 0, objects = 0, colliders = 0, seats = 0, hotspots = 0;   // world items made
+        int grass = 0;                      // grass set to Walk through (the navmesh leaves it out)
+        int grounds = 0, plants = 0;        // of the objects: named as ground (always a surface); plants left to walk through
+        int homeColliders = 0;              // the home's own collision it used (none: made from its meshes)
         WalkReport walk;
         float ms = 0;
     } autoReport;
@@ -3945,11 +4969,27 @@ struct Studio {
         return true;
     }
 
+    // A home with no spawn gets one ("Auto spawn": Auto-generate places it again): where Frame Home would put you
+    // (src/spawn_pick.h: level open floor with room round it, the origin when that's on the area), facing the widest
+    // view; else the middle of the main floor. True: one was added.
+    bool addAutoSpawn(const WalkGrid& g) {
+        if (!scene || !scene->world.spawns.empty()) return false;
+        WorldPoint p;
+        p.name = "Auto spawn";
+        if (!spawnpick::pick(g, p.pos, p.yaw)) {
+            if (!walkMiddle(g, p.pos)) return false;
+            p.yaw = spawnpick::bestFacing(g, p.pos[0], p.pos[1], p.pos[2]);
+        }
+        scene->world.spawns.push_back(p);
+        return true;
+    }
+
     void autoGenerate() {
         if (!scene) return;
         AutoReport r;
         pushWorldUndo();
         HomeWorld& w = scene->world;
+        w.walkNone = false;   // (the navmesh, deleted: made again)
         const size_t n0 = w.colliders.size();
         w.colliders.erase(std::remove_if(w.colliders.begin(), w.colliders.end(), [](const WorldCollider& c) { return isAuto(c.name); }), w.colliders.end());
         r.replaced = static_cast<int>(n0 - w.colliders.size());
@@ -3958,6 +4998,10 @@ struct Studio {
         auto autoPoint = [](const WorldPoint& p) { return isAuto(p.name); };
         w.seats.erase(std::remove_if(w.seats.begin(), w.seats.end(), autoPoint), w.seats.end());
         w.hotspots.erase(std::remove_if(w.hotspots.begin(), w.hotspots.end(), autoPoint), w.hotspots.end());
+        // First what's grass: labelled Walk through (its Collision in the Object tab, as by hand), so the navmesh made
+        // next leaves it out. Not one you gave a Collision yourself.
+        for (const Object& o : objects)
+            if (!o.deleted && surfaceMode(o) == kSurfNone && isGrassObject(o)) { makeSurface(o, kSurfTrigger); ++r.grass; }
         for (const Object& o : objects) if (!o.deleted && surfaceIndex(o) >= 0) ++r.kept;
         const auto t0 = std::chrono::steady_clock::now();
         {   // Everything that can be a floor is one: a mesh you stand on somewhere (the floor, stairs, a rug, a deck,
@@ -3965,9 +5009,20 @@ struct Studio {
             // pots, lamps: the random objects) gets a Collider, so you don't walk through it and never stand on it.
             // Not the ones you gave a surface, a vista's (scenery), or see-through and cut-out ones (glass, foliage:
             // the bake keeps them blocking but never floor already).
-            std::vector<char> plain(scene->meshes.size(), 0);
+            // (grass, ferns, flowers and bushes drawn solid are cut-out to the bake, as plants: walked through when low,
+            // never floor, so they're left alone here too; the home's own ground, terrain and floors are surfaces)
+            // (a home with its own collision, Meta's colliders, is walked on that: nothing's added to its objects; what
+            // it drew without collision is walked through)
+            const bool homeCollision = w.hasHomeCollision();
+            r.homeColliders = 0;
+            if (homeCollision) for (const WorldCollider& c : w.colliders) r.homeColliders += c.home && c.role != WorldCollider::Trigger;
+            std::vector<char> plain(scene->meshes.size(), 0), plant(scene->meshes.size(), 0);
             for (const WalkSource& src : drawnNow())
-                if (src.tag >= 0 && static_cast<size_t>(src.tag) < plain.size()) plain[src.tag] = !src.noFloor && !src.cutout;
+                if (src.tag >= 0 && static_cast<size_t>(src.tag) < plain.size()) {
+                    plain[src.tag] = !src.noFloor && !src.cutout;
+                    plant[src.tag] = src.cutout && !scene->meshes[src.tag].alphaTest && !scene->meshes[src.tag].useBlend;
+                }
+            for (const Object& o : objects) if (!o.deleted && !o.hidden && o.scene >= 0 && plant[o.scene]) ++r.plants;
             // A mesh is a floor where its faces that face up lie on the floors the area has (in reach or not), at
             // least 0.1 m² of them: by shape, not by which mesh the bake credits (a home's own collision mesh often
             // lies exactly on its drawn floor).
@@ -3981,7 +5036,7 @@ struct Studio {
                 return false;
             };
             for (const Object& o : objects) {
-                if (o.deleted || o.hidden || surfaceIndex(o) >= 0 || !canBeSurface(o) || !plain[o.scene]) continue;
+                if (homeCollision || o.deleted || o.hidden || surfaceIndex(o) >= 0 || !canBeSurface(o) || !plain[o.scene]) continue;
                 std::vector<u32> all;
                 for (size_t t = 0; t + 2 < scene->meshes[o.scene].indices.size(); t += 3) all.push_back(static_cast<u32>(t));
                 double floorArea = 0;
@@ -3998,23 +5053,18 @@ struct Studio {
                         floorArea += area * on / 3;
                     }
                 });
-                const bool floor = floorArea >= 0.1;
+                const bool named = walkNameIsGround(o.label);          // (Meta's floor is a floor, reached or not)
+                const bool floor = floorArea >= 0.1 || named;
+                r.grounds += named;
                 w.colliders.push_back(surfacePart(o, all, floor ? WorldCollider::Solid : WorldCollider::Object,
                                                   std::string(kAutoPrefix) + (floor ? "surface · " : "collider · ") + o.label));
                 ++(floor ? r.objects : r.colliders);
             }
         }
-        if (w.spawns.empty()) {                                        // a start in the middle of the main floor
+        if (w.spawns.empty()) {                                        // a start with room round it, facing the view
             WalkReport rep;
             std::shared_ptr<const WalkGrid> g = bakeWalk(walkEdit, &rep);
-            float at[3];
-            if (g && walkMiddle(*g, at)) {
-                WorldPoint p;
-                p.name = "Auto spawn";
-                std::memcpy(p.pos, at, 12);
-                w.spawns.push_back(p);
-                r.spawnAdded = true;
-            }
+            r.spawnAdded = g && addAutoSpawn(*g);
         }
         walkSaveNext = true;
         rebakeWalk();
@@ -4058,7 +5108,7 @@ struct Studio {
 
     // The result, with its own Undo (the whole run is one step).
     void autoSummaryWindow() {
-        const char* title = "Walkable Area";
+        const char* title = "Navmesh";
         if (autoSummaryOpen) { ImGui::OpenPopup(title); autoSummaryOpen = false; }
         autoUndoAt = autoDoneAt = ImVec2(-1, -1);
         const ImGuiIO& io = ImGui::GetIO();
@@ -4087,10 +5137,13 @@ struct Studio {
         const ImGuiStyle& style = ImGui::GetStyle();
         const float buttonsH = ImGui::GetFrameHeightWithSpacing() + style.ItemSpacing.y * 2;
         const float titleH = ImGui::GetFontSize() + style.FramePadding.y * 2;
-        const float maxReportH = std::max(120.0f * scale, io.DisplaySize.y - titleH - buttonsH - style.WindowPadding.y * 2 - 40 * scale);
+        // never more than about two thirds of the window high or nine tenths wide (a small window, a big UI scale):
+        // past that the report scrolls
+        const float maxReportH = std::max(120.0f * scale, std::min(io.DisplaySize.y * 0.65f, io.DisplaySize.y - titleH - buttonsH - style.WindowPadding.y * 2 - 40 * scale));
+        const float reportW = std::max(240.0f * scale, std::min(490.0f * scale, io.DisplaySize.x * 0.9f - style.WindowPadding.x * 2));
         ImGui::SetNextWindowSizeConstraints(ImVec2(0, 0), ImVec2(FLT_MAX, maxReportH));
-        ImGui::BeginChild("report", ImVec2(490 * scale, 0), ImGuiChildFlags_AutoResizeY);
-        ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + 470 * scale);
+        ImGui::BeginChild("report", ImVec2(reportW, 0), ImGuiChildFlags_AutoResizeY);
+        ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + reportW - 20 * scale);
         swatch(0x2ec756);
         ImGui::Text("You can walk on %.0f m²%s", w.walkArea, w.areas > 1 ? ("  (" + std::to_string(w.areas) + " separate areas)").c_str() : "");
         if (w.bridgedArea > 0.05) { swatch(0x1a8cff); ImGui::Text("%.1f m² of seams and small gaps bridged (up to %.0f cm across)", w.bridgedArea, walkEdit.gap * 100); }
@@ -4104,14 +5157,14 @@ struct Studio {
         if (b.homeShapes) ImGui::Text("%d of the home's own collision shapes", b.homeShapes);
         if (b.ledges > 0.5f) ImGui::Text("%.0f m of ledges and drops (higher than a %.0f cm step)", b.ledges, walkEdit.step * 100);
         ImGui::Unindent(22 * scale);
-        if (w.unreached) {
-            swatch(0x808080);
-            ImGui::Text("%d floor%s you can't reach from the start left out (%.0f m²: table tops, roofs, behind walls)", w.unreached, w.unreached == 1 ? "" : "s", w.unreachedArea);
-        }
-        if (r.spawnAdded) { swatch(kShowColors[kShowSpawns]); ImGui::TextUnformatted("A spawn point in the middle of the main floor"); }
+        if (r.spawnAdded) { swatch(kShowColors[kShowSpawns]); ImGui::TextUnformatted("A spawn point on open floor, facing the widest view"); }
         if (r.walls) { swatch(kShowColors[kShowWalls]); ImGui::Text("%d wall%s on the room's walls and round its open edges", r.walls, r.walls == 1 ? "" : "s"); }
         if (r.objects) { swatch(kShowColors[kShowSolidMeshes]); ImGui::Text("%d floor mesh%s made surfaces: walkable where flat, blocking where too steep", r.objects, r.objects == 1 ? "" : "es"); }
         if (r.colliders) { swatch(kRoleColors[WorldCollider::Object]); ImGui::Text("%d object%s given a collider: you don't walk through %s", r.colliders, r.colliders == 1 ? "" : "s", r.colliders == 1 ? "it" : "them"); }
+        if (r.homeColliders) ImGui::Text("Walked on the home's own collision (%d colliders its makers set up): objects without any are walked through", r.homeColliders);
+        if (r.grounds) ImGui::TextDisabled("   (%d of the surfaces named as ground, terrain or floor by the home's makers: kept as floor)", r.grounds);
+        if (r.grass) { swatch(kShowColors[kShowTriggers]); ImGui::Text("%d grass object%s labelled Walk through: the navmesh leaves %s out", r.grass, r.grass == 1 ? "" : "s", r.grass == 1 ? "it" : "them"); }
+        if (r.plants) ImGui::TextDisabled("   %d plant%s (grass, ferns, flowers, bushes) left as plants: walked through up to 1 m tall, never floor", r.plants, r.plants == 1 ? "" : "s");
         if (r.seats) { swatch(kShowColors[kShowSeats]); ImGui::Text("%d seat%s on the chairs, sofas and stools it found", r.seats, r.seats == 1 ? "" : "s"); }
         if (r.hotspots) { swatch(kShowColors[kShowHotspots]); ImGui::Text("%d teleport hotspot%s spread over the floor", r.hotspots, r.hotspots == 1 ? "" : "s"); }
         if (r.walls + r.objects + r.colliders + r.seats + r.hotspots) ImGui::TextDisabled("They're all named \"Auto …\" in the World list: edit or delete any; running it again replaces them.");
@@ -4134,92 +5187,162 @@ struct Studio {
         ImGui::EndPopup();
     }
 
-    // The panel's WALKABLE AREA section: what Frame Home walks, its settings, and the button.
-    void walkPanel() {
-        if (!scene) return;
+    // Navmesh: what Frame Home walks. Where it comes from and how big, the buttons that make and change it, its
+    // pieces, which of it the view shows, and how it's worked out from the home.
+    void navmeshTab() {
+        if (!scene) { hint("Open a home to start."); return; }
         const WalkReport& w = walkReport;
-        ImGui::PushTextWrapPos(0);
-        if (!walkShown) ImGui::TextDisabled("Working it out…");
-        else {
-            ImGui::Text("%.0f m² to walk on%s", w.walkArea, w.areas > 1 ? (" in " + std::to_string(w.areas) + " areas").c_str() : "");
-            if (w.unreached) { ImGui::SameLine(); ImGui::TextDisabled("· %d out of reach", w.unreached); }
-            ImGui::TextDisabled("%s", walkSaved() ? "Saved with the home: Frame Home walks exactly this (it updates as you edit)."
-                                                  : "Not saved yet: Frame Home works out the same from the home when it loads it. Auto-generate (or change a setting) to save it with your edits.");
+        HomeWorld& world = scene->world;
+        int pieces = 0;
+        for (const WorldCollider& c : world.colliders) pieces += c.role == WorldCollider::Navmesh;
+        const bool none = world.walkNone && !pieces;
+        const bool meta = !pieces && (world.hasHomeCollision() || (world.useHomeCollision && !metaNavmeshMeshes(*scene).empty()));
+        if (section("NAVMESH")) {
+            fieldLabel("Source");
+            ImGui::TextColored(hex(kRoleColors[WorldCollider::Navmesh]), "%s", none ? "None" : pieces ? "Your pieces" : meta ? "Meta's" : "Worked out");
+            tip(walkSaved() ? "Saved with the home: Frame Home walks exactly this" : "Frame Home works out the same from the home when it loads it");
+            ImGui::SameLine();
+            if (none) ImGui::TextDisabled("nothing is walkable");
+            else if (!walkShown) ImGui::TextDisabled("working it out…");
+            else ImGui::TextDisabled("%.0f m²%s", w.walkArea, w.areas > 1 ? (" in " + std::to_string(w.areas) + " areas").c_str() : "");
+            const bool editingNav = meshEdit.active() && meshEdit.collider() >= 0 && meshEdit.collider() < static_cast<int>(world.colliders.size()) &&
+                                    world.colliders[meshEdit.collider()].role == WorldCollider::Navmesh;
+            buttonRow(3);
+            if (rowButton("Draw", "Draw a piece by its corners on the floor (settings in the Tool tab); again to stop", true, navDrawing ? Look::On : Look::Plain,
+                          static_cast<int>(ToolIcon::DrawFloor))) {
+                if (navDrawing) stopNavDraw(); else startNavDraw();
+            }
+            if (rowButton("Edit", kMakeNavmeshTip, !none, editingNav ? Look::On : Look::Plain, static_cast<int>(ToolIcon::MeshData))) {
+                if (meshEdit.active()) meshEdit.end(); else editNavmesh();
+            }
+            if (rowButton("Add Square", "A new 2 m square piece on the floor where you're looking, to edit or extrude (E)")) addNavmesh();
+            buttonRow(3);
+            if (rowButton("Auto-generate", "Labels the grass Walk through, then works the navmesh out from everything solid in the home and saves it (one\n"
+                                           "undo step): floors you can reach with headroom; furniture, railings and walls block; steps up to the step height connect."))
+                autoGenerate();
+            if (rowButton("Use Meta's", hasMetaNavmesh(*scene, world) ? "Back to the navmesh this home's makers shipped, in place of yours (one undo step)"
+                                                                      : "This home has no navmesh of Meta's: its navmesh is worked out from its meshes",
+                          hasMetaNavmesh(*scene, world)))
+                useMetaNavmesh();
+            if (rowButton("Delete", kResetWalkTip, !none, Look::Danger)) resetWalk();
         }
-        ImGui::PopTextWrapPos();
-        ImGui::Spacing();
-        // presets, then the settings
-        struct Preset { const char* name; const char* tip; WalkParams p; };
-        static const Preset presets[3] = {
-            {"Open", "Walk close to things, up higher steps and over wider gaps: small rooms, cluttered homes.", [] { WalkParams p; p.radius = 0.05f; p.gap = 0.35f; p.step = 0.45f; p.headroom = 1.4f; return p; }()},
-            {"Standard", "Frame Home's defaults.", WalkParams{}},
-            {"Careful", "Keep well clear of edges, low steps only, only bridge seams.", [] { WalkParams p; p.radius = 0.25f; p.gap = 0.15f; p.step = 0.2f; p.headroom = 1.8f; return p; }()}};
-        const float bw = (ImGui::GetContentRegionAvail().x - 8 * scale) / 3;
-        for (int i = 0; i < 3; ++i) {
-            if (i) ImGui::SameLine(0, 4 * scale);
-            const WalkParams& p = presets[i].p;
-            const bool on = std::fabs(p.step - walkEdit.step) < 1e-4f && std::fabs(p.radius - walkEdit.radius) < 1e-4f && std::fabs(p.gap - walkEdit.gap) < 1e-4f && std::fabs(p.headroom - walkEdit.headroom) < 1e-4f;
-            ImGui::PushStyleColor(ImGuiCol_Button, on ? hex(kGo) : hex(kWidget, 0.55f));
-            if (ImGui::Button(presets[i].name, ImVec2(bw, 0)) && !on) { pushWorldUndo(); walkEdit = p; walkSettingsChanged(); }
-            ImGui::PopStyleColor();
-            if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", presets[i].tip);
+        if (pieces && section("PIECES")) {
+            auto xf = [](const float* m, float x, float y, float z, float* o) { for (int k = 0; k < 3; ++k) o[k] = m[k] * x + m[4 + k] * y + m[8 + k] * z + m[12 + k]; };
+            const float bw = ImGui::GetFrameHeight(), gap = 2 * scale;
+            for (size_t i = 0; i < world.colliders.size(); ++i) {
+                const WorldCollider& c = world.colliders[i];
+                if (c.role != WorldCollider::Navmesh) continue;
+                ImGui::PushID(static_cast<int>(i));
+                const bool sel = wKind == kCollider && wIndex == static_cast<int>(i);
+                double area = 0;
+                for (size_t t = 0; t + 2 < c.indices.size(); t += 3) {
+                    float pa[3], pb[3], pc[3];
+                    xf(c.world, c.positions[c.indices[t] * 3], c.positions[c.indices[t] * 3 + 1], c.positions[c.indices[t] * 3 + 2], pa);
+                    xf(c.world, c.positions[c.indices[t + 1] * 3], c.positions[c.indices[t + 1] * 3 + 1], c.positions[c.indices[t + 1] * 3 + 2], pb);
+                    xf(c.world, c.positions[c.indices[t + 2] * 3], c.positions[c.indices[t + 2] * 3 + 1], c.positions[c.indices[t + 2] * 3 + 2], pc);
+                    area += 0.5 * std::fabs((pb[0] - pa[0]) * (pc[2] - pa[2]) - (pb[2] - pa[2]) * (pc[0] - pa[0]));
+                }
+                char label[160];
+                std::snprintf(label, sizeof label, "%s  ·  %.1f m², %zu faces", c.name.empty() ? "Navmesh" : c.name.c_str(), area, c.indices.size() / 3);
+                const float rowW = std::max(1.0f, ImGui::GetContentRegionAvail().x - bw - gap);
+                ImGui::PushStyleVar(ImGuiStyleVar_SelectableTextAlign, ImVec2(0.0f, 0.5f));
+                const bool picked = ImGui::Selectable(label, sel, ImGuiSelectableFlags_AllowDoubleClick, ImVec2(rowW, bw));
+                ImGui::PopStyleVar();
+                if (picked) {
+                    selected = splatSel = -1; walkAreaPicked = false; wAlso.clear(); wKind = kCollider; wIndex = static_cast<int>(i);
+                    if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) { meshEdit.end(); toggleMeshEdit(); }
+                }
+                tip("Click to select it, double-click to edit its corners (Tab)");
+                ImGui::SameLine(0, gap);
+                if (listButton("x", "✕", "Delete this piece (the last one: no navmesh)")) {
+                    meshEdit.end(); wAlso.clear(); wKind = kCollider; wIndex = static_cast<int>(i); deleteWorld(); ImGui::PopID(); break;
+                }
+                ImGui::PopID();
+            }
         }
-        walkSliding = false;
-        auto slider = [&](const char* name, float* v, float lo, float hi, float unit, const char* fmt, const char* tip) {
-            fieldLabel(name);
-            float shown = *v * unit;
-            const bool changed = ImGui::SliderFloat((std::string("##walk") + name).c_str(), &shown, lo * unit, hi * unit, fmt);
-            if (ImGui::IsItemActivated()) pushWorldUndo();
-            if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", tip);
-            walkSliding |= ImGui::IsItemActive();
-            if (changed) { *v = shown / unit; walkSettingsChanged(); }
-        };
-        slider("Step up", &walkEdit.step, 0.05f, 0.6f, 100, "%.0f cm", "The highest step you walk up or down. Higher is a ledge: you can't climb it or walk off it.");
-        slider("Headroom", &walkEdit.headroom, 1.0f, 2.4f, 1, "%.2f m", "The clear height a floor needs. Lower than this under something (a table, a shelf, a low beam): not walkable.");
-        slider("Body radius", &walkEdit.radius, 0.0f, 0.5f, 100, "%.0f cm", "How close you get to walls, furniture and ledges.");
-        slider("Bridge gaps", &walkEdit.gap, 0.0f, 0.6f, 100, "up to %.0f cm", "Seams and holes in the floor up to this wide are walked over (at the floor's height), so you never drop into a crack.");
-        ImGui::Spacing();
-        if (ImGui::Button(walkSaved() ? "Auto-generate Again" : "Auto-generate Walkable Surfaces")) autoGenerate();
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Bakes where you can walk from everything solid in the home and saves it with it (one undo step),\n"
-                              "and adds walls along its edges, seats on chairs and sofas and teleport hotspots.\n"
-                              "Floors need headroom; furniture, plants, railings and walls block; steps up to the step height connect;\n"
-                              "seams are bridged; floors you can't reach from the start are left out. Object Surfaces override it.");
+        if (section("VIEWPORT DISPLAY", false, &showWorld, "The world layer over the view (W)")) {
+            static const int kCats[3] = {kShowWalkArea, kShowSteps, kShowUnreached};
+            static const char* kTips[3] = {"Where you can walk, green", "Steps you walk up and ledges you can't", "Floors nobody can get to, grey"};
+            for (int k = 0; k < 3; ++k) {
+                bool v = showCat[kCats[k]];
+                if (fieldCheck(kShowNames[kCats[k]], &v, kTips[k])) { showCat[kCats[k]] = v; if (v) showWorld = true; }
+            }
+        }
+        if (section("SETTINGS", false)) {
+            if (pieces) hint("Only Auto-generate uses these: your pieces are walked as they are.");
+            int homeColliders = 0;
+            for (const WorldCollider& c : world.colliders) homeColliders += c.home && c.role != WorldCollider::Trigger;
+            if (homeColliders) {
+                bool use = world.useHomeCollision;
+                char t[400];
+                std::snprintf(t, sizeof t, "On: you walk on the floors and walls this home's makers set up (%d colliders, their invisible walls too);\n"
+                                           "what they drew without any (a vase, leaves, a lamp) is walked through.\n"
+                                           "Off: those are removed, and the navmesh is made from the home's meshes instead.", homeColliders);
+                if (fieldCheck("Use Meta's Floor", &use, t)) {
+                    pushWorldUndo();
+                    world.useHomeCollision = use;
+                    dirty = worldEdited = true;
+                    updateTitle();
+                    walkSettingsChanged();
+                }
+            }
+            struct Preset { const char* name; const char* tip; WalkParams p; };
+            static const Preset presets[3] = {
+                {"Open", "Walk close to things, up higher steps and over wider gaps: small rooms, cluttered homes.", [] { WalkParams p; p.radius = 0.05f; p.gap = 0.35f; p.step = 0.45f; p.headroom = 1.4f; return p; }()},
+                {"Standard", "Frame Home's defaults.", WalkParams{}},
+                {"Careful", "Keep well clear of edges, low steps only, only bridge seams.", [] { WalkParams p; p.radius = 0.25f; p.gap = 0.15f; p.step = 0.2f; p.headroom = 1.8f; return p; }()}};
+            static const char* names[3] = {presets[0].name, presets[1].name, presets[2].name};
+            static const char* tips[3] = {presets[0].tip, presets[1].tip, presets[2].tip};
+            int on = -1;
+            for (int i = 0; i < 3; ++i) {
+                const WalkParams& pr = presets[i].p;
+                if (std::fabs(pr.step - walkEdit.step) < 1e-4f && std::fabs(pr.radius - walkEdit.radius) < 1e-4f && std::fabs(pr.gap - walkEdit.gap) < 1e-4f &&
+                    std::fabs(pr.headroom - walkEdit.headroom) < 1e-4f)
+                    on = i;
+            }
+            fieldLabel("Preset");
+            if (const int k = segmented("##preset", names, 3, on, tips); k >= 0 && k != on) { pushWorldUndo(); walkEdit = presets[k].p; walkSettingsChanged(); }
+            walkSliding = false;
+            auto slider = [&](const char* name, float* v, float lo, float hi, float unit, const char* fmt, const char* tipText) {
+                fieldLabel(name);
+                float shown = *v * unit;
+                const bool changed = ImGui::SliderFloat((std::string("##walk") + name).c_str(), &shown, lo * unit, hi * unit, fmt);
+                if (ImGui::IsItemActivated()) pushWorldUndo();
+                tip(tipText);
+                walkSliding |= ImGui::IsItemActive();
+                if (changed) { *v = shown / unit; walkSettingsChanged(); }
+            };
+            slider("Step up", &walkEdit.step, 0.05f, 0.6f, 100, "%.0f cm", "The highest step you walk up or down. Higher is a ledge: you can't climb it or walk off it.");
+            slider("Headroom", &walkEdit.headroom, 1.0f, 2.4f, 1, "%.2f m", "The clear height a floor needs. Lower than this under something (a table, a shelf, a low beam): not walkable.");
+            // (Meta's floor is walked as it is: no body radius taken off it, no seams bridged, walkgrid.h homeFloor)
+            const bool metaFloor = world.hasHomeCollision();
+            const char* offTip = "Off while Use Meta's Floor is on: its floor is walked exactly as it is";
+            ImGui::BeginDisabled(metaFloor);
+            slider("Body radius", &walkEdit.radius, 0.0f, 0.5f, 100, "%.0f cm", metaFloor ? offTip : "How close you get to walls, furniture and ledges.");
+            slider("Bridge gaps", &walkEdit.gap, 0.0f, 0.6f, 100, "%.0f cm", metaFloor ? offTip
+                                                                                       : "Seams and holes in the floor up to this wide are walked over (at the floor's height), so you never drop into a crack.");
+            ImGui::EndDisabled();
+        }
     }
 
-    // World > What Nobody Can See: the Trim button, what it did, Put Back, the red view, trimming when saving.
+    // Scene > What Nobody Can See: the Trim button, what it did, Put Back, the red view, trimming when saving.
     void trimPanel() {
-        if (!scene) { ImGui::TextDisabled("No home open"); return; }
-        ImGui::PushTextWrapPos(0);
-        ImGui::TextDisabled("The parts of the home nobody can see from anywhere they can walk, sit or teleport to (the backs of walls, "
-                            "under floors, the insides of things), and the back of anything only ever seen from the front.");
-        ImGui::PopTextWrapPos();
-        ImGui::Spacing();
-        ImGui::BeginDisabled(trimJob != nullptr || uploading);
-        if (ImGui::Button(trimJob ? "Trimming\u2026" : "Trim What Can't Be Seen")) startTrim();
-        ImGui::EndDisabled();
-        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-            ImGui::SetTooltip("Takes them out of the home now (a minute or two): it looks the same from everywhere you can be,\n"
-                              "and the headset draws less. Saved with the home.");
-        if (!untrimmed.empty() && !trimJob) {
-            ImGui::SameLine();
-            if (ImGui::Button("Put Back")) putBackTrimmed();
-            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Everything trimming took out comes back");
-        }
-        if (trimJob || !trimStatus.empty()) {
-            ImGui::PushTextWrapPos(0);
-            ImGui::TextDisabled("%s", trimJob ? "Finding what can't be seen from anywhere you can be\u2026" : trimStatus.c_str());
-            ImGui::PopTextWrapPos();
-        }
-        if (ImGui::Checkbox("Show what was trimmed", &showTrimmed)) walkGuideDirty = true;
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Red, where it was. None of it shows from anywhere you can stand: fly behind walls, under floors\n"
-                              "or outside the home to see it.");
-        if (ImGui::Checkbox("Trim when saving", &trimOnSave))
+        const bool canPutBack = !untrimmed.empty() && !trimJob;
+        buttonRow(canPutBack ? 2 : 1);
+        if (rowButton(trimJob ? "Trimming…" : "Trim What Can't Be Seen",
+                      "Takes out the parts nobody can see from anywhere they can walk, sit or teleport to (the backs of walls, under\n"
+                      "floors, the insides of things) and the back of anything only ever seen from the front. It looks the same from\n"
+                      "everywhere you can be, and the headset draws less. A minute or two; saved with the home.",
+                      !trimJob && !uploading))
+            startTrim();
+        if (canPutBack && rowButton("Put Back", "Everything trimming took out comes back")) putBackTrimmed();
+        if (trimJob || !trimStatus.empty()) hint(trimJob ? "Finding what can't be seen from anywhere you can be…" : trimStatus.c_str());
+        if (fieldCheck("Show Trimmed", &showTrimmed, "Red, where it was. None of it shows from anywhere you can stand: fly behind walls, under floors\n"
+                                                     "or outside the home to see it."))
+            walkGuideDirty = true;
+        if (fieldCheck("Trim When Saving", &trimOnSave, "Each save leaves out what nobody can see, the same way (the home open here stays as it is).\n"
+                                                        "Saving takes a minute or two longer. Autosaved versions aren't trimmed."))
             if (FILE* f = platform::openFile((dataDir() / L"trim-on-save.txt").c_str(), "wb")) { std::fputs(trimOnSave ? "1\n" : "0\n", f); std::fclose(f); }
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Each save leaves out what nobody can see, the same way (the home open here stays as it is).\n"
-                              "Saving takes a minute or two longer. Autosaved versions aren't trimmed.");
     }
 
     // Mesh surfaces get their pivot at their centre (Meta's and geometry ones come in world space, which put the
@@ -4284,6 +5407,7 @@ struct Studio {
             case kGravity: return kShowGravity;
             default: {
                 const WorldCollider& c = scene->world.colliders[i];
+                if (c.role == WorldCollider::Navmesh) return kShowWalkArea;
                 if (c.role == WorldCollider::Trigger) return kShowTriggers;
                 if (c.role == WorldCollider::Floor || c.role == WorldCollider::Walkable) return kShowFloors;
                 if ((c.role == WorldCollider::Solid || c.role == WorldCollider::Object) && c.kind == WorldCollider::Mesh) return kShowSolidMeshes;
@@ -4504,7 +5628,13 @@ struct Studio {
 
     void deleteWorld() {
         if (!scene || wKind < 0 || wIndex < 0 || wIndex >= worldCount(wKind)) return;
+        if (!wAlso.empty()) { deleteWorldSelection(); return; }
         pushWorldUndo();
+        const bool hadNavmesh = scene->world.hasNavmesh();
+        struct NoneIfLast {   // (the last navmesh piece deleted: no navmesh, as Delete Navmesh leaves it)
+            HomeWorld& w; bool had;
+            ~NoneIfLast() { if (had && !w.hasNavmesh()) w.walkNone = true; }
+        } noneIfLast{scene->world, hadNavmesh};
         HomeWorld& w = scene->world;
         switch (wKind) {
             case kSpawn: w.spawns.erase(w.spawns.begin() + wIndex); break;
@@ -4703,7 +5833,7 @@ struct Studio {
         return scene && !uploading && loadState != 1 && ((selected >= 0 && selected < static_cast<int>(objects.size())) || (wKind >= 0 && wIndex >= 0) ||
                                                          (splatSel >= 0 && static_cast<size_t>(splatSel) < splatItems.size()));
     }
-    bool canPaste() const { return scene && !uploading && loadState != 1 && !saving; }
+    bool canPaste() const { return scene && !uploading && loadState != 1 && !saving && !blenderBusy; }   // (an export reads the meshes)
 
     // Not the sky, and not animated (skinned, vertex-animated, moved by the home's animation): its copy would stand
     // still in a pose, or not draw at all.
@@ -4868,12 +5998,17 @@ struct Studio {
         }
         return pasteClip(c, false, to);
     }
-    // Edit > Duplicate: the selection again, beside itself (the clipboard is left as it was).
-    bool duplicateSelection() {
+    // Edit > Duplicate: the selection again, exactly where it is (selected: drag it, or change it, from there); beside:
+    // along the view's right, its width over. The clipboard is left as it was.
+    bool duplicateSelection(bool beside = false) {
         if (!canPaste()) return false;
         Clip c;
         if (!clipOfSelection(c)) return false;
-        return pasteClip(c, true);
+        if (beside) return pasteClip(c, true);
+        const float at[3] = {c.centre[0], c.centre[1], c.centre[2]};
+        if (!pasteClip(c, false, at)) return false;
+        note("Duplicated " + c.what + " in place: it's selected, on top of the original");
+        return true;
     }
 
     // A name not yet used: its own when that's free (cut and pasted back, from another window), else "Chair copy",
@@ -5195,7 +6330,7 @@ struct Studio {
     // Nearest visible object under a viewport pixel (ray against its triangles, in object space).
     int pick(float px, float py) { return pickRay(px, py, -1, nullptr, nullptr); }
     // The same, against one object only (only >= 0); outT: the distance along the (world) ray, outTri its triangle.
-    int pickRay(float px, float py, int only, float* outT, long* outTri) {
+    int pickRay(float px, float py, int only, float* outT, long* outTri, bool throughPlants = false) {
         if (!scene || viewSize.x < 1 || viewSize.y < 1) return -1;
         const float ty = std::tan(kFovY * 0.5f), tx = ty * viewSize.x / viewSize.y;
         const float u = (px - viewPos.x) / viewSize.x, v = (py - viewPos.y) / viewSize.y;
@@ -5210,6 +6345,7 @@ struct Studio {
         for (size_t i = 0; i < objects.size(); ++i) {
             const Object& o = objects[i];
             if (o.deleted || o.hidden || o.skybox || (only >= 0 && static_cast<int>(i) != only)) continue;
+            if (throughPlants && o.category == kPlants && surfaceMode(o) != kSurfSolid && surfaceMode(o) != kSurfObject) continue;
             float w[16], inv[16];
             mul(o.pivot, o.offset, w);
             if (!invert(w, inv)) continue;
@@ -5407,6 +6543,10 @@ struct Studio {
     void pickSelect(float px, float py) {
         float tm = 1e30f, ts = 1e30f;
         const int m = pickRay(px, py, -1, &tm, nullptr), sp = pickSplat(px, py, ts);
+        const bool more = ImGui::GetIO().KeyShift || ImGui::GetIO().KeyCtrl;   // (Ctrl or Shift: one more, or one less)
+        if (more && m >= 0 && !(sp >= 0 && ts < tm)) { toggleSelected(m); return; }
+        if (more && m < 0) return;                                             // (a missed Ctrl/Shift click keeps the selection)
+        alsoSelected.clear();
         selected = sp >= 0 && (m < 0 || ts < tm) ? -1 : m;
         splatSel = selected < 0 ? sp : -1;
     }
@@ -5498,60 +6638,60 @@ struct Studio {
     void splatPanel() {
         const size_t i = static_cast<size_t>(splatSel);
         SplatItem& sp = splatItems[i];
-        ImGui::TextUnformatted(scene->splats[i].name.c_str());
-        ImGui::TextDisabled("Gaussian splats · %s splats", withCommas(sp.count).c_str());
-        ImGui::Spacing();
-        float t[3], r[3], sc[3];
-        ImGuizmo::DecomposeMatrixToComponents(sp.pivot, t, r, sc);
-        bool changed = false;
-        auto pivotField = [&](bool edited) {        // one undo step per field, the first time it really changes
-            if (ImGui::IsItemActivated()) { std::memcpy(fieldPivot, sp.pivot, 64); fieldPivotPushed = false; }
-            if (edited && !fieldPivotPushed) { pushSplatUndo(i, fieldPivot); fieldPivotPushed = true; }
-            changed |= edited;
-        };
-        ImGui::BeginDisabled(drawing());   // (moving is Arrange mode's: not while drawing)
-        fieldLabel("Location");
-        pivotField(ImGui::DragFloat3("##sloc", t, 0.01f, 0, 0, "%.3f m"));
-        fieldLabel("Rotation");
-        tidyZero(r, 0.001f);
-        pivotField(ImGui::DragFloat3("##srot", r, 0.5f, 0, 0, "%.1f°"));
-        fieldLabel("Scale");
-        pivotField(ImGui::DragFloat3("##sscl", sc, 0.01f, 0.001f, 1000.0f, "%.3f"));
-        ImGui::EndDisabled();
-        if (changed) {
-            float was[16];
-            std::memcpy(was, sp.pivot, 64);
-            ImGuizmo::RecomposeMatrixFromComponents(t, r, sc, sp.pivot);
-            if (finiteMatrix(sp.pivot)) applySplat(i); else std::memcpy(sp.pivot, was, 64);   // (typed "1e39" or "nan")
+        bool reset = false, isolate = false, remove = false;
+        if (section("OBJECT")) {
+            fieldLabel("Name");
+            ImGui::TextUnformatted(scene->splats[i].name.c_str());
+            fieldLabel("Splats");
+            ImGui::Text("%s Gaussian splats", withCommas(sp.count).c_str());
+            // The headset's budget, for all the splats the environment keeps
+            const size_t total = splatTotal();
+            const uint32_t c = total > kSplatsMost ? 0xff5a4a : total > kSplatsSmooth ? 0xffd84a : 0x4cd964;
+            fieldLabel("Headset");
+            const ImVec2 dp = ImGui::GetCursorScreenPos();
+            const float sz = ImGui::GetTextLineHeight();
+            ImGui::GetWindowDrawList()->AddCircleFilled(ImVec2(dp.x + sz * 0.35f, dp.y + ImGui::GetFrameHeight() * 0.5f), sz * 0.3f, col(c));
+            ImGui::Dummy(ImVec2(sz * 0.7f, ImGui::GetFrameHeight()));
+            ImGui::SameLine(0, 4 * scale);
+            ImGui::TextColored(hex(c), "%s", total > kSplatsMost ? "Too many to draw smoothly" : total > kSplatsSmooth ? "May need Half frame rate" : "Fine at full frame rate");
+            const std::string t = withCommas(total) + " splats in all. Up to 400,000 keep the Steam Frame at its full frame rate; more may need\n"
+                                  "Scene › Rendering › Frame rate: Half; over a million won't stay smooth. Delete or hide what you don't need,\nor crop the capture.";
+            tip(t.c_str());
+            bool visible = !sp.hidden;
+            if (fieldCheck("Visible", &visible)) toggleSplatHidden(i);
+            buttonRow(3);
+            reset = rowButton("Reset", "Back where, how turned and how big it was loaded");
+            isolate = rowButton(isolating ? "Show All" : "Only This", "Show only what's selected (I), or everything again");
+            remove = rowButton("Delete", nullptr, true, Look::Danger);
         }
-        // The headset's budget, for all the splats the environment keeps
-        const size_t total = splatTotal();
-        const uint32_t c = total > kSplatsMost ? 0xff5a4a : total > kSplatsSmooth ? 0xffd84a : 0x4cd964;
-        fieldLabel("Headset");
-        const ImVec2 dp = ImGui::GetCursorScreenPos();
-        const float sz = ImGui::GetTextLineHeight();
-        ImGui::GetWindowDrawList()->AddCircleFilled(ImVec2(dp.x + sz * 0.35f, dp.y + ImGui::GetFrameHeight() * 0.5f), sz * 0.3f, col(c));
-        ImGui::Dummy(ImVec2(sz * 0.7f, ImGui::GetFrameHeight()));
-        ImGui::SameLine(0, 4 * scale);
-        ImGui::AlignTextToFramePadding();
-        ImGui::PushStyleColor(ImGuiCol_Text, hex(c));
-        ImGui::TextWrapped("%s splats in all: %s", withCommas(total).c_str(),
-                           total > kSplatsMost ? "too many to draw smoothly" : total > kSplatsSmooth ? "may need Half frame rate" : "fine at full frame rate");
-        ImGui::PopStyleColor();
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Up to 400,000 splats keep the Steam Frame at its full frame rate. More may need Environment > Frame rate:\n"
-                              "Half; over a million won't stay smooth. Delete or hide what you don't need, or crop the capture.");
-        ImGui::Spacing();
-        bool visible = !sp.hidden;
-        if (ImGui::Checkbox("Visible", &visible)) toggleSplatHidden(i);
-        ImGui::SameLine();
-        if (ImGui::Button("Reset")) { pushSplatUndo(i); std::memcpy(sp.pivot, sp.pivot0, 64); applySplat(i); }
-        ImGui::SameLine();
-        if (ImGui::Button(isolating ? "Show All" : "Only This")) toggleIsolate();
-        ImGui::SameLine();
-        pushDanger();
-        if (ImGui::Button("Delete")) deleteSplat(i);
-        ImGui::PopStyleColor(3);
+        if (section("TRANSFORM")) {
+            float t[3], r[3], sc[3];
+            ImGuizmo::DecomposeMatrixToComponents(sp.pivot, t, r, sc);
+            bool changed = false;
+            auto pivotField = [&](bool edited) {        // one undo step per field, the first time it really changes
+                if (ImGui::IsItemActivated()) { std::memcpy(fieldPivot, sp.pivot, 64); fieldPivotPushed = false; }
+                if (edited && !fieldPivotPushed) { pushSplatUndo(i, fieldPivot); fieldPivotPushed = true; }
+                changed |= edited;
+            };
+            ImGui::BeginDisabled(drawing());   // (moving is Arrange mode's: not while drawing)
+            fieldLabel("Location");
+            pivotField(ImGui::DragFloat3("##sloc", t, 0.01f, 0, 0, "%.3f m"));
+            fieldLabel("Rotation");
+            tidyZero(r, 0.001f);
+            pivotField(ImGui::DragFloat3("##srot", r, 0.5f, 0, 0, "%.1f°"));
+            fieldLabel("Scale");
+            pivotField(ImGui::DragFloat3("##sscl", sc, 0.01f, 0.001f, 1000.0f, "%.3f"));
+            ImGui::EndDisabled();
+            if (changed) {
+                float was[16];
+                std::memcpy(was, sp.pivot, 64);
+                ImGuizmo::RecomposeMatrixFromComponents(t, r, sc, sp.pivot);
+                if (finiteMatrix(sp.pivot)) applySplat(i); else std::memcpy(sp.pivot, was, 64);   // (typed "1e39" or "nan")
+            }
+        }
+        if (reset) { pushSplatUndo(i); std::memcpy(sp.pivot, sp.pivot0, 64); applySplat(i); }
+        if (isolate) toggleIsolate();
+        if (remove) deleteSplat(i);
     }
     // Save or Send with more splats than the headset draws smoothly: asked first (true: go on).
     bool splatBudgetOk(const char* what) {
@@ -5606,7 +6746,7 @@ struct Studio {
                     animTime = std::fmod(animTime, animLength);
                 }
             }
-            if (scene->animate && !scene->animatedMeshes.empty() && !walkJob) scene->animate(animTime, scene->meshes);   // (a walk bake reads the meshes)
+            if (scene->animate && !scene->animatedMeshes.empty() && !walkJob && !blenderBusy) scene->animate(animTime, scene->meshes);   // (a walk bake reads the meshes)
         }
         // Clay / glTF loops are baked on the CPU above. HSL shaders (water, flipbooks, VAT, sway) and rigs read the
         // clock the way the headset does, never wrapping: wrapping it made every shader animation jump each loop.
@@ -5622,9 +6762,17 @@ struct Studio {
         if (io.WantTextInput || flying) return;
         const bool ctrl = io.KeyCtrl, shift = io.KeyShift, alt = io.KeyAlt;
         if (ctrl && ImGui::IsKeyPressed(ImGuiKey_O, false)) openDialog();
-        if (ctrl && shift && ImGui::IsKeyPressed(ImGuiKey_S, false)) saveEnvironmentDialog();
+        if (ctrl && shift && ImGui::IsKeyPressed(ImGuiKey_S, false)) exportEnvironmentDialog();
+        else if (ctrl && !shift && ImGui::IsKeyPressed(ImGuiKey_E, false)) exportEnvironmentDialog();
         else if (ctrl && ImGui::IsKeyPressed(ImGuiKey_S, false)) saveToLibrary();
         if (ImGui::IsKeyPressed(ImGuiKey_F1, false)) showControls = !showControls;
+        if (scene && ImGui::IsKeyPressed(ImGuiKey_F12, false)) { if (framingPicture) pictureWanted = true; else framePicture(true); }
+        if (framingPicture && (ImGui::IsKeyPressed(ImGuiKey_Enter, false) || ImGui::IsKeyPressed(ImGuiKey_KeypadEnter, false))) pictureWanted = true;
+        if (framingPicture && ImGui::IsKeyPressed(ImGuiKey_Escape, false)) { framePicture(false); return; }
+        if (walking) {                                 // (W A S D walk: none of them are the editor's keys now)
+            if (ImGui::IsKeyPressed(ImGuiKey_Escape, false) || (!ctrl && ImGui::IsKeyPressed(ImGuiKey_V, false))) stopWalking();
+            return;
+        }
         if (ImGui::IsKeyPressed(ImGuiKey_F3, false)) openSearch();
         if (ctrl && ImGui::IsKeyPressed(ImGuiKey_Space, false)) viewMaximized = !viewMaximized;
         // Mid gizmo drag or field edit: no undo / redo, delete or selection changes (Ctrl is also the snap key, and a
@@ -5636,17 +6784,28 @@ struct Studio {
         if (ctrl && !shift && !alt && ImGui::IsKeyPressed(ImGuiKey_C, false)) copySelection(false);
         if (ctrl && !shift && !alt && ImGui::IsKeyPressed(ImGuiKey_X, false)) copySelection(true);
         if (ctrl && !shift && !alt && ImGui::IsKeyPressed(ImGuiKey_V, false)) pasteClipboard();
-        if (ctrl && !shift && !alt && ImGui::IsKeyPressed(ImGuiKey_D, false)) duplicateSelection();
+        if (ctrl && !alt && ImGui::IsKeyPressed(ImGuiKey_D, false)) duplicateSelection(shift);
         // Blender's numpad views (Ctrl: from the opposite side)
         if (scene && ImGui::IsKeyPressed(ImGuiKey_Keypad1, false)) viewFrom(ctrl ? kPi : 0, 0);
         if (scene && ImGui::IsKeyPressed(ImGuiKey_Keypad3, false)) viewFrom(ctrl ? -kPi * 0.5f : kPi * 0.5f, 0);
         if (scene && ImGui::IsKeyPressed(ImGuiKey_Keypad7, false)) viewFrom(0, ctrl ? -kPi * 0.5f + 0.001f : kPi * 0.5f - 0.001f);
         if (ctrl) return;
         if (ImGui::IsKeyPressed(ImGuiKey_N, false)) showSidebar = !showSidebar;
+        if (scene && !shift && !alt && ImGui::IsKeyPressed(ImGuiKey_V, false)) { startWalking(); return; }
         if (ImGui::IsKeyPressed(ImGuiKey_T, false)) showToolbar = !showToolbar;
         if (!scene) return;
+        if (navDrawing) {
+            if (ImGui::IsKeyPressed(ImGuiKey_Escape, false)) stopNavDraw();
+            if (ImGui::IsKeyPressed(ImGuiKey_Backspace) && !navPoints.empty()) navPoints.pop_back();
+            if (ImGui::IsKeyPressed(ImGuiKey_Enter, false) || ImGui::IsKeyPressed(ImGuiKey_KeypadEnter, false)) finishNavDraw();
+            return;
+        }
+        const bool navPicked = walkAreaPicked && selected < 0 && wKind < 0 && splatSel < 0;
+        if (!shift && !alt && ImGui::IsKeyPressed(ImGuiKey_Tab, false) && navPicked) { editNavmesh(); return; }
+        if (!shift && !alt && ImGui::IsKeyPressed(ImGuiKey_Tab, false) && (meshEdit.active() || wKind == kCollider)) { toggleMeshEdit(); return; }
+        if (meshEdit.active()) { meshEditKeys(alt); return; }
         if (shift && ImGui::IsKeyPressed(ImGuiKey_A, false)) { ImGui::OpenPopup("##addAtMouse"); return; }
-        if (alt && ImGui::IsKeyPressed(ImGuiKey_A, false)) { selected = splatSel = -1; wKind = wIndex = -1; }
+        if (alt && ImGui::IsKeyPressed(ImGuiKey_A, false)) { selected = splatSel = -1; wKind = wIndex = -1; alsoSelected.clear(); }
         if (ImGui::IsKeyPressed(ImGuiKey_Space, false)) animPlaying = !animPlaying;
         if (shift && ImGui::IsKeyPressed(ImGuiKey_LeftArrow, false)) { animTime = 0; animTick = std::chrono::steady_clock::now(); }
         if (shift && ImGui::IsKeyPressed(ImGuiKey_RightArrow, false)) { animTime = animLength; animTick = std::chrono::steady_clock::now(); }
@@ -5657,11 +6816,20 @@ struct Studio {
             if (tool == Tool::DrawFloor && !painting) drawWhat = static_cast<DrawWhat>((static_cast<int>(drawWhat) + 1) % 3);
             tool = Tool::DrawFloor;
         }
+        if (tool == Tool::DrawFloor && drawWhat == DrawWhat::Floor && !shapeCorners.empty() && floorShape == FloorShape::Polygon) {
+            if (ImGui::IsKeyPressed(ImGuiKey_Enter, false) || ImGui::IsKeyPressed(ImGuiKey_KeypadEnter, false)) closePolygon(shift);
+            if (ImGui::IsKeyPressed(ImGuiKey_Backspace)) shapeCorners.pop_back();
+            if (ImGui::IsKeyPressed(ImGuiKey_Escape, false)) { shapeCorners.clear(); return; }
+        }
+        if (tool == Tool::DrawFloor && drawWhat == DrawWhat::Floor && !painting && !flying && ImGui::IsKeyPressed(ImGuiKey_Q, false)) {
+            floorShape = static_cast<FloorShape>((static_cast<int>(floorShape) + 1) % static_cast<int>(FloorShape::kCount));
+            shapeCorners.clear();
+        }
         if (tool == Tool::DrawFloor && ImGui::IsKeyPressed(ImGuiKey_LeftBracket)) floorBrush = std::max(0.05f, floorBrush / 1.25f);
         if (tool == Tool::DrawFloor && ImGui::IsKeyPressed(ImGuiKey_RightBracket)) floorBrush = std::min(5.0f, floorBrush * 1.25f);
         // X asks first (Blender's "OK? Delete"); Delete deletes
-        if (ImGui::IsKeyPressed(ImGuiKey_X, false) && (selected >= 0 || wKind >= 0 || splatSel >= 0)) ImGui::OpenPopup("##deleteAsk");
-        if (ImGui::IsKeyPressed(ImGuiKey_Delete, false)) { if (wKind >= 0) deleteWorld(); else deleteSelected(); }
+        if (ImGui::IsKeyPressed(ImGuiKey_X, false) && (selected >= 0 || wKind >= 0 || splatSel >= 0 || navPicked)) ImGui::OpenPopup("##deleteAsk");
+        if (ImGui::IsKeyPressed(ImGuiKey_Delete, false)) { if (navPicked) resetWalk(); else if (wKind >= 0) deleteWorld(); else deleteSelected(); }
         if (ImGui::IsKeyPressed(ImGuiKey_W, false)) showWorld = !showWorld;
         if (ImGui::IsKeyPressed(ImGuiKey_I, false) || ImGui::IsKeyPressed(ImGuiKey_KeypadDivide, false)) toggleIsolate();
         if (ImGui::IsKeyPressed(ImGuiKey_H, false)) { if (alt) unhideAll(); else if (selected >= 0) toggleHidden(selected); else if (splatSel >= 0) toggleSplatHidden(splatSel); }
@@ -5717,6 +6885,7 @@ struct Studio {
         Move, Rotate, Scale, DrawFloor, Global, Local, PlayerView, FrameAll,
         Viewport, Outliner, Properties, Timeline,                  // the editors (an area's editor button)
         Object, Walk, Scene, Bundle, Headset,                      // the Properties tabs
+        ActiveTool, Physics, MeshData, Output,
         Zoom, Pan, Play, Pause, SkipStart, SkipEnd, Sound, Muted   // navigation, playback
     };
 
@@ -5846,6 +7015,36 @@ struct Studio {
                 dl->AddLine(ImVec2(c.x + r * 0.8f, c.y - r * 0.1f), ImVec2(c.x + r * 1.0f, c.y - r * 0.1f), color, t);
                 break;
             }
+            case ToolIcon::ActiveTool: {   // a screwdriver, as Blender's Tool tab
+                const ImVec2 a(c.x - r * 0.8f, c.y + r * 0.8f), m(c.x - r * 0.15f, c.y + r * 0.15f), b(c.x + r * 0.75f, c.y - r * 0.75f);
+                dl->AddLine(a, m, color, t * 2.6f);                         // the handle
+                dl->AddLine(m, b, color, t);                                // the shaft
+                dl->AddLine(ImVec2(b.x - r * 0.18f, b.y - r * 0.08f), ImVec2(b.x + r * 0.08f, b.y + r * 0.18f), color, t);   // its tip
+                break;
+            }
+            case ToolIcon::Physics: {   // a ball in flight: Blender's Physics tab
+                const ImVec2 ball(c.x + r * 0.3f, c.y - r * 0.3f);
+                dl->AddCircleFilled(ball, r * 0.36f, col(0x6aa8ff), 16);
+                for (int k = -1; k <= 1; ++k) {
+                    const float o = k * r * 0.22f;
+                    dl->AddLine(ImVec2(ball.x - r * 0.45f + o, ball.y + r * 0.45f + o), ImVec2(ball.x - r * 1.0f + o, ball.y + r * 1.0f + o), color, t);
+                }
+                break;
+            }
+            case ToolIcon::MeshData: {   // a triangle of corners, Blender's mesh data green
+                const ImU32 g = col(0x5fd068);
+                const ImVec2 p0(c.x, c.y - r * 0.72f), p1(c.x - r * 0.78f, c.y + r * 0.6f), p2(c.x + r * 0.78f, c.y + r * 0.6f);
+                dl->AddTriangle(p0, p1, p2, g, t);
+                const float d = r * 0.16f;
+                for (const ImVec2& p : {p0, p1, p2}) dl->AddRectFilled(ImVec2(p.x - d, p.y - d), ImVec2(p.x + d, p.y + d), color);
+                break;
+            }
+            case ToolIcon::Output: {   // a printer, as Blender's Output tab
+                dl->AddRect(ImVec2(c.x - r * 0.45f, c.y - r * 0.8f), ImVec2(c.x + r * 0.45f, c.y - r * 0.2f), color, 0, 0, t);   // the paper in
+                dl->AddRectFilled(ImVec2(c.x - r * 0.85f, c.y - r * 0.25f), ImVec2(c.x + r * 0.85f, c.y + r * 0.4f), color, 1.5f * scale);
+                dl->AddRect(ImVec2(c.x - r * 0.45f, c.y + r * 0.2f), ImVec2(c.x + r * 0.45f, c.y + r * 0.8f), color, 0, 0, t);   // the page out
+                break;
+            }
             case ToolIcon::Zoom: {   // a magnifier
                 dl->AddCircle(ImVec2(c.x - r * 0.15f, c.y - r * 0.15f), r * 0.45f, color, 20, t);
                 dl->AddLine(ImVec2(c.x + r * 0.18f, c.y + r * 0.18f), ImVec2(c.x + r * 0.7f, c.y + r * 0.7f), color, t * 1.6f);
@@ -5909,17 +7108,17 @@ struct Studio {
     void surfaceItems(const std::vector<size_t>& objs) {
         int mode = -2;                      // the one they share (-1: mixed)
         size_t can = 0;
-        for (size_t i : objs) { if (!canBeSurface(objects[i])) continue; ++can; const int m = surfaceMode(objects[i]); mode = mode == -2 ? m : mode == m ? m : -1; }
-        ImGui::TextDisabled(objs.size() > 1 ? "Surface (all %zu)" : "Surface", can);
+        for (size_t i : objs) { if (!canHaveCollision(objects[i])) continue; ++can; const int m = surfaceMode(objects[i]); mode = mode == -2 ? m : mode == m ? m : -1; }
+        ImGui::TextDisabled(objs.size() > 1 ? "Collision (all %zu)" : "Collision", can);
         for (int m = 0; m < kSurfModes; ++m) {
             const uint32_t tint = m == kSurfSolid ? 0xc8b45a : m == kSurfObject ? 0xb07aff : kText;
             ImGui::PushStyleColor(ImGuiCol_Text, hex(can ? tint : kDim));
             const bool hit = ImGui::MenuItem((std::string("    ") + kSurfNames[m]).c_str(), nullptr, mode == m, can > 0);
             ImGui::PopStyleColor();
-            if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("%s", can ? kSurfHelp[m] : "Not solid (see-through, glow, sky or a far backdrop)");
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("%s", can ? kSurfHelp[m] : "The sky or a far backdrop: nothing to bump into");
             if (hit && mode != m) {
                 std::vector<size_t> v;
-                for (size_t i : objs) if (canBeSurface(objects[i])) v.push_back(i);
+                for (size_t i : objs) if (canHaveCollision(objects[i])) v.push_back(i);
                 setSurfaces(v, m);
             }
         }
@@ -5952,7 +7151,8 @@ struct Studio {
         if (ImGui::MenuItem("Copy", "Ctrl+C", false, can)) copySelection(false);
         if (ImGui::MenuItem("Cut", "Ctrl+X", false, can)) copySelection(true);
         if (ImGui::MenuItem("Paste", "Ctrl+V", false, canPaste())) pasteClipboard();
-        if (ImGui::MenuItem("Duplicate", "Ctrl+D", false, can && canPaste())) duplicateSelection();
+        if (ImGui::MenuItem("Duplicate in Place", "Ctrl+D", false, can && canPaste())) duplicateSelection();
+        if (ImGui::MenuItem("Duplicate Beside", "Ctrl+Shift+D", false, can && canPaste())) duplicateSelection(true);
     }
 
     // ── Files: everything inside the open home's files, by what each thing was. Meta's homes keep each file as it
@@ -6380,10 +7580,11 @@ struct Studio {
             const ImVec2 p = ImGui::GetCursorScreenPos();
             const float w = ImGui::GetContentRegionAvail().x;
             if (row++ & 1) ImGui::GetWindowDrawList()->AddRectFilled(p, ImVec2(p.x + w, p.y + h), col(kListAlt));
-            const bool sel = selected == static_cast<int>(i);
+            const bool sel = isSelected(static_cast<int>(i));
             ImGui::SetCursorScreenPos(p);
             if (ImGui::Selectable("##row", sel, ImGuiSelectableFlags_AllowOverlap | ImGuiSelectableFlags_AllowDoubleClick, ImVec2(w, h))) {
-                selected = static_cast<int>(i);
+                if (ImGui::GetIO().KeyShift || ImGui::GetIO().KeyCtrl) toggleSelected(static_cast<int>(i));
+                else { alsoSelected.clear(); selected = static_cast<int>(i); }
                 wKind = wIndex = -1;
                 if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) frameSelected();
             }
@@ -6493,31 +7694,95 @@ struct Studio {
                     for (int k = 0; k < kWorldKinds; ++k)
                         for (int i = 0, n = worldCount(k); i < n; ++i)
                             if (worldCat(k, i) == cat) items.emplace_back(k, i);
-                    if (items.empty()) continue;
+                    // the navmesh with no pieces: the one worked out from the home (or none, deleted), a row of its own
+                    const bool navRow = cat == kShowWalkArea && !scene->world.hasNavmesh();
+                    if (items.empty() && !navRow) continue;
                     ImGui::PushID("worldgroup");
                     ImGui::PushID(cat);
                     const ImVec2 gp = ImGui::GetCursorScreenPos();
                     const bool gopen = !collapsed.count(2100 + cat);
                     if (ImGui::Selectable("##grp", false, ImGuiSelectableFlags_AllowOverlap, ImVec2(w, h))) { if (gopen) collapsed.insert(2100 + cat); else collapsed.erase(2100 + cat); }
+                    if (ImGui::BeginPopupContextItem("##grpmenu")) {   // the whole group at once
+                        ImGui::TextUnformatted(kShowNames[cat]);
+                        ImGui::Separator();
+                        if (ImGui::MenuItem("Select All", nullptr, false, !items.empty())) {
+                            meshEdit.end();
+                            selected = splatSel = -1;
+                            walkAreaPicked = false;
+                            wKind = items[0].first; wIndex = items[0].second;
+                            wAlso.assign(items.begin() + 1, items.end());
+                            wAlsoKind = wKind; wAlsoIndex = wIndex;
+                        }
+                        if (ImGui::MenuItem(cat == kShowWalkArea ? "Delete Navmesh" : "Delete All", nullptr, false, !items.empty() || (navRow && !scene->world.walkNone))) {
+                            if (cat == kShowWalkArea) resetWalk();
+                            else {
+                                meshEdit.end();
+                                wKind = items[0].first; wIndex = items[0].second;
+                                wAlso.assign(items.begin() + 1, items.end());
+                                wAlsoKind = wKind; wAlsoIndex = wIndex;
+                                deleteWorldSelection();
+                            }
+                        }
+                        if (cat == kShowWalkArea && ImGui::IsItemHovered()) ImGui::SetTooltip("%s", kResetWalkTip);
+                        ImGui::EndPopup();
+                    }
                     const float ty = gp.y + (h - ImGui::GetTextLineHeight()) * 0.5f;
                     hdl->AddCircleFilled(ImVec2(gp.x + 20 * scale, gp.y + h * 0.5f), 4 * scale, col(kShowColors[cat], showCat[cat] ? 1.0f : 0.3f));
                     const std::string gt = std::string(gopen ? "\u25be " : "\u25b8 ") + kShowNames[cat];
                     hdl->AddText(ImVec2(gp.x + 30 * scale, ty), col(showCat[cat] ? kText : kDim), gt.c_str());
-                    const std::string gc = std::to_string(items.size());
+                    const std::string gc = std::to_string(items.size() + (navRow && !scene->world.walkNone ? 1 : 0));
                     hdl->AddText(ImVec2(gp.x + w - h - ImGui::CalcTextSize(gc.c_str()).x - 10 * scale, ty), col(kDim), gc.c_str());
                     ImGui::SetCursorScreenPos(ImVec2(gp.x + w - h - 4 * scale, gp.y + h * 0.1f));
                     if (eyeButton("geye", showCat[cat])) showCat[cat] = !showCat[cat];
                     ImGui::SetCursorScreenPos(ImVec2(gp.x, gp.y + h));
+                    if (gopen && navRow) {   // the navmesh worked out from the home: select it for its settings, Tab to edit it, Delete
+                        ImGui::PushID("navauto");
+                        const ImVec2 rp = ImGui::GetCursorScreenPos();
+                        const bool none = scene->world.walkNone;
+                        const bool sel = walkAreaPicked && selected < 0 && wKind < 0 && splatSel < 0;
+                        if (ImGui::Selectable("##navrow", sel, ImGuiSelectableFlags_AllowOverlap | ImGuiSelectableFlags_AllowDoubleClick, ImVec2(w, h))) pickWalkArea();
+                        if (ImGui::IsItemHovered())
+                            ImGui::SetTooltip(none ? "Deleted: nothing is walkable. Right-click to Auto-generate it or Add Navmesh."
+                                                   : "Where you can walk, worked out from the home. Click for its settings, Tab to edit it (it becomes pieces you edit), Delete to delete it.");
+                        if (ImGui::BeginPopupContextItem("##navmenu")) {
+                            pickWalkArea();
+                            if (ImGui::MenuItem(none ? "Auto-generate" : walkSaved() ? "Auto-generate Again" : "Auto-generate Navmesh")) autoGenerate();
+                            if (ImGui::MenuItem("Edit (Tab)", nullptr, false, !none && walkShown != nullptr)) editNavmesh();
+                            if (ImGui::MenuItem("Use Meta's Navmesh", nullptr, false, hasMetaNavmesh(*scene, scene->world))) useMetaNavmesh();
+                            if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", kMakeNavmeshTip);
+                            if (ImGui::MenuItem("Add Navmesh")) addNavmesh();
+                            if (ImGui::MenuItem("Clear Painted Floor", nullptr, false, !scene->world.walkPaint.empty())) clearPaint();
+                            ImGui::Separator();
+                            if (ImGui::MenuItem("Delete", "X", false, !none)) resetWalk();
+                            if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", kResetWalkTip);
+                            ImGui::EndPopup();
+                        }
+                        const float ty2 = rp.y + (h - ImGui::GetTextLineHeight()) * 0.5f;
+                        const bool shown = showCat[kShowWalkArea];
+                        hdl->AddText(ImVec2(rp.x + 40 * scale, ty2), col(none ? kDim : sel ? 0xffffff : shown ? kText : kDim),
+                                     none ? "None (deleted)" : scene->world.hasHomeCollision() || (scene->world.useHomeCollision && !metaNavmeshMeshes(*scene).empty())
+                                                                   ? "Navmesh (Meta's)" : "Navmesh (worked out from the home)");
+                        char area[48];
+                        if (none) area[0] = 0;
+                        else if (walkShown) std::snprintf(area, sizeof area, "%.0f m\u00b2", walkReport.walkArea);
+                        else std::snprintf(area, sizeof area, "\u2026");
+                        hdl->AddText(ImVec2(rp.x + w - h - ImGui::CalcTextSize(area).x - 10 * scale, ty2), col(kDim), area);
+                        ImGui::SetCursorScreenPos(ImVec2(rp.x + w - h - 4 * scale, rp.y + h * 0.1f));
+                        if (!none && eyeButton("naveye", shown)) { showCat[kShowWalkArea] = !shown; if (!shown) showWorld = true; }
+                        ImGui::SetCursorScreenPos(ImVec2(rp.x, rp.y + h));
+                        ImGui::PopID();
+                    }
                     if (gopen) {
-                        const size_t shown = std::min<size_t>(items.size(), 300);
-                        for (size_t r = 0; r < shown; ++r) {
+                        for (size_t r = 0; r < items.size(); ++r) {
                             const int k = items[r].first, i = items[r].second;
+                            if (!rowVisible()) continue;   // (scrolled out of view: only its space)
                             ImGui::PushID(static_cast<int>(r));
                             const ImVec2 rp = ImGui::GetCursorScreenPos();
-                            const bool sel = wKind == k && wIndex == i;
+                            const bool sel = (wKind == k && wIndex == i) || worldAlsoSelected(k, i);
                             bool* hid = worldHidden(k, i);
                             if (ImGui::Selectable("##wrow", sel, ImGuiSelectableFlags_AllowOverlap | ImGuiSelectableFlags_AllowDoubleClick, ImVec2(w, h))) {
-                                wKind = k; wIndex = i; selected = -1;
+                                if ((ImGui::GetIO().KeyShift || ImGui::GetIO().KeyCtrl) && wKind >= 0) toggleWorldSelected(k, i);
+                                else { wAlso.clear(); wKind = k; wIndex = i; selected = -1; }
                                 if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) frameWorld(k, i);
                             }
                             if (ImGui::BeginPopupContextItem("##wrowmenu")) {
@@ -6534,7 +7799,6 @@ struct Studio {
                             ImGui::SetCursorScreenPos(ImVec2(rp.x, rp.y + h));
                             ImGui::PopID();
                         }
-                        if (items.size() > shown) { ImGui::SetCursorPosX(ImGui::GetCursorPosX() + 40 * scale); ImGui::TextDisabled("\u2026 %zu more", items.size() - shown); }
                     }
                     ImGui::PopID();
                     ImGui::PopID();
@@ -6553,34 +7817,60 @@ struct Studio {
         ImGui::EndChild();
     }
 
-    // A panel's section header: a small semibold caption with a hairline under it, a little air above it.
-    // A panel, as Blender's Properties draws them: a title strip (an arrow, the title) and its fields on a lighter
-    // rounded box. In Properties the boxes go behind the fields (a draw-list channel under them, filled in when the
-    // panel ends); anywhere else a section is its title and a hairline.
+    // ── Properties' panels, drawn as Blender's Properties editor draws them: a rounded box per panel, a header row
+    //    (an arrow, the title, sometimes a checkbox that switches the panel's thing on) over a slightly darker body.
+    //    A header click folds the panel; each panel's state is kept for the session by its tab and title. The boxes
+    //    go behind the fields (a draw-list channel under them, the body's filled in when the panel ends). Anywhere
+    //    else (the viewport's sidebar) a section is its caption and a hairline. ──
     ImDrawList* panelList = nullptr;        // the draw list the panels being drawn go on (null: plain sections)
     float panelTop = -1;                    // the open panel's top (screen y), or -1
+    float panelHeadH = 0;                   // its header's height
+    bool panelBody = false;                 // it's unfolded: its body gets a box
+    bool panelHidden = false;               // it doesn't match the search: drawn into a hidden child (its labels still read)
+    int panelsShown = 0;                    // panels drawn in the open tab this frame (the search: none matched)
+    std::string panelKey;                   // the panel being drawn ("<tab>/<title>")
+    std::map<std::string, bool> panelOpen;  // each panel's and sub-panel's unfolded state this session
+    std::map<std::string, int> panelHit;    // the search: the frame each panel last had something matching it
+    std::string panelScrollTo;              // a panel to unfold and bring into view (showInspectorTab)
+    char propSearch[64] = "";               // Properties' search field (in its header)
+    bool searching() const { return propSearch[0] != 0; }
+    bool searchMatches(const char* text) const {
+        return searching() && text && *text && lowerOf(text).find(lowerOf(propSearch)) != std::string::npos;
+    }
+    // Something in the panel being drawn matches the search: it shows (from the next frame if it was hidden).
+    void markSearchHit(const char* text) {
+        if (!panelKey.empty() && searchMatches(text)) panelHit[panelKey] = ImGui::GetFrameCount();
+    }
     void beginPanels() {
         panelList = ImGui::GetWindowDrawList();
         panelList->ChannelsSplit(2);
         panelList->ChannelsSetCurrent(1);
         panelTop = -1;
+        panelHidden = false;
+        panelsShown = 0;
+        panelKey.clear();
     }
     void closePanel() {
+        if (panelHidden) { ImGui::EndChild(); panelHidden = false; panelTop = -1; return; }
         if (!panelList || panelTop < 0 || panelList != ImGui::GetWindowDrawList()) return;
-        const float x0 = ImGui::GetWindowPos().x + ImGui::GetWindowContentRegionMin().x - 6 * scale;
-        const float x1 = ImGui::GetWindowPos().x + ImGui::GetWindowContentRegionMax().x + 6 * scale;
-        const float y1 = ImGui::GetCursorScreenPos().y + 3 * scale;
-        panelList->ChannelsSetCurrent(0);
-        panelList->AddRectFilled(ImVec2(x0, panelTop), ImVec2(x1, y1), col(kPanelBox), 5 * scale);
-        panelList->ChannelsSetCurrent(1);
+        if (panelBody) {
+            const float x0 = ImGui::GetWindowPos().x + ImGui::GetWindowContentRegionMin().x - 6 * scale;
+            const float x1 = ImGui::GetWindowPos().x + ImGui::GetWindowContentRegionMax().x + 6 * scale;
+            const float y0 = panelTop + panelHeadH, y1 = ImGui::GetCursorScreenPos().y + 2 * scale;
+            panelList->ChannelsSetCurrent(0);
+            if (y1 > y0) panelList->AddRectFilled(ImVec2(x0, y0), ImVec2(x1, y1), col(kPanelBox), 4 * scale, ImDrawFlags_RoundCornersBottom);
+            panelList->ChannelsSetCurrent(1);
+        }
         panelTop = -1;
-        ImGui::Dummy(ImVec2(0, 10 * scale));
+        ImGui::Dummy(ImVec2(0, (panelBody ? 4 : 1) * scale));   // Blender's few pixels between panels
     }
     void endPanels() {
         if (!panelList) return;
-        if (panelList == ImGui::GetWindowDrawList()) closePanel();
+        if (panelHidden || panelList == ImGui::GetWindowDrawList()) closePanel();
+        if (searching() && panelsShown == 0) ImGui::TextDisabled("Nothing here matches \"%s\"", propSearch);
         panelList->ChannelsMerge();
         panelList = nullptr;
+        panelKey.clear();
     }
     // "WALKABLE AREA" -> "Walkable Area": Blender's panels are titled in title case
     static std::string titleCase(const char* label) {
@@ -6592,6 +7882,25 @@ struct Studio {
         }
         return t;
     }
+    // A header's arrow (down unfolded, right folded), its checkbox if it has one, and its title.
+    void panelHeading(ImDrawList* dl, ImVec2 p, float h, const std::string& title, bool open, bool* check, const char* checkTip) {
+        const float ax = p.x + 6 * scale, ay = p.y + h * 0.5f, a = 3.5f * scale;
+        const ImU32 ac = col(kDim);
+        if (open) dl->AddTriangleFilled(ImVec2(ax - a, ay - a * 0.5f), ImVec2(ax + a, ay - a * 0.5f), ImVec2(ax, ay + a * 0.7f), ac);
+        else dl->AddTriangleFilled(ImVec2(ax - a * 0.5f, ay - a), ImVec2(ax - a * 0.5f, ay + a), ImVec2(ax + a * 0.7f, ay), ac);
+        float tx = p.x + 16 * scale;
+        if (check) {   // (submitted after the header's button, so it gets the click)
+            ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(2 * scale, 1 * scale));
+            const float box = ImGui::GetFrameHeight();
+            ImGui::SetCursorScreenPos(ImVec2(tx, p.y + (h - box) * 0.5f));
+            ImGui::Checkbox("##headcheck", check);
+            ImGui::PopStyleVar();
+            tip(checkTip);
+            tx += box + 5 * scale;
+        }
+        const bool hit = searchMatches(title.c_str());
+        dl->AddText(ImVec2(tx, p.y + (h - ImGui::GetTextLineHeight()) * 0.5f), col(hit ? kBlueHover : kText), title.c_str());
+    }
     // A video screen's panel: what it plays, and its sound — how loud, heard in full within the near distance of it and
     // fading to nothing by the far one (the view shows both as rings round it while it's selected).
     VideoClip panelClip;                    // the selected screen's clip as the panel shows it (read once, not every frame)
@@ -6599,15 +7908,14 @@ struct Studio {
     bool panelClipFailed(const std::string& path) const { return path == panelClipMissing; }
     void videoPanel(const Object& o) {
         MeshData& md = scene->meshes[o.scene];
-        section("VIDEO");
+        if (!section("VIDEO")) return;
         if (panelClip.path != md.video && !panelClipFailed(md.video)) { panelClip = VideoClip(); if (!panelClip.open(md.video)) panelClipMissing = md.video; }
         const VideoClip& clip = panelClip;
         const bool readable = clip.path == md.video;
-        ImGui::PushTextWrapPos(0);
+        fieldLabel("Clip");
         if (readable)
             ImGui::TextDisabled("%u x %u, %.1f s at %.0f fps, %s", clip.width, clip.height, clip.seconds(), clip.fps, clip.hasSound() ? "with sound" : "no sound");
         else ImGui::TextDisabled("its video file is missing");
-        ImGui::PopTextWrapPos();
         bool changed = false;
         fieldLabel("Volume");
         float vol = md.videoVolume * 100;
@@ -6619,34 +7927,90 @@ struct Studio {
         if (ImGui::SliderFloat("##vFar", &md.videoFar, 0.5f, 60, "%.1f m")) { md.videoNear = std::min(md.videoNear, md.videoFar - 0.5f); md.videoNear = std::max(0.0f, md.videoNear); changed = true; }
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("Walking from the near ring to this one, the sound fades out; past it, it's silent");
         fieldLabel("Sound");
-        ImGui::BeginDisabled(videoJob != nullptr);
-        if (ImGui::Button(clip.hasSound() ? "Replace\u2026" : "Add a Sound\u2026")) chooseScreenSound(selected);
-        ImGui::EndDisabled();
-        if (videoJob && videoJob->soundMesh == o.scene) { ImGui::SameLine(); ImGui::TextDisabled("adding it\u2026"); }
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Play a sound file with this screen (it loops with the picture)");
+        buttonRow(1);
+        const bool adding = videoJob && videoJob->soundMesh == o.scene;
+        if (rowButton(adding ? "Adding It\u2026" : clip.hasSound() ? "Replace\u2026" : "Add Sound\u2026", "Play a sound file with this screen (it loops with the picture)",
+                      videoJob == nullptr))
+            chooseScreenSound(selected);
         if (changed) { dirty = true; updateTitle(); }
     }
-    void section(const char* label) {
+    // A panel: its header (a click folds it) and true when its fields are to be drawn. startOpen: unfolded the first
+    // time it shows (rarely used panels start folded). check: a checkbox in its header, switching its thing on.
+    bool section(const char* label, bool startOpen = true, bool* check = nullptr, const char* checkTip = nullptr) {
         const std::string title = titleCase(label);
-        if (panelList && panelList == ImGui::GetWindowDrawList()) {
-            closePanel();
+        if (!panelList || (!panelHidden && panelList != ImGui::GetWindowDrawList())) {   // not in Properties: a caption
+            if (ImGui::GetCursorPosY() > ImGui::GetStyle().WindowPadding.y + 1) ImGui::Dummy(ImVec2(0, 6 * scale));
+            caption(title.c_str());
             const ImVec2 p = ImGui::GetCursorScreenPos();
-            const float h = ImGui::GetFrameHeight() + 2 * scale;
-            panelTop = p.y - 2 * scale;
-            ImDrawList* dl = ImGui::GetWindowDrawList();
-            const float ax = p.x + 5 * scale, ay = p.y + h * 0.5f - 1 * scale, a = 3.5f * scale;   // the ▾
-            dl->AddTriangleFilled(ImVec2(ax - a, ay - a * 0.6f), ImVec2(ax + a, ay - a * 0.6f), ImVec2(ax, ay + a * 0.8f), col(0xc0c0c0));
-            dl->AddText(ImVec2(p.x + 16 * scale, p.y + (h - ImGui::GetTextLineHeight()) * 0.5f - 1 * scale), col(kText), title.c_str());
-            ImGui::Dummy(ImVec2(ImGui::GetContentRegionAvail().x, h));
-            return;
+            ImGui::GetWindowDrawList()->AddLine(p, ImVec2(p.x + ImGui::GetContentRegionAvail().x, p.y), col(kLine), 1.0f);
+            ImGui::Dummy(ImVec2(0, 5 * scale));
+            if (check) { ImGui::Checkbox(("On##" + title).c_str(), check); tip(checkTip); }
+            return true;
         }
-        if (ImGui::GetCursorPosY() > ImGui::GetStyle().WindowPadding.y + 1) ImGui::Dummy(ImVec2(0, 6 * scale));
-        caption(title.c_str());
+        closePanel();
+        panelKey = std::to_string(static_cast<int>(inspectorTab)) + "/" + title;
+        bool& unfolded = panelOpen.try_emplace(panelKey, startOpen).first->second;
+        const bool scrollHere = panelScrollTo == title;
+        if (scrollHere) unfolded = true;
+        if (searching()) {   // Blender's search: panels with nothing matching go, the rest unfold
+            markSearchHit(title.c_str());
+            const auto hit = panelHit.find(panelKey);
+            if (hit == panelHit.end() || hit->second < ImGui::GetFrameCount() - 1) {
+                ImGui::BeginChild(("##hidden" + panelKey).c_str(), ImVec2(1, 1), ImGuiChildFlags_None,
+                                  ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoNav);
+                panelHidden = true;
+                return true;
+            }
+        }
+        const bool open = searching() || unfolded;
+        ++panelsShown;
         const ImVec2 p = ImGui::GetCursorScreenPos();
-        ImGui::GetWindowDrawList()->AddLine(ImVec2(p.x, p.y), ImVec2(p.x + ImGui::GetContentRegionAvail().x, p.y), col(kLine), 1.0f);
-        ImGui::Dummy(ImVec2(0, 5 * scale));
+        const float h = ImGui::GetFrameHeight() + 2 * scale;
+        const float x0 = ImGui::GetWindowPos().x + ImGui::GetWindowContentRegionMin().x - 6 * scale;
+        const float x1 = ImGui::GetWindowPos().x + ImGui::GetWindowContentRegionMax().x + 6 * scale;
+        panelTop = p.y;
+        panelHeadH = h;
+        panelBody = open;
+        ImGui::PushID(panelKey.c_str());
+        ImGui::SetNextItemAllowOverlap();
+        if (ImGui::InvisibleButton("##head", ImVec2(std::max(1.0f, ImGui::GetContentRegionAvail().x), h)) && !searching()) unfolded = !unfolded;
+        const bool hot = ImGui::IsItemHovered();
+        if (scrollHere) { ImGui::SetScrollHereY(0.0f); panelScrollTo.clear(); }
+        const ImVec2 after = ImGui::GetCursorScreenPos();
+        panelList->ChannelsSetCurrent(0);
+        panelList->AddRectFilled(ImVec2(x0, p.y), ImVec2(x1, p.y + h), col(hot ? mix(kPanelHead, kText, 0.06f) : kPanelHead), 4 * scale,
+                                 open ? ImDrawFlags_RoundCornersTop : ImDrawFlags_RoundCornersAll);
+        panelList->ChannelsSetCurrent(1);
+        panelHeading(panelList, ImVec2(p.x - 2 * scale, p.y), h, title, open, check, checkTip);
+        ImGui::SetCursorScreenPos(after);
+        ImGui::PopID();
+        return open;
     }
-    // The caption alone (section headers, the explorer's title, the start screen's lists).
+    // A sub-panel inside a panel, as Blender nests them: its own header, its fields indented under it. True: draw
+    // them, then endSubPanel().
+    bool subPanel(const char* label, bool startOpen = true, bool* check = nullptr, const char* checkTip = nullptr) {
+        const std::string title = titleCase(label);
+        const std::string key = panelKey + "/" + title;
+        bool& unfolded = panelOpen.try_emplace(key, startOpen).first->second;
+        markSearchHit(title.c_str());
+        const bool open = searching() || unfolded;
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        const ImVec2 p = ImGui::GetCursorScreenPos();
+        const float h = ImGui::GetFrameHeight(), w = std::max(1.0f, ImGui::GetContentRegionAvail().x);
+        ImGui::PushID(key.c_str());
+        ImGui::SetNextItemAllowOverlap();
+        if (ImGui::InvisibleButton("##sub", ImVec2(w, h)) && !searching()) unfolded = !unfolded;
+        const bool hot = ImGui::IsItemHovered();
+        const ImVec2 after = ImGui::GetCursorScreenPos();
+        dl->AddRectFilled(p, ImVec2(p.x + w, p.y + h), col(hot ? mix(kPanelHead, kText, 0.06f) : kPanelHead), 3 * scale);
+        panelHeading(dl, p, h, title, open, check, checkTip);
+        ImGui::SetCursorScreenPos(after);
+        ImGui::PopID();
+        if (open) ImGui::Indent(10 * scale);
+        return open;
+    }
+    void endSubPanel() { ImGui::Unindent(10 * scale); ImGui::Dummy(ImVec2(0, 1 * scale)); }
+    // The caption alone (the sidebar's sections, the explorer's title, the start screen's lists).
     void caption(const char* label) {
         ImGui::PushFont(fontOr(g_fontBold));
         ImGui::PushStyleColor(ImGuiCol_Text, hex(kHeading));
@@ -6655,219 +8019,390 @@ struct Studio {
         ImGui::PopFont();
     }
 
-    // ── The Inspector (right): the selection's and the environment's settings, one tab each ──
-    enum class InspectorTab { Selection, World, Environment, Bundle, Headset };
-    InspectorTab inspectorTab = InspectorTab::Selection;
-    int lastSelected = -1, lastWorldKind = -1, lastWorldIndex = -1, lastSplatSel = -1;   // selecting something new shows its tab
-
     // Angles read back from a transform come out as -0.0001, shown as "-0": within `half` of zero they're shown as 0.
     static void tidyZero(float* v, float half) { for (int k = 0; k < 3; ++k) if (std::fabs(v[k]) < half) v[k] = 0.0f; }
 
-    // A field's label, right-aligned in a column on its left, as Blender lays out properties; the field takes the rest.
+    // ── Properties' fields, the same in every tab: a label right-aligned in a column on the left (about 40%), the
+    //    field filling the rest; a checkbox in the field column with its label after it; a pick-one choice as joined
+    //    buttons with the chosen one blue; operator buttons sharing their row in equal widths. Help is a tooltip;
+    //    at most one short dim line under a field. ──
     void fieldLabel(const char* text) {
+        markSearchHit(text);
         const float x0 = ImGui::GetCursorPosX();
-        const float colW = std::clamp(ImGui::GetContentRegionAvail().x * 0.38f, 64 * scale, 140 * scale);
+        const float colW = std::clamp(ImGui::GetContentRegionAvail().x * 0.4f, 60 * scale, 150 * scale);
         const float tw = ImGui::CalcTextSize(text).x;
         ImGui::AlignTextToFramePadding();
         ImGui::SetCursorPosX(x0 + std::max(0.0f, colW - tw - 8 * scale));
-        ImGui::PushStyleColor(ImGuiCol_Text, hex(0xb8b8b8));
+        ImGui::PushStyleColor(ImGuiCol_Text, hex(searchMatches(text) ? kBlueHover : kHeading));
         ImGui::TextUnformatted(text);
         ImGui::PopStyleColor();
         ImGui::SameLine(x0 + colW);
         ImGui::SetNextItemWidth(-1);
     }
-
-    // Buttons side by side at their own width, as the Object tab lays out its row; one that doesn't fit on the line
-    // starts the next. A row's first button passes first (it starts a new line).
-    bool rowButton(const char* text, bool first = false) {
-        const ImGuiStyle& st = ImGui::GetStyle();
-        const float w = ImGui::CalcTextSize(text, nullptr, true).x + st.FramePadding.x * 2;
-        if (!first && ImGui::GetItemRectMax().x + st.ItemSpacing.x + w <= ImGui::GetWindowPos().x + ImGui::GetContentRegionMax().x) ImGui::SameLine();
-        return ImGui::Button(text);
+    // One short dim line; the longer story in its tooltip.
+    void hint(const char* text, const char* tipText = nullptr) {
+        ImGui::PushTextWrapPos(0);
+        ImGui::TextDisabled("%s", text);
+        ImGui::PopTextWrapPos();
+        tip(tipText);
+    }
+    // The last item's tooltip (disabled ones too: they say why).
+    void tip(const char* text) {
+        if (text && *text && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("%s", text);
+    }
+    bool fieldCheck(const char* label, bool* v, const char* tipText = nullptr) {
+        fieldLabel("");
+        markSearchHit(label);
+        const bool lit = searchMatches(label);
+        if (lit) ImGui::PushStyleColor(ImGuiCol_Text, hex(kBlueHover));
+        const bool changed = ImGui::Checkbox(label, v);
+        if (lit) ImGui::PopStyleColor();
+        tip(tipText);
+        return changed;
+    }
+    // Operator buttons: buttonRow(n), then n rowButton()s across the width there is (after a fieldLabel: the field's).
+    enum class Look { Plain, Primary, Danger, On };   // On: a mode that's running (blue, as Blender's pressed buttons)
+    int rowCount = 1, rowAt = 0;
+    float rowWidth = 0;
+    void buttonRow(int n) {
+        rowCount = std::max(1, n);
+        rowAt = 0;
+        rowWidth = std::max(1.0f, (ImGui::GetContentRegionAvail().x - (rowCount - 1) * 2 * scale) / rowCount);
+    }
+    bool rowButton(const char* text, const char* tipText = nullptr, bool enabled = true, Look look = Look::Plain, int icon = -1) {
+        if (rowAt > 0 && rowAt < rowCount) ImGui::SameLine(0, 2 * scale);
+        ++rowAt;
+        markSearchHit(text);
+        ImGui::BeginDisabled(!enabled);
+        if (look == Look::Primary || look == Look::On) pushPrimary();
+        else if (look == Look::Danger) pushDanger();
+        const std::string label = icon >= 0 ? std::string("     ") + text : std::string(text);
+        const bool hit = ImGui::Button(label.c_str(), ImVec2(rowWidth, 0));
+        if (look != Look::Plain) ImGui::PopStyleColor(3);
+        if (icon >= 0) {   // its icon just before its name
+            const ImVec2 a = ImGui::GetItemRectMin(), b = ImGui::GetItemRectMax();
+            const float full = ImGui::CalcTextSize(label.c_str(), nullptr, true).x, pad = ImGui::CalcTextSize("     ").x;
+            const float x = a.x + std::max(ImGui::GetStyle().FramePadding.x, (b.x - a.x - full) * 0.5f);
+            drawToolIcon(ImGui::GetWindowDrawList(), static_cast<ToolIcon>(icon), ImVec2(x + pad * 0.4f, (a.y + b.y) * 0.5f), (b.y - a.y) * 0.6f,
+                         col(kText, ImGui::GetStyle().Alpha));
+        }
+        ImGui::EndDisabled();
+        tip(tipText);
+        return hit;
+    }
+    // A pick-one choice as Blender draws an expanded enum: joined buttons across the field, the chosen one blue.
+    // Returns the one clicked (-1: none); the caller applies it. centres: where each was (--selftest clicks them).
+    int segmented(const char* id, const char* const* names, int n, int chosen, const char* const* tips = nullptr, ImVec2* centres = nullptr) {
+        ImGui::PushID(id);
+        const float w = std::max(1.0f, ImGui::GetContentRegionAvail().x), h = ImGui::GetFrameHeight();
+        const float alpha = ImGui::GetStyle().Alpha, round = ImGui::GetStyle().FrameRounding;
+        const ImVec2 p = ImGui::GetCursorScreenPos();
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        int clicked = -1;
+        for (int k = 0; k < n; ++k) {
+            const ImVec2 a(std::floor(p.x + w * k / n), p.y), b(std::floor(p.x + w * (k + 1) / n), p.y + h);
+            ImGui::SetCursorScreenPos(a);
+            ImGui::PushID(k);
+            if (ImGui::InvisibleButton("##seg", ImVec2(std::max(1.0f, b.x - a.x), h))) clicked = k;
+            ImGui::PopID();
+            const bool hot = ImGui::IsItemHovered(), on = k == chosen;
+            const ImDrawFlags corners = n == 1 ? ImDrawFlags_RoundCornersAll : k == 0 ? ImDrawFlags_RoundCornersLeft
+                                        : k == n - 1 ? ImDrawFlags_RoundCornersRight : ImDrawFlags_RoundCornersNone;
+            dl->AddRectFilled(a, b, col(on ? (hot ? kBlueHover : kBlue) : hot ? kWidgetHover : kWidget, alpha), round, corners);
+            if (k && !on && k - 1 != chosen) dl->AddLine(ImVec2(a.x, a.y + 3 * scale), ImVec2(a.x, b.y - 3 * scale), col(kPanelBox, alpha), 1.0f);
+            const ImVec2 ts = ImGui::CalcTextSize(names[k]);
+            dl->PushClipRect(ImVec2(a.x + 2 * scale, a.y), ImVec2(b.x - 2 * scale, b.y), true);
+            dl->AddText(ImVec2(std::max(a.x + 3 * scale, (a.x + b.x - ts.x) * 0.5f), (a.y + b.y - ts.y) * 0.5f), col(on ? 0xffffff : kText, alpha), names[k]);
+            dl->PopClipRect();
+            markSearchHit(names[k]);
+            if (tips) tip(tips[k]);
+            if (centres) centres[k] = ImVec2((a.x + b.x) * 0.5f, (a.y + b.y) * 0.5f);
+        }
+        ImGui::SetCursorScreenPos(p);
+        ImGui::Dummy(ImVec2(w, h));
+        ImGui::PopID();
+        return clicked;
+    }
+    // A list row's small square button (a piece's ✕).
+    bool listButton(const char* id, const char* glyph, const char* tipText) {
+        ImGui::PushID(id);
+        const float s = ImGui::GetFrameHeight();
+        const bool hit = ImGui::Button(glyph, ImVec2(s, s));
+        ImGui::PopID();
+        tip(tipText);
+        return hit;
     }
 
-    // Properties: its tabs across the top, each its icon and name (the open one lit, a blue line under it), the
-    // chosen tab's panels under them. Too narrow for every name: the others show only their icon (hover names them).
+    // ── Properties: its tabs down the left edge as Blender's (icons; the open one lit; gaps between kinds of tab),
+    //    the open tab's panels to their right under the path to what they show. ──
+    enum class InspectorTab { Tool, Scene, Navmesh, Object, Physics, Data, Output };
+    InspectorTab inspectorTab = InspectorTab::Object;
+    int lastSelected = -1, lastWorldKind = -1, lastWorldIndex = -1, lastSplatSel = -1;   // selecting something new may show Object
+    struct TabDef { InspectorTab tab; ToolIcon icon; const char* name; const char* tip; int group; };
+    static const TabDef* tabDefs(int& n) {
+        static const TabDef k[] = {
+            {InspectorTab::Tool, ToolIcon::ActiveTool, "Tool", "Tool: the active tool's settings", 0},
+            {InspectorTab::Scene, ToolIcon::Scene, "Scene", "Scene: the environment's name, picture, sky, sound and rendering", 1},
+            {InspectorTab::Navmesh, ToolIcon::Walk, "Navmesh", "Navmesh: where you can walk, and how it's worked out", 1},
+            {InspectorTab::Object, ToolIcon::Object, "Object", "Object: what you selected, where it is and how it's turned", 2},
+            {InspectorTab::Physics, ToolIcon::Physics, "Physics", "Physics: walked on, bumped into or walked through", 2},
+            {InspectorTab::Data, ToolIcon::MeshData, "Data", "Data: the selected surface's mesh, and editing its corners", 2},
+            {InspectorTab::Output, ToolIcon::Output, "Output", "Output: saving, exporting, bundles and the headset", 3},
+        };
+        n = static_cast<int>(std::size(k));
+        return k;
+    }
+    static const char* tabName(InspectorTab t) { int n = 0; return tabDefs(n)[static_cast<int>(t)].name; }
+    bool objectPicked() const { return scene && selected >= 0 && selected < static_cast<int>(objects.size()); }
+    bool worldPicked() const { return scene && wKind >= 0 && wIndex >= 0 && wIndex < worldCount(wKind); }
+    bool splatPicked() const { return scene && splatSel >= 0 && static_cast<size_t>(splatSel) < splatItems.size(); }
+    bool physicsShown() const {
+        if (worldPicked()) return wKind == kCollider || wKind == kGravity;
+        return objectPicked() && canHaveCollision(objects[selected]);
+    }
+    bool dataShown() const { return worldPicked() && wKind == kCollider; }
+    bool tabShown(InspectorTab t) const { return t == InspectorTab::Physics ? physicsShown() : t == InspectorTab::Data ? dataShown() : true; }
+    // A new selection keeps the open tab when it shows something for it; else Properties shows its Object tab.
+    bool tabShowsSelection(InspectorTab t) const {
+        switch (t) {
+            case InspectorTab::Object: return true;
+            case InspectorTab::Physics: return physicsShown();
+            case InspectorTab::Data: return dataShown();
+            case InspectorTab::Navmesh: return dataShown() && scene->world.colliders[wIndex].role == WorldCollider::Navmesh;
+            case InspectorTab::Tool: return meshEdit.active() || navDrawing || drawing();
+            default: return false;
+        }
+    }
+    std::string activeToolName() const {
+        if (navDrawing) return "Draw Navmesh";
+        if (meshEdit.active()) return "Edit Mesh";
+        if (tool == Tool::DrawFloor) return drawWhatName(drawWhat);
+        return tool == Tool::Rotate ? "Rotate" : tool == Tool::Scale ? "Scale" : "Move";
+    }
+
     void inspector(float height) {
         if (selected != lastSelected || wKind != lastWorldKind || wIndex != lastWorldIndex || splatSel != lastSplatSel) {
-            if (selected >= 0 || wKind >= 0 || splatSel >= 0) inspectorTab = InspectorTab::Selection;
+            if (!forceInspectorTab && (selected >= 0 || wKind >= 0 || splatSel >= 0) && !tabShowsSelection(inspectorTab)) inspectorTab = InspectorTab::Object;
             lastSelected = selected; lastWorldKind = wKind; lastWorldIndex = wIndex; lastSplatSel = splatSel;
         }
-        static const struct { InspectorTab tab; ToolIcon icon; const char* name; const char* tip; } kTabs[] = {
-            {InspectorTab::Selection, ToolIcon::Object, "Object", "Object: the object or world item you selected"},
-            {InspectorTab::World, ToolIcon::Walk, "World", "World: where you can walk, the walkable area and its settings"},
-            {InspectorTab::Environment, ToolIcon::Scene, "Environment", "Environment: its name, picture, sound, what it's made of, and its headset settings"},
-            {InspectorTab::Bundle, ToolIcon::Bundle, "Bundle", "Bundle: several environments packed into one file, to share or install together"},
-            {InspectorTab::Headset, ToolIcon::Headset, "Headset", "Headset: send it to the Steam Frame, or install Frame Home there"},
-        };
         forceInspectorTab = false;
-        const float side = 26 * scale, pad = 8 * scale, gap = 2 * scale, stripH = side + 8 * scale;
+        if (!tabShown(inspectorTab)) inspectorTab = InspectorTab::Object;
+        int n = 0;
+        const TabDef* tabs = tabDefs(n);
+        const float side = 26 * scale, stripW = side + 8 * scale;
         ImGui::PushStyleColor(ImGuiCol_ChildBg, hex(kBar));
-        ImGui::BeginChild("tabs", ImVec2(0, stripH), ImGuiChildFlags_None, ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+        ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 0.0f);
+        ImGui::BeginChild("tabs", ImVec2(stripW, height), ImGuiChildFlags_None, ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+        ImGui::PopStyleVar();
         ImGui::PopStyleColor();
         ImDrawList* dl = ImGui::GetWindowDrawList();
-        // As much as fits: icons and names, else names alone, else icons (the open tab keeps its name)
-        float names = 0;
-        for (const auto& t : kTabs) names += ImGui::CalcTextSize(t.name).x + pad * 2 + gap;
-        const float room = ImGui::GetContentRegionAvail().x - 8 * scale, iconsW = std::size(kTabs) * (side * 0.7f + 4 * scale);
-        const bool named = names <= room, withIcons = names + iconsW <= room;
-        const float lineH = ImGui::GetTextLineHeight();
-        ImGui::SetCursorPos(ImVec2(4 * scale, 4 * scale));
-        for (const auto& t : kTabs) {
-            ImGui::PushID(static_cast<int>(t.tab));
-            const bool on = inspectorTab == t.tab, label = named || on, icon = withIcons || !label;
-            const float iconW = icon ? side * 0.7f + (label ? 4 * scale : 0) : 0;
-            const float w = label ? pad + iconW + ImGui::CalcTextSize(t.name).x + pad : side;
+        float y = 6 * scale;
+        int group = 0;
+        for (int i = 0; i < n; ++i) {
+            const TabDef& t = tabs[i];
+            if (!tabShown(t.tab)) continue;
+            if (t.group != group) { y += 8 * scale; group = t.group; }
+            ImGui::SetCursorPos(ImVec2((stripW - side) * 0.5f, y));
+            ImGui::PushID(i);
             const ImVec2 p = ImGui::GetCursorScreenPos();
-            if (ImGui::InvisibleButton("##tab", ImVec2(w, side))) inspectorTab = t.tab;
-            const bool hot = ImGui::IsItemHovered();
-            if (on) {
-                dl->AddRectFilled(p, ImVec2(p.x + w, p.y + side), col(kPanel), 5 * scale);
-                dl->AddRectFilled(ImVec2(p.x + 5 * scale, p.y + side - 2.5f * scale), ImVec2(p.x + w - 5 * scale, p.y + side), col(kBlue), 1);   // which tab is open
-            } else if (hot) dl->AddRectFilled(p, ImVec2(p.x + w, p.y + side), col(kWidget), 5 * scale);
-            const uint32_t c = on || hot ? kText : kDim;
-            if (icon) drawToolIcon(dl, t.icon, ImVec2(label ? p.x + pad + side * 0.35f : p.x + side * 0.5f, p.y + side * 0.5f), side * 0.6f, col(c));
-            if (label) dl->AddText(ImVec2(p.x + pad + iconW, p.y + (side - lineH) * 0.5f), col(c), t.name);
+            if (ImGui::InvisibleButton("##tab", ImVec2(side, side))) inspectorTab = t.tab;
+            const bool on = inspectorTab == t.tab, hot = ImGui::IsItemHovered();
+            if (on || hot) dl->AddRectFilled(p, ImVec2(p.x + side, p.y + side), col(on ? kPanelHead : kToolHover), 4 * scale);
+            drawToolIcon(dl, t.icon, ImVec2(p.x + side * 0.5f, p.y + side * 0.5f), side * 0.6f, col(on || hot ? kText : kDim));
             if (hot) ImGui::SetTooltip("%s", t.tip);
             ImGui::PopID();
-            ImGui::SameLine(0, gap);
+            y += side + 2 * scale;
         }
+        roundAreaBottom(4);
         ImGui::EndChild();
-        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(12 * scale, 8 * scale));
+        ImGui::SameLine(0, 0);
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(10 * scale, 6 * scale));
         ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(4 * scale, 3 * scale));
-        ImGui::BeginChild("inspectorBody", ImVec2(0, std::max(1.0f, height - stripH - ImGui::GetStyle().ItemSpacing.y)), ImGuiChildFlags_AlwaysUseWindowPadding);
+        ImGui::BeginChild("inspectorBody", ImVec2(0, height), ImGuiChildFlags_AlwaysUseWindowPadding);
+        contextPath();
         beginPanels();
         switch (inspectorTab) {
-            case InspectorTab::Selection: selectionTab(); break;
-            case InspectorTab::World: worldTab(); break;
-            case InspectorTab::Environment: environmentTab(); break;
-            case InspectorTab::Bundle: bundleTab(); break;
-            case InspectorTab::Headset: headsetTab(); break;
+            case InspectorTab::Tool: toolTab(); break;
+            case InspectorTab::Scene: sceneTab(); break;
+            case InspectorTab::Navmesh: navmeshTab(); break;
+            case InspectorTab::Object: objectTab(); break;
+            case InspectorTab::Physics: physicsTab(); break;
+            case InspectorTab::Data: dataTab(); break;
+            case InspectorTab::Output: outputTab(); break;
         }
         endPanels();
         roundAreaBottom(8);
         ImGui::EndChild();
         ImGui::PopStyleVar(2);
     }
-    bool forceInspectorTab = false;         // inspectorTab was set in code (the icon column shows it as it is)
-    void showInspectorTab(InspectorTab t) { inspectorTab = t; forceInspectorTab = true; }
+    // Over the panels, what they're about, as Blender's Properties shows it: "Home › Chair".
+    void contextPath() {
+        std::string path = scene ? shownName() : std::string("No home open");
+        switch (inspectorTab) {
+            case InspectorTab::Tool: path = "Tool › " + activeToolName(); break;
+            case InspectorTab::Navmesh: path += " › Navmesh"; break;
+            case InspectorTab::Output: path += " › Output"; break;
+            case InspectorTab::Object: case InspectorTab::Physics: case InspectorTab::Data:
+                if (worldPicked()) path += " › " + worldName(wKind, wIndex);
+                else if (objectPicked()) path += " › " + objects[selected].label;
+                else if (splatPicked()) path += " › " + scene->splats[splatSel].name;
+                if (inspectorTab == InspectorTab::Data && dataShown()) path += " › Mesh";
+                break;
+            default: break;
+        }
+        const ImVec2 p = ImGui::GetCursorScreenPos();
+        const float s = ImGui::GetTextLineHeight();
+        int n = 0;
+        drawToolIcon(ImGui::GetWindowDrawList(), tabDefs(n)[static_cast<int>(inspectorTab)].icon, ImVec2(p.x + s * 0.5f, p.y + s * 0.5f), s * 0.85f, col(kDim));
+        ImGui::Dummy(ImVec2(s, s));
+        ImGui::SameLine(0, 5 * scale);
+        ImGui::TextDisabled("%s", path.c_str());
+        ImGui::Dummy(ImVec2(0, 1 * scale));
+    }
+    bool forceInspectorTab = false;         // inspectorTab was set in code (a selection the same frame doesn't change it)
+    // Shows a tab; panel: that panel unfolded and scrolled to (sub: and that sub-panel in it unfolded).
+    void showInspectorTab(InspectorTab t, const char* panel = nullptr, const char* sub = nullptr) {
+        inspectorTab = t;
+        forceInspectorTab = true;
+        if (!panel) return;
+        panelScrollTo = titleCase(panel);
+        if (sub) panelOpen[std::to_string(static_cast<int>(t)) + "/" + panelScrollTo + "/" + titleCase(sub)] = true;
+    }
+    // The Outliner's Walkable Area row picked: nothing else selected, its settings shown.
+    bool walkAreaPicked = false;
+    void pickWalkArea() {
+        selected = -1;
+        wKind = wIndex = -1;
+        splatSel = -1;
+        alsoSelected.clear();
+        walkAreaPicked = true;
+        showInspectorTab(InspectorTab::Navmesh);
+    }
 
-    // Selected: the world item or object picked in the view or the Explorer.
+    // A world item's fields (the Object and Physics tabs): a field's first real change is its undo step (a click alone
+    // leaves the history alone); a one-shot edit (a choice) keeps the layer as it was in `before`.
+    struct WorldFields { bool changed = false, letGo = false; std::shared_ptr<HomeWorld> before; };
+    void trackWorldField(WorldFields& e) {
+        if (ImGui::IsItemActivated() && !fieldBefore) fieldBefore = std::make_shared<HomeWorld>(scene->world);
+        if (ImGui::IsItemEdited()) {
+            e.changed = true;
+            if (fieldBefore && !fieldPushed) { UndoStep u = {}; u.world = fieldBefore; undo.push_back(u); redo.clear(); fieldPushed = true; }
+        }
+        if (ImGui::IsItemDeactivatedAfterEdit()) e.letGo = true;
+        if (ImGui::IsItemDeactivated()) { fieldBefore.reset(); fieldPushed = false; }
+    }
+    void finishWorldFields(WorldFields& e) {
+        if (e.before) { UndoStep u = {}; u.world = e.before; undo.push_back(u); redo.clear(); }
+        if (e.changed) { dirty = worldEdited = true; scene->world.origin = "studio"; updateTitle(); }
+        if (e.letGo && wKind == kCollider) {   // moved or resized by a field: overlapping placed surfaces become one
+            const int was = static_cast<int>(scene->world.colliders.size());
+            wIndex = combineTouching(wIndex);
+            if (static_cast<int>(scene->world.colliders.size()) != was) worldReplaced();
+        }
+    }
+
+    // Object: what's selected, its name and what it alone has (a seat's stand-up spot, a spawn's facing), and where
+    // it is and how it's turned. The viewport's sidebar (N) shows it too, with Physics and Data under it.
+    void objectTab() {
+        if (worldPicked()) worldItemPanels();
+        else if (objectPicked()) homeObjectPanels();
+        else if (splatPicked()) splatPanel();
+        else hint(scene ? "Nothing selected: click something in the 3D view or the Outliner." : "Open a home to start.");
+    }
     void selectionTab() {
-        if (scene && wKind >= 0 && wIndex >= 0 && wIndex < worldCount(wKind)) {
-            section("WORLD ITEM");
-            ImGui::TextUnformatted(worldName(wKind, wIndex).c_str());
-            ImGui::TextDisabled("%s", kWorldNames[wKind]);
-            ImGui::Spacing();
-            bool changed = false, letGo = false;   // letGo: a field edited and let go
-            std::shared_ptr<HomeWorld> before;   // a one-shot edit (a combo, a checkbox): its undo step, pushed below
-            // Fields and drags: the layer as the field was activated, kept across frames and pushed as one undo step
-            // the first time the value really changes (just clicking a field leaves the history alone).
-            auto track = [&]() {
-                if (ImGui::IsItemActivated() && !fieldBefore) fieldBefore = std::make_shared<HomeWorld>(scene->world);
-                if (ImGui::IsItemEdited()) {
-                    changed = true;
-                    if (fieldBefore && !fieldPushed) { UndoStep u = {}; u.world = fieldBefore; undo.push_back(u); redo.clear(); fieldPushed = true; }
-                }
-                if (ImGui::IsItemDeactivatedAfterEdit()) letGo = true;
-                if (ImGui::IsItemDeactivated()) { fieldBefore.reset(); fieldPushed = false; }
-            };
-            if (WorldPoint* pt = worldPoint(wKind, wIndex)) {
-                char nm[128];
-                std::snprintf(nm, sizeof nm, "%s", pt->name.c_str());
+        objectTab();
+        if (physicsShown()) physicsTab();
+        if (dataShown()) dataTab();
+    }
+    void worldItemPanels() {
+        WorldFields e;
+        bool isolate = false, remove = false;
+        WorldPoint* pt = worldPoint(wKind, wIndex);
+        if (section("OBJECT")) {
+            char nm[128];
+            if (pt || wKind == kGravity) {
+                std::string& name = pt ? pt->name : scene->world.gravity[wIndex].name;
+                std::snprintf(nm, sizeof nm, "%s", name.c_str());
                 fieldLabel("Name");
-                if (ImGui::InputText("##wname", nm, sizeof nm)) { pt->name = nm; changed = true; }
-                track();
-                ImGui::BeginDisabled(drawing());   // (moving is Arrange mode's: not while drawing)
-                fieldLabel("Position");
-                ImGui::DragFloat3("##wpos", pt->pos, 0.01f, 0, 0, "%.2f m"); track();
+                if (ImGui::InputTextWithHint("##wname", worldName(wKind, wIndex).c_str(), nm, sizeof nm)) { name = nm; e.changed = true; }
+                trackWorldField(e);
+            } else {
+                fieldLabel("Name");
+                ImGui::TextUnformatted(worldName(wKind, wIndex).c_str());
+            }
+            ImGui::BeginDisabled(drawing());   // (moving is Arrange mode's: not while drawing)
+            if (pt && wKind == kSeat) {
+                fieldLabel("Stand up at");
+                ImGui::DragFloat3("##wexit", pt->exit, 0.01f, 0, 0, "%.2f m");
+                trackWorldField(e);
+                fieldLabel("");
+                buttonRow(1);
+                if (rowButton("Find a Spot", "The nearest place round the seat you can stand: in front if there's room, else to the side")) {
+                    WorldPoint p = *pt;
+                    if (autoStandUp(p)) { pushWorldUndo(); *pt = p; e.changed = true; } else note("No spot to stand up at round this seat");
+                }
+            }
+            if (pt && wKind == kSpawn) {
+                fieldLabel("Spawn");
+                buttonRow(2);
+                if (rowButton("Best View", "Turn it to face the widest view from eye height")) {
+                    if (walkShown) { pushWorldUndo(); pt->yaw = spawnpick::bestFacing(*walkShown, pt->pos[0], pt->pos[1], pt->pos[2]); e.changed = true; }
+                    else note("The navmesh isn't ready yet");
+                }
+                if (rowButton("Good Spot", "Move it to open, level floor with room round it, facing the widest view")) {
+                    float at[3], yaw = 0;
+                    if (walkShown && spawnpick::pick(*walkShown, at, yaw)) { pushWorldUndo(); std::copy_n(at, 3, pt->pos); pt->yaw = yaw; e.changed = true; }
+                    else note("No open floor to stand on yet");
+                }
+            }
+            ImGui::EndDisabled();
+            if (bool* hid = worldHidden(wKind, wIndex)) {
+                bool vis = !*hid;
+                if (fieldCheck("Visible", &vis)) { *hid = !vis; worldEdited = dirty = true; updateTitle(); }
+            }
+            buttonRow(2);
+            isolate = rowButton(isolating ? "Show All (I)" : "Only This (I)", "Show only what's selected, or everything again");
+            remove = rowButton("Delete", nullptr, true, Look::Danger);
+        }
+        if (section("TRANSFORM")) {
+            ImGui::BeginDisabled(drawing());
+            if (pt) {
+                fieldLabel("Location");
+                ImGui::DragFloat3("##wpos", pt->pos, 0.01f, 0, 0, "%.2f m");
+                trackWorldField(e);
                 float deg = pt->yaw * 180.0f / kPi;
                 fieldLabel("Facing");
-                if (ImGui::DragFloat("##wyaw", &deg, 1.0f, -360, 360, "%.0f\u00b0")) pt->yaw = deg * kPi / 180.0f;
-                track();
-                if (wKind == kSeat) {
-                    fieldLabel("Stand up at"); ImGui::DragFloat3("##wexit", pt->exit, 0.01f, 0, 0, "%.2f m"); track();
-                    fieldLabel("");
-                    if (ImGui::Button("Find a Spot")) { WorldPoint p = *pt; if (autoStandUp(p)) { pushWorldUndo(); *pt = p; changed = true; } else note("No spot to stand up at round this seat"); }
-                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("The nearest place round the seat you can stand: in front if there's room, else to the side");
-                }
-                ImGui::EndDisabled();
+                if (ImGui::DragFloat("##wyaw", &deg, 1.0f, -360, 360, "%.0f°")) pt->yaw = deg * kPi / 180.0f;
+                trackWorldField(e);
             } else if (wKind == kCollider) {
                 WorldCollider& c = scene->world.colliders[wIndex];
-                static const char* kinds[] = {"Box", "Sphere", "Capsule", "Mesh"};
-                fieldLabel("Role");
-                const char* roles[4] = {"Surface", c.kind == WorldCollider::Mesh ? "Collider" : "Invisible wall", "Walk through", "Drawn floor"};
-                static const int roleOf[4] = {WorldCollider::Solid, WorldCollider::Object, WorldCollider::Trigger, WorldCollider::Walkable};
-                int role = c.role == WorldCollider::Trigger ? 2 : c.role == WorldCollider::Object ? 1 : c.role == WorldCollider::Walkable ? 3 : 0;
-                if (ImGui::Combo("##wrole", &role, roles, 4) && roleOf[role] != c.role) {
-                    before = std::make_shared<HomeWorld>(scene->world);
-                    c.role = roleOf[role];
-                    changed = true;
-                }
-                ImGui::PushTextWrapPos(0);
-                ImGui::TextDisabled("%s", kRoleHelp[std::clamp(c.role, 0, 5)]);
-                ImGui::PopTextWrapPos();
-                fieldLabel("Shape");
-                ImGui::Text("%s%s", kinds[std::clamp(c.kind, 0, 3)],
-                            c.kind == WorldCollider::Mesh ? (" \u00b7 " + std::to_string(c.indices.size() / 3) + " triangles").c_str() : "");
-                if (!c.mesh.empty()) {
-                    // Made from a home object: it follows the object, so the object is what moves.
+                if (!c.mesh.empty()) {   // made from a home object: it follows the object, so the object is what moves
                     int obj = -1;
                     for (size_t o = 0; o < objects.size(); ++o) if (objectKey(objects[o]) == c.mesh) obj = static_cast<int>(o);
-                    ImGui::TextDisabled("Made from %s \u2014 it moves with it.", obj >= 0 ? objects[obj].label.c_str() : "a home object");
-                    if (obj >= 0 && ImGui::Button("Select the Object")) { selected = obj; wKind = wIndex = -1; }
+                    fieldLabel("Moves with");
+                    buttonRow(1);
+                    if (rowButton(obj >= 0 ? objects[obj].label.c_str() : "A home object", "Made from it: select it to move it", obj >= 0)) { selected = obj; wKind = wIndex = -1; }
                 } else {
                     float t[3], r[3], sc[3];
                     ImGuizmo::DecomposeMatrixToComponents(c.world, t, r, sc);
                     bool moved = false;
-                    ImGui::BeginDisabled(drawing());   // (moving is Arrange mode's: not while drawing)
-                    fieldLabel("Location"); moved |= ImGui::DragFloat3("##wloc", t, 0.01f, 0, 0, "%.2f m"); track();
-                    fieldLabel("Rotation"); tidyZero(r, 0.001f); moved |= ImGui::DragFloat3("##wrot", r, 0.5f, 0, 0, "%.0f\u00b0"); track();
-                    if (c.kind == WorldCollider::Mesh) { fieldLabel("Scale"); moved |= ImGui::DragFloat3("##wscl", sc, 0.01f, 0.01f, 1000.0f, "%.2f"); track(); }
-                    ImGui::EndDisabled();
+                    fieldLabel("Location"); moved |= ImGui::DragFloat3("##wloc", t, 0.01f, 0, 0, "%.2f m"); trackWorldField(e);
+                    fieldLabel("Rotation"); tidyZero(r, 0.001f); moved |= ImGui::DragFloat3("##wrot", r, 0.5f, 0, 0, "%.0f°"); trackWorldField(e);
+                    if (c.kind == WorldCollider::Mesh) { fieldLabel("Scale"); moved |= ImGui::DragFloat3("##wscl", sc, 0.01f, 0.01f, 1000.0f, "%.2f"); trackWorldField(e); }
                     if (moved) {
                         float was[16];
                         std::memcpy(was, c.world, 64);
                         ImGuizmo::RecomposeMatrixFromComponents(t, r, sc, c.world);
                         if (!finiteMatrix(c.world)) std::memcpy(c.world, was, 64);   // (typed "1e39" or "nan")
                     }
-                    if (c.kind == WorldCollider::Box) {
-                        float size[3] = {c.half[0] * 2, c.half[1] * 2, c.half[2] * 2};
-                        fieldLabel("Size");
-                        if (ImGui::DragFloat3("##wsize", size, 0.01f, 0.02f, 200.0f, "%.2f m")) for (int k = 0; k < 3; ++k) c.half[k] = std::max(0.01f, size[k] * 0.5f);
-                        track();
-                    }
-                    if (c.kind == WorldCollider::Sphere || c.kind == WorldCollider::Capsule) { fieldLabel("Radius"); ImGui::DragFloat("##wrad", &c.radius, 0.01f, 0.01f, 50.0f, "%.2f m"); track(); }
-                    if (c.kind == WorldCollider::Capsule) { fieldLabel("Length"); ImGui::DragFloat("##wlen", &c.length, 0.01f, 0.0f, 50.0f, "%.2f m"); track(); }
                 }
-            }
-            if (wKind == kGravity) {
+            } else if (wKind == kGravity) {
                 WorldGravity& g = scene->world.gravity[wIndex];
-                char nm[128];
-                std::snprintf(nm, sizeof nm, "%s", g.name.c_str());
-                fieldLabel("Name");
-                if (ImGui::InputText("##gname", nm, sizeof nm)) { g.name = nm; changed = true; }
-                track();
-                fieldLabel("Kind");
-                int kind = std::clamp(g.kind, 0, 2);
-                if (ImGui::BeginCombo("##gkind", kGravityNames[kind])) {
-                    for (int k = 0; k < 3; ++k) {
-                        if (k == WorldGravity::Planet && kind != k) continue;   // planet zones are no longer made (older files keep theirs)
-                        if (ImGui::Selectable(kGravityNames[k], k == kind) && k != g.kind) { before = std::make_shared<HomeWorld>(scene->world); g.kind = k; changed = true; }
-                    }
-                    ImGui::EndCombo();
-                }
-                ImGui::PushTextWrapPos(0);
-                ImGui::TextDisabled("%s", kGravityHelp[std::clamp(g.kind, 0, 2)]);
-                ImGui::PopTextWrapPos();
                 float t[3], r[3], sc[3];
                 ImGuizmo::DecomposeMatrixToComponents(g.world, t, r, sc);
                 bool moved = false;
-                ImGui::BeginDisabled(drawing());   // (moving is Arrange mode's: not while drawing)
-                fieldLabel(g.kind == WorldGravity::Planet ? "Centre" : "Location"); moved |= ImGui::DragFloat3("##gloc", t, 0.01f, 0, 0, "%.2f m"); track();
-                if (g.kind != WorldGravity::Planet) { fieldLabel("Rotation"); tidyZero(r, 0.001f); moved |= ImGui::DragFloat3("##grot", r, 0.5f, 0, 0, "%.0f\u00b0"); track(); }
-                ImGui::EndDisabled();
-
+                fieldLabel(g.kind == WorldGravity::Planet ? "Centre" : "Location"); moved |= ImGui::DragFloat3("##gloc", t, 0.01f, 0, 0, "%.2f m"); trackWorldField(e);
+                if (g.kind != WorldGravity::Planet) { fieldLabel("Rotation"); tidyZero(r, 0.001f); moved |= ImGui::DragFloat3("##grot", r, 0.5f, 0, 0, "%.0f°"); trackWorldField(e); }
                 if (moved) {
                     float was[16];
                     std::memcpy(was, g.world, 64);
@@ -6875,46 +8410,32 @@ struct Studio {
                     ImGuizmo::RecomposeMatrixFromComponents(t, r, sc, g.world);
                     if (!finiteMatrix(g.world)) std::memcpy(g.world, was, 64);   // (typed "1e39" or "nan")
                 }
-                if (g.kind == WorldGravity::Planet) { fieldLabel("Pull radius"); ImGui::DragFloat("##grad", &g.radius, 0.1f, 0.5f, 5000.0f, "%.1f m"); track(); }
-                else {
-                    float size[3] = {g.half[0] * 2, g.half[1] * 2, g.half[2] * 2};
-                    fieldLabel("Size");
-                    if (ImGui::DragFloat3("##gsize", size, 0.05f, 0.2f, 5000.0f, "%.1f m")) for (int k = 0; k < 3; ++k) g.half[k] = std::max(0.1f, size[k] * 0.5f);
-                    track();
-                }
-                fieldLabel("Priority"); ImGui::DragInt("##gpri", &g.priority, 0.1f, -100, 100); track();
-                if (ImGui::IsItemHovered()) ImGui::SetTooltip("Where zones overlap, the higher priority one decides down.");
             }
-            if (bool* hid = worldHidden(wKind, wIndex)) {
-                bool vis = !*hid;
-                if (ImGui::Checkbox("Visible", &vis)) { *hid = !vis; worldEdited = dirty = true; updateTitle(); }
-                ImGui::SameLine();
-            }
-            if (ImGui::Button(isolating ? "Show All (I)" : "Show Only This (I)")) toggleIsolate();
-            if (before) {   // one undo step per drag / field
-                UndoStep u = {};
-                u.world = before;
-                undo.push_back(u);
-                redo.clear();
-            }
-            if (changed) { dirty = worldEdited = true; scene->world.origin = "studio"; updateTitle(); }
-            if (letGo && wKind == kCollider) {   // moved or resized by a field: overlapping placed surfaces become one
-                const int was = static_cast<int>(scene->world.colliders.size());
-                wIndex = combineTouching(wIndex);
-                if (static_cast<int>(scene->world.colliders.size()) != was) worldReplaced();
-            }
-            ImGui::Spacing();
-            pushDanger();
-            if (ImGui::Button("Delete")) deleteWorld();
-            ImGui::PopStyleColor(3);
+            ImGui::EndDisabled();
+            if (drawing()) hint("Moving is in Arrange mode: you're drawing (B).");
         }
-
-        section("OBJECT");
-        if (selected >= 0) {
-            Object& o = objects[selected];
+        finishWorldFields(e);
+        if (isolate) toggleIsolate();
+        if (remove) deleteWorld();
+    }
+    void homeObjectPanels() {
+        Object& o = objects[selected];
+        bool reset = false, duplicate = false, isolate = false, remove = false;
+        if (section("OBJECT")) {
+            fieldLabel("Name");
             ImGui::TextUnformatted(o.name.c_str());
-            ImGui::TextDisabled("%s \u00b7 %zu triangles", o.surface.c_str(), o.triangles);
-            ImGui::Spacing();
+            fieldLabel("Mesh");
+            ImGui::Text("%s triangles", withCommas(o.triangles).c_str());
+            tip(o.surface.c_str());
+            bool visible = !o.hidden;
+            if (fieldCheck("Visible", &visible)) toggleHidden(selected);
+            buttonRow(4);
+            reset = rowButton("Reset", "Back where, how turned and how big the home has it", !drawing());
+            duplicate = rowButton("Duplicate", "A copy in the same spot, selected (Ctrl+D; Ctrl+Shift+D: beside it)", !drawing() && canPaste());
+            isolate = rowButton(isolating ? "Show All" : "Only This", "Show only what's selected (I), or everything again");
+            remove = rowButton("Delete", nullptr, true, Look::Danger);
+        }
+        if (section("TRANSFORM")) {
             float t[3], r[3], s[3];
             ImGuizmo::DecomposeMatrixToComponents(o.pivot, t, r, s);
             bool changed = false;
@@ -6932,11 +8453,27 @@ struct Studio {
             pivotField(ImGui::DragFloat3("##loc", t, 0.01f, 0, 0, "%.3f m"));
             fieldLabel("Rotation");
             tidyZero(r, 0.001f);
-            pivotField(ImGui::DragFloat3("##rot", r, 0.5f, 0, 0, "%.1f\u00b0"));
+            pivotField(ImGui::DragFloat3("##rot", r, 0.5f, 0, 0, "%.1f°"));
             fieldLabel("Scale");
             pivotField(ImGui::DragFloat3("##scl", s, 0.01f, 0.001f, 1000.0f, "%.3f"));
+            {   // all of it at once, keeping its shape: its size as a part of what it was loaded at
+                float t0[3], r0[3], s0[3];
+                ImGuizmo::DecomposeMatrixToComponents(o.pivot0, t0, r0, s0);
+                const float was = std::cbrt(std::fabs(s0[0] * s0[1] * s0[2])), now = std::cbrt(std::fabs(s[0] * s[1] * s[2]));
+                float pct = was > 1e-6f ? now / was * 100 : 100;
+                float mn[3], mx[3];
+                worldBounds(o, mn, mx);
+                char dims[1100];                // (room for any size gcc can think of)
+                std::snprintf(dims, sizeof dims, "Bigger or smaller all over, keeping its shape (100%% = as the home has it)\nNow %.2f × %.2f × %.2f m",
+                              mx[0] - mn[0], mx[1] - mn[1], mx[2] - mn[2]);
+                fieldLabel("Size");
+                const float before = pct;
+                pivotField(ImGui::DragFloat("##size", &pct, 0.5f, 1.0f, 100000.0f, "%.0f%%"));
+                tip(dims);
+                if (pct != before && before > 1e-4f && pct > 0) for (float& v : s) v *= pct / before;
+            }
             ImGui::EndDisabled();
-            if (drawing()) ImGui::TextDisabled("Moving is in Arrange mode (G, R, S): you're drawing (B).");
+            if (drawing()) hint("Moving is in Arrange mode: you're drawing (B).");
             if (changed) {
                 float was[16];
                 std::memcpy(was, o.pivot, 64);
@@ -6944,308 +8481,411 @@ struct Studio {
                 if (finiteMatrix(o.pivot)) apply(o); else std::memcpy(o.pivot, was, 64);   // (typed "1e39" or "nan")
             }
             if (done) transformDone(static_cast<size_t>(selected));
-            // What this object is for the player: walk on it, bump into it, both, or neither. The buttons set it;
-            // the viewport tints what each part gives (floor green, wall orange) while it's selected.
-            if (canBeSurface(o)) {
-                const int mode = surfaceMode(o);
-                ImGui::Spacing();
-                ImGui::AlignTextToFramePadding();
-                ImGui::TextDisabled("Surface");
-                const float sp = 4 * scale, avail = ImGui::GetContentRegionAvail().x;
-                float tw[kSurfModes], sum = 0;
-                for (int m = 0; m < kSurfModes; ++m) sum += tw[m] = ImGui::CalcTextSize(kSurfNames[m]).x;
-                const float pad = std::max(4 * scale, (avail - sum - (kSurfModes - 1) * sp) / kSurfModes);
-                for (int m = 0; m < kSurfModes; ++m) {
-                    if (m) ImGui::SameLine(0, sp);
-                    const bool on = mode == m;
-                    const uint32_t tint = m == kSurfSolid ? 0x7a6a2a : m == kSurfObject ? 0x5e3f8a : m == kSurfTrigger ? 0x3a5a7a : 0x4a4a4a;
-                    ImGui::PushStyleColor(ImGuiCol_Button, on ? hex(tint) : hex(kWidget, 0.55f));
-                    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, on ? hex(tint) : hex(kWidget));
-                    ImGui::PushStyleColor(ImGuiCol_Text, on ? hex(0xffffff) : hex(0xc8c8c8));
-                    const std::string id = std::string(kSurfNames[m]) + "##surf" + std::to_string(m);
-                    if (ImGui::Button(id.c_str(), ImVec2(tw[m] + pad, 0)) && (!on || (m != kSurfNone && autoMade(o)))) setSurfaces({static_cast<size_t>(selected)}, m);
-                    ImGui::PopStyleColor(3);
-                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", kSurfHelp[m]);
-                    if (testing) surfButtonAt[m] = ImVec2((ImGui::GetItemRectMin().x + ImGui::GetItemRectMax().x) * 0.5f, (ImGui::GetItemRectMin().y + ImGui::GetItemRectMax().y) * 0.5f);
-                }
-                if (testing && surfScroll) { ImGui::SetScrollHereY(0.5f); surfScroll = false; }
-                ImGui::PushTextWrapPos(0);
-                if (mode == kSurfNone)
-                    ImGui::TextDisabled("%s", kSurfHelp[kSurfNone]);
-                else {
-                    ImGui::TextDisabled("%s", kSurfHelp[mode]);
-                    double fa = 0, wa = 0;
-                    surfaceAreas(static_cast<size_t>(selected), fa, wa);
-                    auto swatch = [&](uint32_t c) {
-                        const ImVec2 p = ImGui::GetCursorScreenPos();
-                        const float sz = ImGui::GetTextLineHeight();
-                        ImGui::GetWindowDrawList()->AddRectFilled(ImVec2(p.x, p.y + sz * 0.2f), ImVec2(p.x + sz * 0.6f, p.y + sz * 0.8f), col(c), 2 * scale);
-                        ImGui::Dummy(ImVec2(sz * 0.6f, sz));
-                        ImGui::SameLine(0, 4 * scale);
-                    };
-                    if (mode == kSurfSolid) {
-                        swatch(kFloorTint); ImGui::Text("flat enough %.1f m\u00b2", fa);
-                        ImGui::SameLine(0, 12 * scale);
-                        swatch(kWallTint); ImGui::Text("too steep %.1f m\u00b2", wa);
-                    }
-                    if (autoMade(o)) ImGui::TextDisabled("Made by Auto-generate Walkable Surfaces (a re-run replaces it; click its button to make it yours).");
-                }
-                ImGui::PopTextWrapPos();
-                // a floor drawn on it by hand: always walkable, even on furniture
-                ImGui::Spacing();
-                ImGui::AlignTextToFramePadding();
-                ImGui::TextDisabled("Floor");
-                ImGui::SameLine();
-                const int df = drawnFloorIndex(o);
-                const bool drawingFloor = tool == Tool::DrawFloor && drawWhat == DrawWhat::Floor;
-                if (ImGui::Button(drawingFloor ? "Drawing Floor (B)###drawFloorBtn" : "Draw Floor (B)###drawFloorBtn")) { tool = Tool::DrawFloor; drawWhat = DrawWhat::Floor; }
-                if (ImGui::IsItemHovered()) ImGui::SetTooltip("Paint walkable floor onto any surface in the view; Shift+drag erases floor.");
-                ImGui::SameLine();
-                if (ImGui::Button("Fill Flat Faces")) fillDrawnFloor(static_cast<size_t>(selected), true);
-                if (ImGui::IsItemHovered()) ImGui::SetTooltip("Every face of it flat enough to stand on becomes walkable floor.");
-                if (df >= 0) {
-                    ImGui::SameLine();
-                    if (ImGui::Button("Clear")) fillDrawnFloor(static_cast<size_t>(selected), false);
-                    double a = 0;
-                    const WorldCollider& c = scene->world.colliders[df];
-                    const std::vector<float> wp = worldMeshPositions(c);
-                    for (size_t t = 0; t + 2 < c.indices.size(); t += 3) {
-                        const float* p0 = &wp[c.indices[t] * 3]; const float* p1 = &wp[c.indices[t + 1] * 3]; const float* p2 = &wp[c.indices[t + 2] * 3];
-                        a += 0.5 * std::fabs((p1[0] - p0[0]) * (p2[2] - p0[2]) - (p2[0] - p0[0]) * (p1[2] - p0[2]));
-                    }
-                    ImGui::TextDisabled("%.1f m\u00b2 of floor drawn on it", a);
-                }
-            }
-            if (o.scene >= 0 && static_cast<size_t>(o.scene) < scene->meshes.size() && !scene->meshes[o.scene].video.empty()) videoPanel(o);
-            ImGui::Spacing();
-            bool visible = !o.hidden;
-            if (ImGui::Checkbox("Visible", &visible)) toggleHidden(selected);
-            ImGui::SameLine();
-            ImGui::BeginDisabled(drawing());
-            if (ImGui::Button("Reset")) { pushUndo(selected); std::memcpy(o.pivot, o.pivot0, 64); apply(o); transformDone(static_cast<size_t>(selected)); }
-            ImGui::EndDisabled();
-            ImGui::SameLine();
-            if (ImGui::Button(isolating ? "Show All" : "Only This")) toggleIsolate();
-            ImGui::SameLine();
-            pushDanger();
-            if (ImGui::Button("Delete")) deleteSelected();
-            ImGui::PopStyleColor(3);
-        } else if (splatSel >= 0 && static_cast<size_t>(splatSel) < splatItems.size()) {
-            splatPanel();
-        } else {
-            ImGui::TextDisabled(scene ? "Nothing selected.\nClick an object in the 3D view or the Explorer." : "Open a home to start.");
         }
-
+        if (o.scene >= 0 && static_cast<size_t>(o.scene) < scene->meshes.size() && !scene->meshes[o.scene].video.empty()) videoPanel(o);
+        if (reset) { pushUndo(selected); std::memcpy(o.pivot, o.pivot0, 64); apply(o); transformDone(static_cast<size_t>(selected)); }
+        if (duplicate) duplicateSelection();
+        if (isolate) toggleIsolate();
+        if (remove) deleteSelected();
     }
 
-    // World: the walkable area, as Frame Home walks it.
-    void worldTab() {
-        section("WALKABLE AREA");
-        walkPanel();
-        section("WHAT NOBODY CAN SEE");
-        trimPanel();
-
+    // Physics: what the selection is for the player. An object: walked on, bumped into or walked through (the
+    // viewport tints what each part gives while it's selected: floor green, wall orange), and floor drawn on it. A
+    // surface: its role and its size. A gravity zone: which way is down in it.
+    void physicsTab() {
+        if (worldPicked() && wKind == kCollider) colliderPhysics();
+        else if (worldPicked() && wKind == kGravity) gravityPhysics();
+        else if (objectPicked() && canHaveCollision(objects[selected])) objectPhysics();
+        else hint("Select an object, a surface or a gravity zone.");
     }
-
-    // Environment: its name and picture, what it's made of, saving, and its own headset settings.
-    void environmentTab() {
-        section("ENVIRONMENT");
-        if (scene) {
-            fieldLabel("Name");
-            {
-                char nb[128];
-                std::snprintf(nb, sizeof nb, "%s", envTitle.c_str());
-                if (ImGui::InputTextWithHint("##envname", homeName.c_str(), nb, sizeof nb)) { envTitle = nb; dirty = true; updateTitle(); }
-                if (ImGui::IsItemHovered()) ImGui::SetTooltip("What it's called on the headset (Environments panel) and in a saved .fenv");
-            }
-            fieldLabel("Picture");
-            if (ImGui::Button(envImage.empty() ? "Choose\u2026##envimg" : "Change\u2026##envimg")) chooseImage();
-            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Its picture on the headset (Environments panel); without one, a view of it is taken when it's saved");
-            if (!envImage.empty()) {
-                ImGui::SameLine();
-                if (ImGui::Button("Remove##envimg")) { envImage.clear(); dirty = true; updateTitle(); }
-                ImGui::SameLine();
-                ImGui::TextDisabled("%s", envImage.substr(envImage.rfind(".image-") == std::string::npos ? 0 : envImage.rfind(".image-") + 1).c_str());
-            } else {
-                ImGui::SameLine();
-                ImGui::TextDisabled("a view of it");
-            }
-            fieldLabel("Sky");
-            {
-                const std::string sky = skyPanorama();
-                const bool locked = loadState == 1 || saving || (homePaths.size() == 1 && isFenvPath(homePaths[0]));
-                ImGui::BeginDisabled(locked);
-                if (ImGui::Button(sky.empty() ? "Choose Panorama…##envsky" : "Change…##envsky")) chooseSkyPanorama();
-                if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-                    ImGui::SetTooltip(locked && !saving && loadState != 1 ? "A saved .fenv keeps its sky: open its original home to change it"
-                                                                         : "A 360° panorama (.hdr, .jpg or .png, twice as wide as it is tall) in place of the home's own sky");
-                if (!sky.empty()) {
-                    ImGui::SameLine();
-                    if (ImGui::Button("Remove##envsky")) setSkyPanorama("");
-                }
-                ImGui::EndDisabled();
-                ImGui::SameLine();
-                if (sky.empty()) ImGui::TextDisabled(homePaths.size() == 1 && isFenvPath(homePaths[0]) ? "as saved in it" : "the home's own");
-                else ImGui::TextDisabled("%s", skyPanoramaName(sky).c_str());
-            }
-            fieldLabel("Made with");
-            ImGui::TextDisabled("%s", envMadeWith.empty() ? "not saved yet (Frame Studio " FRAME_VERSION ")" : envMadeWith.c_str());
-            ImGui::Spacing();
-            ImGui::TextWrapped("%s", homeName.c_str());
-            for (size_t i = 0; i < scene->sources.size(); ++i) {
-                const HslSourceInfo& src = scene->sources[i];
-                ImGui::PushStyleColor(ImGuiCol_Text, hex(kOrange));
-                ImGui::TextUnformatted(sourceLine(i).c_str());
-                ImGui::PopStyleColor();
-                if (!src.package.empty()) ImGui::TextDisabled("%s", src.package.c_str());
-                if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", scene->apkPaths[i].c_str());
-            }
-            if (scene->sources.size() == 1 && scene->sources[0].role == "Footprint")
-                ImGui::TextDisabled("Room only: its lighting, sky and outside world ship in a vista.");
-            ImGui::Spacing();
-            size_t live = 0, hidden = 0, deleted = 0, lightmapped = 0;
-            for (const Object& o : objects) { if (o.deleted) ++deleted; else if (o.hidden) ++hidden; else ++live; }
-            for (const MeshData& md : scene->meshes) lightmapped += md.hasLightmap;
-            const bool clay = scene->animate != nullptr;
-            fieldLabel("Objects");
-            ImGui::Text("%zu shown, %zu hidden, %zu deleted", live, hidden, deleted);
-            if (!splatItems.empty()) { fieldLabel("Splats"); ImGui::Text("%s in %zu objects", withCommas(splatTotal()).c_str(), splatItems.size()); }
-            fieldLabel("Shaders");
-            ImGui::Text(clay ? "built-in unlit (Clay)" : "%zu of the home's own", scene->programs.size());
-            fieldLabel("Lighting");
-            ImGui::Text("%s", lightmapped ? (std::to_string(lightmapped) + " baked lightmaps").c_str()
-                                          : clay ? "baked into textures" : scene->hasEnvAmbient ? "light probes" : "estimated ambient");
-            fieldLabel("Animation");
-            if (clay) ImGui::Text("%zu animated objects, %.0f s loop", scene->animatedMeshes.size(), scene->animDuration);
-            else ImGui::Text("%zu rigs + shader motion", scene->anims.size());
-            ImGui::Spacing();
-            ImGui::BeginDisabled(!dirty);
-            if (ImGui::Button(envFile.empty() ? "Save to My Environments" : "Save")) saveToLibrary();
-            ImGui::EndDisabled();
-            ImGui::SameLine();
-            ImGui::TextDisabled(dirty ? "unsaved changes" : "saved");
-        } else {
-            if (ImGui::Button("Open Home\u2026")) openDialog();
-            ImGui::TextDisabled("Or drop an .apk on the window.");
+    void objectPhysics() {
+        Object& o = objects[selected];
+        if (!section("COLLISION")) return;
+        const int mode = surfaceMode(o);
+        ImVec2 at[kSurfModes];
+        const int pick = segmented("##surf", kSurfNames, kSurfModes, mode, kSurfHelp, at);
+        if (testing) for (int m = 0; m < kSurfModes; ++m) surfButtonAt[m] = at[m];
+        if (testing && surfScroll) { ImGui::SetScrollHereY(0.5f); surfScroll = false; }
+        if (pick >= 0 && (pick != mode || (pick != kSurfNone && autoMade(o)))) setSurfaces({static_cast<size_t>(selected)}, pick);
+        if (mode == kSurfSolid) {
+            double fa = 0, wa = 0;
+            surfaceAreas(static_cast<size_t>(selected), fa, wa);
+            auto swatch = [&](uint32_t c) {
+                const ImVec2 p = ImGui::GetCursorScreenPos();
+                const float sz = ImGui::GetTextLineHeight(), y = p.y + (ImGui::GetFrameHeight() - sz) * 0.5f;
+                ImGui::GetWindowDrawList()->AddRectFilled(ImVec2(p.x, y + sz * 0.2f), ImVec2(p.x + sz * 0.6f, y + sz * 0.8f), col(c), 2 * scale);
+                ImGui::Dummy(ImVec2(sz * 0.6f, ImGui::GetFrameHeight()));
+                ImGui::SameLine(0, 4 * scale);
+            };
+            fieldLabel("Area");
+            swatch(kFloorTint); ImGui::Text("%.1f m² floor", fa);
+            tip("Flat enough to walk on");
+            ImGui::SameLine(0, 10 * scale);
+            swatch(kWallTint); ImGui::Text("%.1f m² wall", wa);
+            tip("Too steep to walk up: it stops you");
         }
-
-        soundSection();
-        if (scene) {
-            section("WORLD SETTINGS");
-            {
-                std::lock_guard<std::mutex> l(statusMutex);
-                if (tunedReady) { tunedReady = false; if (tuneGen == loadGen && tunedResult != worldSettings) { worldSettings = tunedResult; dirty = true; updateTitle(); } }
+        if (mode != kSurfNone && autoMade(o)) {
+            fieldLabel("Made by");
+            ImGui::TextUnformatted("Auto-generate");
+            tip("A re-run replaces it; click its choice again to make it yours.");
+        }
+        // a floor drawn on it by hand: always walkable, even on furniture
+        const int df = drawnFloorIndex(o);
+        const bool drawingFloor = tool == Tool::DrawFloor && drawWhat == DrawWhat::Floor;
+        fieldLabel("Floor");
+        buttonRow(df >= 0 ? 3 : 2);
+        if (rowButton("Draw (B)###drawFloorBtn", "Paint walkable floor onto any surface in the view; Shift+drag erases floor", true, drawingFloor ? Look::On : Look::Plain)) {
+            tool = Tool::DrawFloor;
+            drawWhat = DrawWhat::Floor;
+        }
+        if (rowButton("Fill Flat", "Every face of it flat enough to stand on becomes walkable floor")) fillDrawnFloor(static_cast<size_t>(selected), true);
+        if (df >= 0 && rowButton("Clear", "Take the floor drawn on it away")) fillDrawnFloor(static_cast<size_t>(selected), false);
+        if (df >= 0 && drawnFloorIndex(o) == df) {
+            double a = 0;
+            const WorldCollider& c = scene->world.colliders[df];
+            const std::vector<float> wp = worldMeshPositions(c);
+            for (size_t t = 0; t + 2 < c.indices.size(); t += 3) {
+                const float* p0 = &wp[c.indices[t] * 3]; const float* p1 = &wp[c.indices[t + 1] * 3]; const float* p2 = &wp[c.indices[t + 2] * 3];
+                a += 0.5 * std::fabs((p1[0] - p0[0]) * (p2[2] - p0[2]) - (p2[0] - p0[0]) * (p1[2] - p0[2]));
             }
-            const WorldSettings was = worldSettings;
-            ImGui::PushTextWrapPos(0);
-            ImGui::TextDisabled("On the headset it uses %s", worldSettings.describe().c_str());
-            ImGui::PopTextWrapPos();
-            fieldLabel("Resolution");
-            {
-                static const float kRes[] = {0, 0.8f, 0.9f, 1.0f, 1.1f, 1.2f, 1.3f, 1.4f, 1.5f};
-                char cur[32];
-                if (worldSettings.resolution > 0) std::snprintf(cur, sizeof cur, "%.0f%%", worldSettings.resolution * 100);
-                if (ImGui::BeginCombo("##wsres", worldSettings.resolution > 0 ? cur : "The headset's")) {
-                    for (float v : kRes) {
-                        char t[32];
-                        if (v > 0) std::snprintf(t, sizeof t, "%.0f%%", v * 100);
-                        if (ImGui::Selectable(v > 0 ? t : "The headset's", std::abs(worldSettings.resolution - v) < 1e-3f)) worldSettings.resolution = v;
-                    }
-                    ImGui::EndCombo();
+            fieldLabel("");
+            ImGui::TextDisabled("%.1f m² drawn on it", a);
+        }
+    }
+    void colliderPhysics() {
+        WorldCollider& c = scene->world.colliders[wIndex];
+        WorldFields e;
+        if (section("COLLIDER")) {
+            fieldLabel("Role");
+            const char* roles[5] = {"Surface", c.kind == WorldCollider::Mesh ? "Collider" : "Invisible wall", "Walk through", "Drawn floor", "Navmesh"};
+            static const int roleOf[5] = {WorldCollider::Solid, WorldCollider::Object, WorldCollider::Trigger, WorldCollider::Walkable, WorldCollider::Navmesh};
+            int role = c.role == WorldCollider::Trigger ? 2 : c.role == WorldCollider::Object ? 1 : c.role == WorldCollider::Walkable ? 3 : c.role == WorldCollider::Navmesh ? 4 : 0;
+            if (ImGui::Combo("##wrole", &role, roles, c.kind == WorldCollider::Mesh ? 5 : 4) && roleOf[role] != c.role) {
+                e.before = std::make_shared<HomeWorld>(scene->world);
+                c.role = roleOf[role];
+                e.changed = true;
+            }
+            tip(kRoleHelp[std::clamp(c.role, 0, 6)]);
+            if (c.mesh.empty()) {
+                if (c.kind == WorldCollider::Box) {
+                    float size[3] = {c.half[0] * 2, c.half[1] * 2, c.half[2] * 2};
+                    fieldLabel("Size");
+                    if (ImGui::DragFloat3("##wsize", size, 0.01f, 0.02f, 200.0f, "%.2f m")) for (int k = 0; k < 3; ++k) c.half[k] = std::max(0.01f, size[k] * 0.5f);
+                    trackWorldField(e);
                 }
-            }
-            fieldLabel("Foveation");
-            {
-                bool own = worldSettings.foveation > 0;
-                if (ImGui::Checkbox("##wsfovown", &own)) worldSettings.foveation = own ? 1.0f : 0.0f;
-                if (ImGui::IsItemHovered()) ImGui::SetTooltip("Its own foveation strength (off: the headset's level)");
-                ImGui::SameLine();
-                ImGui::SetNextItemWidth(-1);
-                ImGui::BeginDisabled(!own);
-                float fv = own ? worldSettings.foveation : 1.0f;
-                if (ImGui::SliderFloat("##wsfov", &fv, 1.0f, 3.0f, own ? "%.2f" : "the headset's")) worldSettings.foveation = std::round(fv * 4) / 4;
-                ImGui::EndDisabled();
-                if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-                    ImGui::SetTooltip("1 gentle .. 3 strong: where you look stays sharp, the edges of view get coarser (cheaper)");
-            }
-            fieldLabel("MSAA");
-            {
-                static const int kMsaa[] = {0, 1, 2, 4};
-                static const char* kMsaaNames[] = {"The headset's", "Off", "2x", "4x"};
-                int at = 0;
-                for (int i = 0; i < 4; ++i) if (kMsaa[i] == worldSettings.msaa) at = i;
-                if (ImGui::Combo("##wsmsaa", &at, kMsaaNames, 4)) worldSettings.msaa = kMsaa[at];
-                if (ImGui::IsItemHovered()) ImGui::SetTooltip("Different from the headset's: Frame Home restarts itself to show this world");
-            }
-            fieldLabel("Frame rate");
-            {
-                static const char* kRates[] = {"The headset's", "Full", "Half"};
-                int at = worldSettings.frameRate + 1;
-                if (ImGui::Combo("##wsrate", &at, kRates, 3)) worldSettings.frameRate = at - 1;
-                if (ImGui::IsItemHovered()) ImGui::SetTooltip("Half: drawn every other display frame, turned with your head in between (twice the GPU time a frame)");
-            }
-            if (worldSettings != was) { worldSettings.tuned.clear(); worldSettings.clamp(); dirty = true; updateTitle(); }
-            ImGui::BeginDisabled(tuning || saving || sending);
-            if (ImGui::Button(tuning ? "Calculating\u2026" : "Calculate Best Settings")) calculateBestSettings();
-            ImGui::EndDisabled();
-            if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-                ImGui::SetTooltip("On the headset: walks through the world at 120 Hz at a few settings and keeps the sharpest one that holds\n"
-                                  "its frame rate (at most 1%% of frames late). Your MSAA stays; foveation moves first, then resolution.\n"
-                                  "Takes a few minutes; the headset cools between tries.");
-            ImGui::SameLine();
-            ImGui::BeginDisabled(worldSettings.empty() && worldSettings.tuned.empty());
-            if (ImGui::Button("Use Headset Settings")) { worldSettings = WorldSettings(); setTuneStatus(""); dirty = true; updateTitle(); }
-            ImGui::EndDisabled();
-            {
-                std::lock_guard<std::mutex> l(statusMutex);
-                const std::string t = !tuneStatus.empty() && tuneGen == loadGen ? tuneStatus : worldSettings.tuned;   // (another home's measuring isn't this one's)
-                if (!t.empty()) {
-                    ImGui::PushTextWrapPos(0);
-                    ImGui::TextDisabled("%s", t.c_str());
-                    ImGui::PopTextWrapPos();
-                }
+                if (c.kind == WorldCollider::Sphere || c.kind == WorldCollider::Capsule) { fieldLabel("Radius"); ImGui::DragFloat("##wrad", &c.radius, 0.01f, 0.01f, 50.0f, "%.2f m"); trackWorldField(e); }
+                if (c.kind == WorldCollider::Capsule) { fieldLabel("Length"); ImGui::DragFloat("##wlen", &c.length, 0.01f, 0.0f, 50.0f, "%.2f m"); trackWorldField(e); }
             }
         }
-
+        finishWorldFields(e);
+    }
+    void gravityPhysics() {
+        WorldGravity& g = scene->world.gravity[wIndex];
+        WorldFields e;
+        if (section("GRAVITY")) {
+            fieldLabel("Kind");
+            const int kind = std::clamp(g.kind, 0, 2);
+            if (ImGui::BeginCombo("##gkind", kGravityNames[kind])) {
+                for (int k = 0; k < 3; ++k) {
+                    if (k == WorldGravity::Planet && kind != k) continue;   // planet zones are no longer made (older files keep theirs)
+                    if (ImGui::Selectable(kGravityNames[k], k == kind) && k != g.kind) { e.before = std::make_shared<HomeWorld>(scene->world); g.kind = k; e.changed = true; }
+                    tip(kGravityHelp[k]);
+                }
+                ImGui::EndCombo();
+            }
+            tip(kGravityHelp[kind]);
+            if (g.kind == WorldGravity::Planet) { fieldLabel("Pull radius"); ImGui::DragFloat("##grad", &g.radius, 0.1f, 0.5f, 5000.0f, "%.1f m"); trackWorldField(e); }
+            else {
+                float size[3] = {g.half[0] * 2, g.half[1] * 2, g.half[2] * 2};
+                fieldLabel("Size");
+                if (ImGui::DragFloat3("##gsize", size, 0.05f, 0.2f, 5000.0f, "%.1f m")) for (int k = 0; k < 3; ++k) g.half[k] = std::max(0.1f, size[k] * 0.5f);
+                trackWorldField(e);
+            }
+            fieldLabel("Priority");
+            ImGui::DragInt("##gpri", &g.priority, 0.1f, -100, 100);
+            trackWorldField(e);
+            tip("Where zones overlap, the higher priority one decides down");
+        }
+        finishWorldFields(e);
     }
 
-    // The Environment tab's sound: the home's own ambience and a background sound added to it.
-    void soundSection() {
-        if (!scene) return;
-        section("SOUND");
-        fieldLabel("Sound");
-        ImGui::Text("%s", scene->ambientSource.empty() ? "none of its own" : scene->ambientSource == "FMOD bank" ? "FMOD bank (ambience bed)" : "Ogg loop");
-        soundPanel();
-        {   // the sounds it uses, to keep: the home's own ambience (an Ogg file) and the one added to it
-            const bool own = scene && !scene->ambientOgg.empty();
+    // Data: a surface's mesh: what shape it is, its triangles, and editing its corners (Tab; the tools are in Tool).
+    void dataTab() {
+        if (!dataShown()) { hint("Select a surface or a piece of navmesh for its mesh."); return; }
+        WorldCollider& c = scene->world.colliders[wIndex];
+        if (!section("MESH")) return;
+        static const char* kinds[] = {"Box", "Sphere", "Capsule", "Mesh"};
+        fieldLabel("Shape");
+        ImGui::TextUnformatted(kinds[std::clamp(c.kind, 0, 3)]);
+        if (c.kind != WorldCollider::Mesh) {
+            fieldLabel("");
+            buttonRow(1);
+            if (rowButton("Convert to Mesh", "Make it a mesh, so its corners can be edited (Tab)")) convertToMesh(c);
+            return;
+        }
+        fieldLabel("Triangles");
+        ImGui::TextUnformatted(withCommas(c.indices.size() / 3).c_str());
+        const bool editing = meshEdit.active() && meshEdit.collider() == wIndex;
+        if (editing) { fieldLabel("Selected"); ImGui::Text("%zu of %zu corners", meshEdit.selectedCount(), meshEdit.cornerCount()); }
+        fieldLabel("");
+        buttonRow(1);
+        if (rowButton(editing ? "Done Editing (Tab)" : "Edit Mesh (Tab)", editing ? "Its tools are in the Tool tab" : "Edit its corners", true, editing ? Look::On : Look::Plain))
+            toggleMeshEdit();
+    }
+
+    // Tool: the active tool's settings, as Blender's Tool tab (the viewport's toolbar picks the tool; the bar over
+    // the view keeps the brush's quick settings too).
+    void toolTab() {
+        if (section("ACTIVE TOOL")) {
+            fieldLabel("Tool");
+            ImGui::TextUnformatted(activeToolName().c_str());
+            if (!drawing() && !navDrawing) {
+                static const char* kSpace[2] = {"Global", "Local"};
+                static const char* kSpaceTips[2] = {"The gizmo along the world's axes", "The gizmo along the selection's own axes"};
+                fieldLabel("Orientation");
+                const int k = segmented("##orient", kSpace, 2, localSpace ? 1 : 0, kSpaceTips);
+                if (k >= 0) localSpace = k == 1;
+                fieldLabel("Snap");
+                ImGui::TextUnformatted(tool == Tool::Rotate ? "Hold Ctrl: 15° steps" : tool == Tool::Scale ? "Hold Ctrl: 0.1 steps" : "Hold Ctrl: 0.25 m steps");
+            }
+        }
+        if (navDrawing) navDrawPanel();
+        else if (drawing()) drawToolPanel();
+        if (meshEdit.active() && scene && meshEdit.collider() >= 0 && meshEdit.collider() < worldCount(kCollider)) editMeshPanel(scene->world.colliders[meshEdit.collider()]);
+    }
+    void drawToolPanel() {
+        if (!section("DRAW")) return;
+        static const char* kWhat[3] = {"Floor", "Wall", "Seats"};
+        static const char* kWhatTips[3] = {"Paint walkable floor on any surface, through grass and plants (B cycles)",
+                                           "Drag a line on the floor: an invisible wall stands along it (B cycles)",
+                                           "Press where a seat goes and drag the way it faces; " FS_MOD_KEY "+drag: a row of seats (B cycles)"};
+        fieldLabel("Draw");
+        if (const int k = segmented("##drawwhat", kWhat, 3, static_cast<int>(drawWhat), kWhatTips); k >= 0) drawWhat = static_cast<DrawWhat>(k);
+        if (drawWhat == DrawWhat::Floor) {
+            const char* shapes[static_cast<int>(FloorShape::kCount)];
+            for (int k = 0; k < static_cast<int>(FloorShape::kCount); ++k) shapes[k] = floorShapeName(static_cast<FloorShape>(k));
+            static const char* kShapeTips[4] = {"Round brush: drag paints floor, Shift+drag erases it (Q cycles)", "Square brush (Q cycles)",
+                                                "Rectangle: drag from one corner to the opposite one; Shift erases (Q cycles)",
+                                                "Polygon: click its corners, the first again (or Enter) closes it; Backspace takes one back (Q cycles)"};
+            fieldLabel("Shape");
+            if (const int k = segmented("##shape", shapes, static_cast<int>(FloorShape::kCount), static_cast<int>(floorShape), kShapeTips); k >= 0) {
+                floorShape = static_cast<FloorShape>(k);
+                shapeCorners.clear();
+            }
+            if (floorShape == FloorShape::Round || floorShape == FloorShape::Square) {
+                fieldLabel("Brush");
+                ImGui::SliderFloat("##tBrush", &floorBrush, 0.05f, 3.0f, "%.2f m", ImGuiSliderFlags_Logarithmic);
+                tip("Its size: [ and ] change it");
+            }
+            if (scene && !scene->world.walkPaint.empty()) {
+                fieldLabel("");
+                buttonRow(1);
+                if (rowButton("Clear Painted Floor", "Take back everything painted or erased with the brush (Ctrl+Z undoes it)")) clearPaint();
+            }
+        } else if (drawWhat == DrawWhat::Wall) {
+            fieldLabel("Height");
+            ImGui::SliderFloat("##tWallH", &drawnWallHeight, 0.3f, 6.0f, "%.2f m");
+        }
+    }
+    void navDrawPanel() {
+        if (!section("DRAW NAVMESH")) return;
+        fieldLabel("Corners");
+        ImGui::Text("%zu", navPoints.size());
+        tip("Click on the floor corner by corner (each where you click, at its height); the first again, a double-click or Enter closes it");
+        buttonRow(3);
+        if (rowButton("Back", "Take the last corner back (Backspace)", !navPoints.empty())) navPoints.pop_back();
+        if (rowButton("Close", "Make it a piece of navmesh (Enter)", navPoints.size() >= 3, Look::Primary)) finishNavDraw();
+        if (rowButton("Stop", "Stop drawing (Esc)")) stopNavDraw();
+    }
+
+    // Scene: the environment's name, picture and sky, what's in it, its sound, how the headset draws it, and trimming
+    // what nobody can see.
+    void sceneTab() {
+        if (!scene) {
+            if (section("ENVIRONMENT")) {
+                buttonRow(1);
+                if (rowButton("Open Home…", "Or drop an .apk on the window")) openDialog();
+            }
+            return;
+        }
+        if (section("ENVIRONMENT")) environmentPanel();
+        if (section("CONTENTS", false)) contentsPanel();
+        if (section("SOUND")) soundPanel();
+        if (section("RENDERING", false)) renderingPanel();
+        if (section("WHAT NOBODY CAN SEE", false)) trimPanel();
+    }
+    void environmentPanel() {
+        fieldLabel("Name");
+        {
+            char nb[128];
+            std::snprintf(nb, sizeof nb, "%s", envTitle.c_str());
+            if (ImGui::InputTextWithHint("##envname", homeName.c_str(), nb, sizeof nb)) { envTitle = nb; dirty = true; updateTitle(); }
+            tip("What it's called on the headset (Environments panel) and in a saved .fenv");
+        }
+        fieldLabel("Picture");
+        {
+            const std::string file = envImage.empty() ? std::string() : envImage.substr(envImage.rfind(".image-") == std::string::npos ? 0 : envImage.rfind(".image-") + 1);
+            const std::string chooseTip = envImage.empty() ? "A picture file for it on the headset; without one, a view of it is taken when it's saved" : "Now: " + file;
+            buttonRow(envImage.empty() ? 2 : 3);
+            if (rowButton(framingPicture ? "Take##envshot" : "From View##envshot", "Frames the picture in the view: move round to line it up, then Take (or Enter). F12",
+                          true, framingPicture ? Look::On : Look::Plain)) {
+                if (framingPicture) pictureWanted = true; else framePicture(true);
+            }
+            if (rowButton(envImage.empty() ? "Choose…##envimg" : "Change…##envimg", chooseTip.c_str())) chooseImage();
+            if (!envImage.empty() && rowButton("Remove##envimg", "Back to a view of it, taken when it's saved")) { envImage.clear(); dirty = true; updateTitle(); }
+        }
+        fieldLabel("Sky");
+        {
+            const std::string sky = skyPanorama();
+            const bool fenv = homePaths.size() == 1 && isFenvPath(homePaths[0]);
+            const bool locked = loadState == 1 || saving || fenv;
+            const std::string skyTip = locked && !saving && loadState != 1 ? std::string("A saved .fenv keeps its sky: open its original home to change it")
+                                       : sky.empty() ? std::string("A 360° panorama (.hdr, .jpg or .png, twice as wide as it is tall) in place of the home's own sky")
+                                                     : "Now: " + skyPanoramaName(sky);
+            buttonRow(sky.empty() ? 1 : 2);
+            if (rowButton(sky.empty() ? "Choose Panorama…##envsky" : "Change…##envsky", skyTip.c_str(), !locked)) chooseSkyPanorama();
+            if (!sky.empty() && rowButton("Remove##envsky", "Back to the home's own sky", !locked)) setSkyPanorama("");
+        }
+    }
+    void contentsPanel() {
+        fieldLabel("Home");
+        ImGui::TextUnformatted(homeName.c_str());
+        for (size_t i = 0; i < scene->sources.size(); ++i) {
+            const HslSourceInfo& src = scene->sources[i];
+            fieldLabel(i ? "" : "From");
+            ImGui::TextUnformatted(sourceLine(i).c_str());
+            const std::string t = (src.package.empty() ? std::string() : src.package + "\n") + scene->apkPaths[i] +
+                                  (scene->sources.size() == 1 && src.role == "Footprint" ? "\nRoom only: its lighting, sky and outside world ship in a vista." : "");
+            tip(t.c_str());
+        }
+        size_t live = 0, hidden = 0, deleted = 0, lightmapped = 0;
+        for (const Object& o : objects) { if (o.deleted) ++deleted; else if (o.hidden) ++hidden; else ++live; }
+        for (const MeshData& md : scene->meshes) lightmapped += md.hasLightmap;
+        const bool clay = scene->animate != nullptr;
+        fieldLabel("Objects");
+        ImGui::Text("%zu shown, %zu hidden, %zu deleted", live, hidden, deleted);
+        if (!splatItems.empty()) { fieldLabel("Splats"); ImGui::Text("%s in %zu objects", withCommas(splatTotal()).c_str(), splatItems.size()); }
+        fieldLabel("Shaders");
+        ImGui::Text(clay ? "built-in unlit (Clay)" : "%zu of the home's own", scene->programs.size());
+        fieldLabel("Lighting");
+        ImGui::Text("%s", lightmapped ? (std::to_string(lightmapped) + " baked lightmaps").c_str()
+                                      : clay ? "baked into textures" : scene->hasEnvAmbient ? "light probes" : "estimated ambient");
+        fieldLabel("Animation");
+        if (clay) ImGui::Text("%zu animated objects, %.0f s loop", scene->animatedMeshes.size(), scene->animDuration);
+        else ImGui::Text("%zu rigs + shader motion", scene->anims.size());
+        fieldLabel("Made with");
+        ImGui::TextUnformatted(envMadeWith.empty() ? "not saved yet (Frame Studio " FRAME_VERSION ")" : envMadeWith.c_str());
+    }
+    void renderingPanel() {
+        {
+            std::lock_guard<std::mutex> l(statusMutex);
+            if (tunedReady) { tunedReady = false; if (tuneGen == loadGen && tunedResult != worldSettings) { worldSettings = tunedResult; dirty = true; updateTitle(); } }
+        }
+        const WorldSettings was = worldSettings;
+        const std::string uses = "On the headset it uses " + worldSettings.describe();
+        fieldLabel("Resolution");
+        {
+            static const float kRes[] = {0, 0.8f, 0.9f, 1.0f, 1.1f, 1.2f, 1.3f, 1.4f, 1.5f};
+            char cur[32];
+            if (worldSettings.resolution > 0) std::snprintf(cur, sizeof cur, "%.0f%%", worldSettings.resolution * 100);
+            if (ImGui::BeginCombo("##wsres", worldSettings.resolution > 0 ? cur : "The headset's")) {
+                for (float v : kRes) {
+                    char t[32];
+                    if (v > 0) std::snprintf(t, sizeof t, "%.0f%%", v * 100);
+                    if (ImGui::Selectable(v > 0 ? t : "The headset's", std::abs(worldSettings.resolution - v) < 1e-3f)) worldSettings.resolution = v;
+                }
+                ImGui::EndCombo();
+            }
+            tip(uses.c_str());
+        }
+        fieldLabel("Foveation");
+        {
+            bool own = worldSettings.foveation > 0;
+            if (ImGui::Checkbox("##wsfovown", &own)) worldSettings.foveation = own ? 1.0f : 0.0f;
+            tip("Its own foveation strength (off: the headset's level)");
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(-1);
             ImGui::BeginDisabled(!own);
-            if (ImGui::Button("Save Its Sound\u2026")) saveSoundAs(scene->ambientOgg, (scene->ambientName.empty() ? shownName() + " ambience" : scene->ambientName) + ".ogg");
+            float fv = own ? worldSettings.foveation : 1.0f;
+            if (ImGui::SliderFloat("##wsfov", &fv, 1.0f, 3.0f, own ? "%.2f" : "The headset's")) worldSettings.foveation = std::round(fv * 4) / 4;
             ImGui::EndDisabled();
-            if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-                ImGui::SetTooltip("%s", own ? "The home's own ambience as it plays (Ogg Vorbis)" : "This home has no sound of its own");
-            if (sound.bytes) {
-                ImGui::SameLine();
-                if (ImGui::Button("Save the Added Sound\u2026")) saveSoundAs(*sound.bytes, sound.name.empty() ? sound.s.file : sound.name);
-            }
+            tip("1 gentle .. 3 strong: where you look stays sharp, the edges of view get coarser (cheaper)");
         }
+        fieldLabel("MSAA");
+        {
+            static const int kMsaa[] = {0, 1, 2, 4};
+            static const char* kMsaaNames[] = {"The headset's", "Off", "2x", "4x"};
+            int at = 0;
+            for (int i = 0; i < 4; ++i) if (kMsaa[i] == worldSettings.msaa) at = i;
+            if (ImGui::Combo("##wsmsaa", &at, kMsaaNames, 4)) worldSettings.msaa = kMsaa[at];
+            tip("Different from the headset's: Frame Home restarts itself to show this world");
+        }
+        fieldLabel("Frame rate");
+        {
+            static const char* kRates[] = {"The headset's", "Full", "Half"};
+            int at = worldSettings.frameRate + 1;
+            if (ImGui::Combo("##wsrate", &at, kRates, 3)) worldSettings.frameRate = at - 1;
+            tip("Half: drawn every other display frame, turned with your head in between (twice the GPU time a frame)");
+        }
+        if (worldSettings != was) { worldSettings.tuned.clear(); worldSettings.clamp(); dirty = true; updateTitle(); }
+        fieldLabel("");
+        buttonRow(2);
+        if (rowButton(tuning ? "Calculating…" : "Calculate Best",
+                      "On the headset: walks through the world at 120 Hz at a few settings and keeps the sharpest one that holds\n"
+                      "its frame rate (at most 1% of frames late). Your MSAA stays; foveation moves first, then resolution.\n"
+                      "Takes a few minutes; the headset cools between tries.", !tuning && !saving && !sending))
+            calculateBestSettings();
+        if (rowButton("Headset's", "Use the headset's own settings for all of these", !(worldSettings.empty() && worldSettings.tuned.empty()))) {
+            worldSettings = WorldSettings();
+            setTuneStatus("");
+            dirty = true;
+            updateTitle();
+        }
+        std::lock_guard<std::mutex> l(statusMutex);
+        const std::string t = !tuneStatus.empty() && tuneGen == loadGen ? tuneStatus : worldSettings.tuned;   // (another home's measuring isn't this one's)
+        if (!t.empty()) { fieldLabel(""); hint(t.c_str()); }
     }
 
-    // Headset: send the environment to the Steam Frame, or install Frame Home there.
-    void headsetTab() {
-        section("STEAM FRAME");
-        ImGui::TextDisabled("ssh %s  \u2192  ~/%s", frameHost, kFrameEnvDir);
-        ImGui::Spacing();
-        ImGui::BeginDisabled(!scene || sending);
-        pushPrimary();
-        if (ImGui::Button(sending ? "Sending\u2026###send" : "Send to Frame###send")) sendToFrame();
-        ImGui::PopStyleColor(3);
+    // Output: saving and exporting it, bundles, and the headset (sending it, installing Frame Home there or here).
+    void outputTab() {
+        if (section("SAVE")) savePanel();
+        if (section("HEADSET")) headsetPanel();
+        if (section("BUNDLE", false)) bundlePanel();
+    }
+    void savePanel() {
+        if (!scene) { hint("Open a home to save it."); return; }
+        fieldLabel("Saved");
+        if (dirty) ImGui::TextUnformatted("Unsaved changes");
+        else if (envFile.empty()) ImGui::TextUnformatted("Not in My Environments yet");
+        else ImGui::TextUnformatted(narrow(fs::path(widen(envFile)).filename().wstring()).c_str());
+        tip(envFile.c_str());
+        const bool busy = saving || uploading;
+        buttonRow(3);
+        if (rowButton("Save", "All of it, into My Environments (Documents\\Frame Studio\\Environments). Ctrl+S", !busy && (dirty || envFile.empty()), Look::Primary))
+            saveToLibrary();
+        if (rowButton("Export…", "A copy of all of it as a .fenv anywhere you choose. Ctrl+E", !busy)) exportEnvironmentDialog();
+        if (rowButton("Blender…", "Export for Blender: the environment as glTF (.glb) and, beside it, its navmesh with the colliders, spawns,\n"
+                                     "seats and hotspots", !busy && !blenderBusy))
+            exportBlenderDialog();
+    }
+
+    // Output > Headset: where it goes, sending the open environment there, and installing Frame Home (on the headset,
+    // or on this PC where that's possible).
+    void headsetPanel() {
+        fieldLabel("Headset");
+        ImGui::BeginDisabled(installing);
+        ImGui::InputTextWithHint("##frameHost", "an ssh alias, or steamos@<address>", frameHost, sizeof frameHost);
         ImGui::EndDisabled();
-        ImGui::PushTextWrapPos(0);
-        ImGui::TextDisabled("%s", status().c_str());
-        ImGui::PopTextWrapPos();
-        section("INSTALL FRAME HOME");
-        installPanel();
-        if (pcAvailable()) { section("THIS PC"); pcPanel(); }
+        const std::string where = std::string("Send and Install reach it over ssh; environments go into ~/") + kFrameEnvDir;
+        tip(where.c_str());
+        buttonRow(1);
+        if (rowButton(sending ? "Sending…###send" : "Send to Frame###send", "The open environment, onto the headset", scene && !sending, Look::Primary,
+                      static_cast<int>(ToolIcon::Headset)))
+            sendToFrame();
+        const std::string st = status();
+        if (!st.empty()) hint(st.c_str());
+        if (subPanel("INSTALL FRAME HOME", false)) { installPanel(); endSubPanel(); }
+        if (pcAvailable() && subPanel("THIS PC", false)) { pcPanel(); endSubPanel(); }
     }
 
     // ── This PC: Frame Home as SteamVR's environment on the computer Studio runs on (the installer beside Studio,
@@ -7289,30 +8929,29 @@ struct Studio {
         });
     }
     void pcPanel() {
-        ImGui::PushTextWrapPos(0);
-        ImGui::TextWrapped("SteamVR on this computer: your environments (My Environments) become its environment, switched in the "
-                           "Steam menu's Environments panel. SteamVR's own settings are put back exactly when you remove it.");
-        ImGui::Spacing();
         const bool installed = pcInstalled();
-        ImGui::BeginDisabled(pcBusy);
-        if (!installed) pushPrimary();
-        if (rowButton(pcBusy ? "Working\u2026###pcinst" : installed ? "Update Frame Home on This PC###pcinst" : "Install Frame Home on This PC###pcinst", true))
+        buttonRow(installed ? 2 : 1);
+        static const char* kWhat = "SteamVR on this computer: your environments (My Environments) become its environment, switched in the\n"
+                                   "Steam menu's Environments panel. SteamVR's own settings are put back exactly when you remove it.";
+        if (rowButton(pcBusy ? "Working…###pcinst" : installed ? "Update###pcinst" : "Install###pcinst", kWhat, !pcBusy, installed ? Look::Plain : Look::Primary))
             pcInstall(false);
-        if (!installed) ImGui::PopStyleColor(3);
-        if (installed && rowButton("Remove from This PC")) pcInstall(true);
-        ImGui::EndDisabled();
+        if (installed && rowButton("Remove", "Give SteamVR its own environment back", !pcBusy, Look::Danger)) pcInstall(true);
         std::string st;
         { std::lock_guard<std::mutex> l(statusMutex); st = pcStatus; }
-        if (!st.empty()) { ImGui::Spacing(); ImGui::TextWrapped("%s", st.c_str()); }
-        ImGui::PopTextWrapPos();
+        if (!st.empty()) hint(st.c_str());
     }
 
 
 
     // The selected object's own mesh: every triangle edge, Blender orange, plus a soft fill of its faces.
     void drawSelection(ImDrawList* dl, const float* viewProj) {
-        if (selected < 0 || !scene) return;
-        const Object& o = objects[selected];
+        if (!scene) return;
+        for (int i : alsoSelected) if (i >= 0 && i < static_cast<int>(objects.size()) && i != selected) drawObjectSelection(dl, viewProj, i, 0.5f);
+        if (selected >= 0) drawObjectSelection(dl, viewProj, selected, 1.0f);
+    }
+    // One selected object's faces (a faint tint) and wire; strength: 1 the gizmo's, less for the others selected.
+    void drawObjectSelection(ImDrawList* dl, const float* viewProj, int i, float strength) {
+        const Object& o = objects[i];
         if (o.hidden || o.deleted) return;
         const MeshData& md = scene->meshes[o.scene];
         float w[16], mvp[16];
@@ -7335,9 +8974,9 @@ struct Studio {
             const u32 a = md.indices[t * 3], b = md.indices[t * 3 + 1], c = md.indices[t * 3 + 2];
             if (a >= nv || b >= nv || c >= nv) continue;
             if (clip[a * 4 + 3] < kNear || clip[b * 4 + 3] < kNear || clip[c * 4 + 3] < kNear) continue;
-            dl->AddTriangleFilled(screen(&clip[a * 4]), screen(&clip[b * 4]), screen(&clip[c * 4]), col(kOrange, 0.10f));
+            dl->AddTriangleFilled(screen(&clip[a * 4]), screen(&clip[b * 4]), screen(&clip[c * 4]), col(kOrange, 0.10f * strength));
         }
-        const ImU32 wire = col(kOrange, 0.85f);
+        const ImU32 wire = col(kOrange, 0.85f * strength);
         const float thick = 1.0f * scale;
         for (size_t t = 0; t < tris; t += step) {
             const u32 idx[3] = {md.indices[t * 3], md.indices[t * 3 + 1], md.indices[t * 3 + 2]};
@@ -7474,12 +9113,29 @@ struct Studio {
                     const float bx[3] = {p.pos[0] - fx * 0.25f, p.pos[1], p.pos[2] - fz * 0.25f}, top[3] = {bx[0], bx[1] + 0.5f, bx[2]};
                     line(bx, top, c, th);
                 }
+                if (kind == kSpawn) {   // someone standing there: a body to eye height, a head, and what they look at first
+                    const float t = sel || hov ? th * 2 : th * 1.5f, eyeY = p.pos[1] + spawnpick::kEyeHeight;
+                    const float eye[3] = {p.pos[0], eyeY, p.pos[2]};
+                    line(p.pos, eye, c, t);
+                    float hp[3] = {p.pos[0] + 0.14f, eyeY, p.pos[2]};
+                    for (int k = 1; k <= 16; ++k) {
+                        const float a = k * 2 * kPi / 16, cur[3] = {p.pos[0] + 0.14f * std::cos(a), eyeY, p.pos[2] + 0.14f * std::sin(a)};
+                        line(hp, cur, c, t);
+                        std::memcpy(hp, cur, 12);
+                    }
+                    for (float side : {-0.5f, 0.5f}) {   // the view, 60 degrees across, a metre out
+                        const float a = p.yaw + side, edge[3] = {p.pos[0] - std::sin(a) * 1.0f, eyeY, p.pos[2] - std::cos(a) * 1.0f};
+                        line(eye, edge, col(color, 0.6f), th);
+                    }
+                    const float ahead[3] = {p.pos[0] + fx * 1.0f, eyeY, p.pos[2] + fz * 1.0f};
+                    line(eye, ahead, c, t);
+                }
                 ImVec2 sp;
                 const float lab[3] = {p.pos[0], p.pos[1] + 0.15f, p.pos[2]};
                 if (project(lab, sp)) dl->AddText(ImVec2(sp.x + 6 * scale, sp.y - 8 * scale), c, (p.name.empty() ? kWorldNames[kind] : p.name).c_str());
             }
         };
-        points(w.spawns, kSpawn, kShowColors[kShowSpawns], 0.3f);
+        points(w.spawns, kSpawn, kShowColors[kShowSpawns], 0.4f);
         points(w.seats, kSeat, kShowColors[kShowSeats], 0.25f);
         points(w.hotspots, kHotspot, kShowColors[kShowHotspots], 0.4f);
         if (wKind == kSeat && wIndex >= 0 && wIndex < static_cast<int>(w.seats.size())) {   // where you stand up: drag it
@@ -7516,41 +9172,87 @@ struct Studio {
         if (scene && tool == Tool::DrawFloor && (painting || walkPending || walkJob)) {   // the stroke, until the area shows it
             const std::vector<WalkStroke>& p = scene->world.walkPaint;
             for (size_t i = std::min(strokeFrom, p.size()); i < p.size(); ++i) {
-                float prev[3];
-                for (int k = 0; k <= 20; ++k) {
-                    const float a = k * 2 * kPi / 20, cur[3] = {p[i].pos[0] + p[i].radius * std::cos(a), p[i].pos[1] + 0.01f, p[i].pos[2] + p[i].radius * std::sin(a)};
-                    if (k) line(prev, cur, col(p[i].erase ? 0xff5050 : kFloorTint, 0.45f), th);
-                    std::memcpy(prev, cur, 12);
-                }
+                const std::vector<std::array<float, 3>> o = strokeOutline(p[i]);
+                for (size_t k = 0; k < o.size(); ++k) line(o[k].data(), o[(k + 1) % o.size()].data(), col(p[i].erase ? 0xff5050 : kFloorTint, 0.45f), th);
             }
         }
-        if (scene && tool == Tool::DrawFloor && painting && drawWhat != DrawWhat::Floor && strokePath.size() > 1) {   // the line so far
+        if (scene && tool == Tool::DrawFloor && painting && drawWhat != DrawWhat::Floor && !seatAiming() && strokePath.size() > 1) {   // the line so far
             const uint32_t c = drawWhat == DrawWhat::Wall ? kWallTint : 0x7cf0a0;
-            for (size_t i = 1; i < strokePath.size(); ++i) {
-                const float a[3] = {strokePath[i - 1][0], strokePath[i - 1][1] + 0.02f, strokePath[i - 1][2]}, b[3] = {strokePath[i][0], strokePath[i][1] + 0.02f, strokePath[i][2]};
+            // a wall: the runs it will make (straightened, ends carried on to what they reach), faint where the hand went
+            const std::vector<std::array<float, 3>> shown = drawWhat == DrawWhat::Wall ? wallRuns(strokePath) : strokePath;
+            if (drawWhat == DrawWhat::Wall)
+                for (size_t i = 1; i < strokePath.size(); ++i) {
+                    const float a[3] = {strokePath[i - 1][0], strokePath[i - 1][1] + 0.02f, strokePath[i - 1][2]}, b[3] = {strokePath[i][0], strokePath[i][1] + 0.02f, strokePath[i][2]};
+                    line(a, b, col(c, 0.3f), th);
+                }
+            for (size_t i = 1; i < shown.size(); ++i) {
+                const float a[3] = {shown[i - 1][0], shown[i - 1][1] + 0.02f, shown[i - 1][2]}, b[3] = {shown[i][0], shown[i][1] + 0.02f, shown[i][2]};
                 line(a, b, col(c), th * 2);
                 if (drawWhat == DrawWhat::Wall) {
                     const float a2[3] = {a[0], a[1] + drawnWallHeight, a[2]}, b2[3] = {b[0], b[1] + drawnWallHeight, b[2]};
                     line(a2, b2, col(c, 0.5f), th);
+                    line(a, a2, col(c, 0.5f), th);
+                    if (i + 1 == shown.size()) line(b, b2, col(c, 0.5f), th);
                 }
             }
         }
-        if (brushShown && drawWhat != DrawWhat::Floor) {   // a wall's / a seat's spot under the mouse
+        if ((brushShown || seatAiming()) && drawWhat != DrawWhat::Floor) {   // a wall's / a seat's spot under the mouse
             float prev[3];
             const float rr = drawWhat == DrawWhat::Seat ? 0.25f : 0.08f;
+            const bool aiming = seatAiming();
+            const float* ring = aiming ? strokePath.front().data() : brushAt;
+            if (drawWhat == DrawWhat::Seat && (!painting || aiming)) {   // the way it faces: dragged, else towards the camera
+                float fwd[3];
+                cam.forward(fwd);
+                const float ax = seatAim[0] - ring[0], az = seatAim[2] - ring[2], al = std::hypot(ax, az);
+                const bool aimed = aiming && seatAimed && al >= kSeatAimMin;
+                const float fl = std::hypot(fwd[0], fwd[2]);
+                const float fx = aimed ? ax / al : fl > 1e-4f ? -fwd[0] / fl : 0, fz = aimed ? az / al : fl > 1e-4f ? -fwd[2] / fl : 1;
+                const float from[3] = {ring[0], ring[1] + 0.03f, ring[2]}, to[3] = {ring[0] + fx * 0.45f, ring[1] + 0.03f, ring[2] + fz * 0.45f};
+                line(from, to, col(0x7cf0a0), th * 2);
+                const float lx = -fz * 0.1f, lz = fx * 0.1f, back[3] = {to[0] - fx * 0.12f, to[1], to[2] - fz * 0.12f};
+                const float l[3] = {back[0] + lx, back[1], back[2] + lz}, r[3] = {back[0] - lx, back[1], back[2] - lz};
+                line(to, l, col(0x7cf0a0), th * 2);
+                line(to, r, col(0x7cf0a0), th * 2);
+            }
             for (int k = 0; k <= 24; ++k) {
-                const float a = k * 2 * kPi / 24, cur[3] = {brushAt[0] + rr * std::cos(a), brushAt[1] + 0.02f, brushAt[2] + rr * std::sin(a)};
+                const float a = k * 2 * kPi / 24, cur[3] = {ring[0] + rr * std::cos(a), ring[1] + 0.02f, ring[2] + rr * std::sin(a)};
                 if (k) line(prev, cur, col(drawWhat == DrawWhat::Wall ? kWallTint : 0x7cf0a0), th * 1.5f);
                 std::memcpy(prev, cur, 12);
             }
             if (drawWhat == DrawWhat::Wall) { const float top[3] = {brushAt[0], brushAt[1] + drawnWallHeight, brushAt[2]}; line(brushAt, top, col(kWallTint, 0.6f), th); }
         }
-        if (brushShown && drawWhat == DrawWhat::Floor) {   // the Draw Floor brush, flat on the surface under the mouse
-            float prev[3];
-            for (int k = 0; k <= 32; ++k) {
-                const float a = k * 2 * kPi / 32, cur[3] = {brushAt[0] + floorBrush * std::cos(a), brushAt[1] + 0.01f, brushAt[2] + floorBrush * std::sin(a)};
-                if (k) line(prev, cur, col(ImGui::GetIO().KeyShift ? 0xff5050 : kFloorTint), th * 1.5f);
-                std::memcpy(prev, cur, 12);
+        if (scene && tool == Tool::DrawFloor && drawWhat == DrawWhat::Floor) {   // the Draw Floor brush or shape, flat on the surface under the mouse
+            const uint32_t tint = ImGui::GetIO().KeyShift ? 0xff5050 : kFloorTint;
+            auto loop = [&](const std::vector<std::array<float, 3>>& o, bool closed, float w) {
+                for (size_t k = 0; k + (closed ? 0 : 1) < o.size(); ++k) line(o[k].data(), o[(k + 1) % o.size()].data(), col(tint), w);
+            };
+            auto marker = [&](const float* at, float r) {
+                WalkStroke m;
+                std::copy_n(at, 3, m.pos);
+                m.radius = r;
+                loop(strokeOutline(m), true, th * 1.5f);
+            };
+            if (floorShape == FloorShape::Rect) {
+                if (painting && !shapeCorners.empty() && shapeEndSet) loop(strokeOutline(rectStroke(shapeCorners.front().data(), shapeEnd, viewYaw())), true, th * 2);
+                else if (brushShown) marker(brushAt, 0.08f);
+            } else if (floorShape == FloorShape::Polygon) {
+                std::vector<std::array<float, 3>> o;
+                for (const auto& c : shapeCorners) o.push_back({c[0], c[1] + 0.01f, c[2]});
+                if (!shapeCorners.empty() && shapeEndSet) o.push_back({shapeEnd[0], shapeCorners.front()[1] + 0.01f, shapeEnd[2]});
+                if (o.size() > 1) loop(o, o.size() > 2, th * 2);
+                if (!shapeCorners.empty()) {                              // the first corner: click it to close
+                    const ImVec2 first = toScreen(shapeCorners.front().data(), viewProj);
+                    const ImVec2 m = ImGui::GetIO().MousePos;
+                    const bool closes = shapeCorners.size() >= 3 && std::hypot(m.x - first.x, m.y - first.y) < 12 * scale;
+                    marker(shapeCorners.front().data(), closes ? 0.18f : 0.1f);
+                } else if (brushShown) marker(brushAt, 0.08f);
+            } else if (brushShown) {
+                WalkStroke b;
+                std::copy_n(brushAt, 3, b.pos);
+                b.radius = floorBrush;
+                if (floorShape == FloorShape::Square) { b.shape = WalkStroke::Square; b.yaw = viewYaw(); }
+                loop(strokeOutline(b), true, th * 1.5f);
             }
         }
         // Surfaces in their role's colour. Walkable floors are filled where you can stand; the rest are wireframes.
@@ -7573,7 +9275,7 @@ struct Studio {
             const bool ofSel = !selKey.empty() && (c.mesh == selKey || c.mesh == selKey + "#floor");
             if (ofSel ? c.hidden : !worldShown(kCollider, static_cast<int>(i))) continue;   // (a part's own eye still hides it)
             const bool sel = wKind == kCollider && wIndex == static_cast<int>(i), hov = hoverKind == kCollider && hoverIndex == static_cast<int>(i);
-            const uint32_t rc = kRoleColors[std::clamp(c.role, 0, 5)];
+            const uint32_t rc = kRoleColors[std::clamp(c.role, 0, 6)];
             const ImU32 color = col(sel ? 0xffffff : hov ? 0xfff2b0 : rc, sel || hov ? 1.0f : c.role == WorldCollider::Trigger ? 0.45f : 0.8f);
             const float t = sel || hov ? th * 2 : th;
             if (c.kind == WorldCollider::Box) {
@@ -7621,14 +9323,14 @@ struct Studio {
                     if (L < 1e-9f) continue;
                     const float up = std::fabs(n[1]) / L;
                     const bool obj = c.role == WorldCollider::Object;   // a collider: all of it stops you
-                    const bool drawn = c.role == WorldCollider::Floor || c.role == WorldCollider::Walkable;
+                    const bool drawn = c.role == WorldCollider::Floor || c.role == WorldCollider::Walkable || c.role == WorldCollider::Navmesh;
                     const bool isFloor = !obj && (drawn ? up > 0.5f : c.role == WorldCollider::Solid && up > 0.7f);
                     const bool isWall = obj || (!isFloor && !drawn && up < 0.7f);
                     if (!isFloor && !isWall) continue;
                     ImVec2 pa, pb, pc;
                     if (!project(a, pa) || !project(b, pb) || !project(d, pc)) continue;
-                    const uint32_t tint = obj ? kRoleColors[WorldCollider::Object] : isFloor ? kFloorTint : kWallTint;
-                    dl->AddTriangleFilled(pa, pb, pc, col(tint, hot ? (isFloor ? 0.55f : 0.32f) : isFloor ? 0.22f : 0.13f));
+                    const uint32_t tint = obj ? kRoleColors[WorldCollider::Object] : c.role == WorldCollider::Navmesh ? kRoleColors[WorldCollider::Navmesh] : isFloor ? kFloorTint : kWallTint;
+                    if (c.role != WorldCollider::Navmesh || hot) dl->AddTriangleFilled(pa, pb, pc, col(tint, hot ? (isFloor ? 0.55f : 0.32f) : isFloor ? 0.22f : 0.13f));
                     if (edges || sel) dl->AddTriangle(pa, pb, pc, col(sel ? 0xffffff : tint, hot ? 0.85f : isFloor ? 0.5f : 0.22f), 1.0f);
                 }
                 if (ofSel) legendFloor = 0;
@@ -7641,17 +9343,18 @@ struct Studio {
         }
         if (legendFloor < 0 && walkGuideOn && walkShown) {   // the walkable area's colours, above the timeline
             char a[64];
-            std::snprintf(a, sizeof a, "Walkable  %.0f m\u00b2", walkReport.walkArea);
-            const char* items[4] = {a, "Bridged seam", "Edge", "Out of reach"};
-            const uint32_t cols[4] = {0x2ec756, 0x1a8cff, 0xff7314, 0x808080};
+            std::snprintf(a, sizeof a, "Navmesh  %.0f m²", walkReport.walkArea);
+            const char* items[4] = {a, "Bridged seam", "Edge", "Step / ledge up"};
+            const uint32_t cols[4] = {0x2ec756, 0x1a8cff, 0xff7314, kShowColors[kShowSteps]};
+            const size_t shown = showCat[kShowSteps] && showCat[kShowWalkArea] ? 4 : 3;
             const float lh = ImGui::GetTextLineHeight(), sw = lh * 0.7f, gap = 8 * scale;
             float wsum = 0;
-            for (const char* t : items) wsum += ImGui::CalcTextSize(t).x + sw + gap * 2;
+            for (size_t k = 0; k < shown; ++k) wsum += ImGui::CalcTextSize(items[k]).x + sw + gap * 2;
             const ImVec2 p0(viewPos.x + 10 * scale, viewPos.y + viewSize.y - 34 * scale - lh - 22 * scale);
             dl->AddRectFilled(p0, ImVec2(p0.x + wsum + 10 * scale, p0.y + lh + 12 * scale), col(kBar, 0.9f), 6 * scale);
             float x = p0.x + 8 * scale;
             const float y = p0.y + 6 * scale;
-            for (int k = 0; k < 4; ++k) {
+            for (size_t k = 0; k < shown; ++k) {
                 dl->AddRectFilled(ImVec2(x, y + lh * 0.15f), ImVec2(x + sw, y + lh * 0.85f), col(cols[k]), 2 * scale);
                 x += sw + gap * 0.6f;
                 dl->AddText(ImVec2(x, y), col(0xc8c8c8), items[k]);
@@ -7885,6 +9588,16 @@ struct Studio {
         const bool hovered = overView && !overTimeline;
         dl->AddRectFilled(viewPos, end, col(kViewBg));
         if (rendered && viewTex) { dl->AddImage((ImTextureID)viewTex, viewPos, end); viewDrawn = true; }   // (a pointer on 64-bit Vulkan, an integer on 32-bit: as ImGui's backend casts it)
+        if (walking && scene) {                         // walk mode: the walker's view, nothing of the editor over it
+            renderer.setSelection(-1);
+            walkStep(hovered);
+            drawPictureFrame(dl);
+            if (!framingPicture) drawWalkHint(dl);
+            if (!viewMaximized) roundAreaBottom(4 | 8);
+            ImGui::EndChild();
+            return;
+        }
+        if (walking) stopWalking();                     // (the home went)
 
         const float ty = std::tan(kFovY * 0.5f), tx = ty * std::max(1.0f, viewSize.x) / std::max(1.0f, viewSize.y);
         float pose[16], view[16], proj[16], viewProj[16];
@@ -7897,7 +9610,27 @@ struct Studio {
         bool overGizmo = false, gizmoShown = false;
         const bool gizmoAllowed = !io.KeyAlt && drag < 0;
         float worldM[16];
-        if (scene && wKind >= 0 && wIndex >= 0 && wIndex < worldCount(wKind) && worldShown(wKind, wIndex) && !drawing() && worldMatrix(wKind, wIndex, worldM)) {
+        keepWorldSelection();
+        keepMeshEdit();
+        if (navDrawing && (drawing() || walking)) stopNavDraw();
+        if (scene && navDrawing) {   // Draw Navmesh: clicks are its corners; Alt+drag still orbits
+            navDrawFrame(dl, viewProj, hovered);
+            gizmoShown = true;
+            overGizmo = hovered;
+        } else if (scene && meshEdit.active()) {   // edit mode: the corners are what's picked and moved; Alt+drag still orbits
+            MeshEditor::View mv;
+            mv.view = view; mv.proj = proj; mv.viewProj = viewProj; mv.pos = viewPos; mv.size = viewSize; mv.nearW = kNear; mv.scale = scale;
+            const int op = tool == Tool::Rotate ? ImGuizmo::ROTATE : tool == Tool::Scale ? ImGuizmo::SCALE : ImGuizmo::TRANSLATE;
+            bool over = false;
+            ImGuizmo::SetGizmoSizeClipSpace(0.14f);
+            if (meshEdit.frame(scene->world.colliders[meshEdit.collider()], dl, mv, hovered, gizmoAllowed, op, io.KeyCtrl, [this] { pushWorldUndo(); }, over))
+                meshEdited();
+            gizmoShown = true;
+            overGizmo = hovered;   // (nothing else picks in the view meanwhile)
+            drawMeshEditHint(dl);
+        } else if (scene && wKind >= 0 && wIndex >= 0 && wIndex < worldCount(wKind) && worldShown(wKind, wIndex) && !drawing() && worldMatrix(wKind, wIndex, worldM)) {
+            float wasM[16];
+            std::memcpy(wasM, worldM, sizeof wasM);
             ImGuizmo::SetOrthographic(false);
             ImGuizmo::SetGizmoSizeClipSpace(0.14f);      // a bit bigger than ImGuizmo's default: easier to grab
             ImGuizmo::SetDrawlist(dl);
@@ -7912,7 +9645,10 @@ struct Studio {
             const bool changed = ImGuizmo::Manipulate(view, proj, op, localSpace ? ImGuizmo::LOCAL : ImGuizmo::WORLD, worldM, nullptr, snap ? snapValues : nullptr);
             const bool using_ = ImGuizmo::IsUsing();
             if (using_ && !gizmoWasUsing) { pushWorldUndo(); dragBase = scene->world; }   // one undo step per drag, taken before it moves
-            if (changed && finiteMatrix(worldM)) setWorldMatrix(wKind, wIndex, worldM);
+            if (changed && finiteMatrix(worldM)) {
+                setWorldMatrix(wKind, wIndex, worldM);
+                moveAlsoSelected(wasM, worldM);   // (the others selected with it move as it does)
+            }
             if (!using_ && gizmoWasUsing && wKind == kCollider) {   // let go: overlapping placed surfaces become one (same undo step)
                 const int was = static_cast<int>(scene->world.colliders.size());
                 wIndex = combineTouching(wIndex);
@@ -7955,10 +9691,11 @@ struct Studio {
         // The highlight is drawn by the renderer on the GPU (built once per selection; the old per-frame CPU
         // wireframe made the whole app lag on big meshes like the floor).
         {
-            const bool show = selected >= 0 && objectShown(objects[selected]);
+            const bool show = selected >= 0 && objectShown(objects[selected]) && !framingPicture;
             renderer.setSelection(show ? static_cast<int>(objects[selected].mesh) : -1);
         }
-        if (scene) drawWorld(dl, viewProj);
+        if (scene && !framingPicture) drawWorld(dl, viewProj);
+        drawPictureFrame(dl);
         if (scene && splatSel >= 0) drawSplatBox(dl, static_cast<size_t>(splatSel));
         const bool navGizmo = scene && drawAxes(dl, view);   // the navigation gizmo took the mouse: don't also orbit the view
         if (scene && isolating) {   // say why everything else vanished, and how to get it back
@@ -8142,7 +9879,7 @@ struct Studio {
         // Draw Floor: drag over any surface to paint walkable floor on it (Shift: erase it), one undo step a stroke.
         brushShown = false;
         if (tool == Tool::DrawFloor && scene && hovered && !io.KeyAlt && drag < 0) {
-            bool on = pickSurface(io.MousePos.x, io.MousePos.y, brushAt);
+            bool on = pickSurface(io.MousePos.x, io.MousePos.y, brushAt, true);
             // The floor brush paints where there's nothing too (a gap, water, open air), at the level it was painting at:
             // a stroke carries on at its own height off an edge (a surface a step or more off it is passed over), and
             // with nothing under the mouse it paints at the last height it touched.
@@ -8151,21 +9888,54 @@ struct Studio {
                 if (!on || offLevel) on = pickLevel(io.MousePos.x, io.MousePos.y, brushLevel, brushAt);
             }
             if (on && drawWhat == DrawWhat::Floor) { brushLevel = brushAt[1]; brushLevelKnown = true; }
+            if (drawWhat == DrawWhat::Wall && painting && !strokePath.empty())   // a wall's line: on its floor's level
+                on = pickLevel(io.MousePos.x, io.MousePos.y, strokePath.front()[1], brushAt) || on;
             brushShown = on;
-            if (on && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+            const bool rectShape = drawWhat == DrawWhat::Floor && floorShape == FloorShape::Rect, polyShape = drawWhat == DrawWhat::Floor && floorShape == FloorShape::Polygon;
+            if (rectShape && painting && !shapeCorners.empty())          // the rectangle's other corner, on the first one's level
+                shapeEndSet = pickLevel(io.MousePos.x, io.MousePos.y, shapeCorners.front()[1], shapeEnd) || shapeEndSet;
+            if (polyShape) {                                             // corners after the first: on its level
+                if (!shapeCorners.empty()) { shapeEndSet = pickLevel(io.MousePos.x, io.MousePos.y, shapeCorners.front()[1], shapeEnd); brushShown = brushShown || shapeEndSet; }
+                // (the first corner where the brush is; later ones on its level: a click above the horizon adds none)
+                if (ImGui::IsMouseClicked(ImGuiMouseButton_Left) && (shapeCorners.empty() ? on : shapeEndSet)) {
+                    bool closing = shapeCorners.size() >= 3 && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left);
+                    if (shapeCorners.size() >= 3) {                          // a click on the first corner closes it
+                        const ImVec2 first = toScreen(shapeCorners.front().data(), viewProj);
+                        closing = closing || std::hypot(io.MousePos.x - first.x, io.MousePos.y - first.y) < 12 * scale;
+                    }
+                    if (closing) closePolygon(io.KeyShift);
+                    else if (shapeCorners.empty()) shapeCorners.push_back({brushAt[0], brushAt[1], brushAt[2]});
+                    else shapeCorners.push_back({shapeEnd[0], shapeEnd[1], shapeEnd[2]});
+                }
+            }
+            if (seatAiming()) {
+                float at[3];
+                if (pickLevel(io.MousePos.x, io.MousePos.y, strokePath.front()[1], at)) { std::copy_n(at, 3, seatAim); seatAimed = true; }
+            }
+            if (on && !polyShape && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
                 painting = true;
+                if (rectShape) { shapeCorners.assign(1, {brushAt[0], brushAt[1], brushAt[2]}); shapeEndSet = false; }
+                seatRow = io.KeyCtrl;
+                seatAimed = false;
                 pushWorldUndo();
                 strokeFrom = scene->world.walkPaint.size();
                 strokePath.clear();
             }
             if (on && painting && ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
-                if (drawWhat == DrawWhat::Floor) paintDab(brushAt, floorBrush, io.KeyShift);
-                else extendStroke(brushAt);
+                if (drawWhat == DrawWhat::Floor) { if (!rectShape) paintDab(brushAt, floorBrush, io.KeyShift, floorShape == FloorShape::Square); }
+                else if (!seatAiming()) extendStroke(brushAt);          // (a seat: placed where pressed, then aimed)
             }
         }
         if (painting && !ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
             painting = false;
             if (drawWhat == DrawWhat::Wall && !commitDrawnWall() && !undo.empty()) undo.pop_back();   // (nothing made: no undo step)
+            if (drawWhat == DrawWhat::Floor && floorShape == FloorShape::Rect) {
+                strokeFrom = scene->world.walkPaint.size();
+                const bool made = !shapeCorners.empty() && shapeEndSet && addShape(rectStroke(shapeCorners.front().data(), shapeEnd, viewYaw()), io.KeyShift);
+                if (!made && !undo.empty()) undo.pop_back();
+                shapeCorners.clear();
+                shapeEndSet = false;
+            }
             if (drawWhat == DrawWhat::Seat && !commitDrawnSeats() && !undo.empty()) undo.pop_back();
             strokePath.clear();
         }
@@ -8191,14 +9961,26 @@ struct Studio {
             ImGui::SetCursorScreenPos(ImVec2(at.x + 4 * scale, at.y + 4 * scale));
             ImGui::SetNextItemWidth(w);
             if (drawWhat == DrawWhat::Floor) {
-                ImGui::SliderFloat("##brush", &floorBrush, 0.05f, 3.0f, "brush %.2f m", ImGuiSliderFlags_Logarithmic);
-                if (ImGui::IsItemHovered()) ImGui::SetTooltip("Brush size \u00b7 [ and ] change it \u00b7 drag paints floor \u00b7 Shift+drag erases it");
+                const bool brush = floorShape == FloorShape::Round || floorShape == FloorShape::Square;
+                if (brush) {
+                    ImGui::SliderFloat("##brush", &floorBrush, 0.05f, 3.0f, "brush %.2f m", ImGuiSliderFlags_Logarithmic);
+                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Brush size \u00b7 [ and ] change it \u00b7 drag paints floor \u00b7 Shift+drag erases it");
+                } else {
+                    ImGui::AlignTextToFramePadding();
+                    ImGui::TextUnformatted(floorShape == FloorShape::Rect ? "drag corner to corner" : "click the corners");
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("%s", floorShape == FloorShape::Rect ? "Drag from one corner to the opposite one: floor inside it. Shift: erase it."
+                                                                               : "Click each corner; click the first again (or Enter, or double-click) to close it.\n"
+                                                                                 "Backspace takes the last corner back, Esc drops it. Shift when closing: erase.");
+                }
             } else if (drawWhat == DrawWhat::Wall) {
                 ImGui::SliderFloat("##wallH", &drawnWallHeight, 0.3f, 6.0f, "wall %.2f m tall");
                 if (ImGui::IsItemHovered()) ImGui::SetTooltip("Drag a line on the floor: an invisible wall stands along it (Frame Home never draws it; it stops you)");
             } else {
-                ImGui::TextUnformatted("click: a seat \u00b7 drag: a row");
-                if (ImGui::IsItemHovered()) ImGui::SetTooltip("Click a cushion for a seat facing you, or drag along a sofa or bench for a row of seats facing your side");
+                ImGui::AlignTextToFramePadding();
+                ImGui::TextUnformatted("press, drag to aim \u00b7 " FS_MOD_KEY "+drag: a row");
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("Press where the seat goes and drag the way it faces (a click faces you).\n"
+                                                          FS_MOD_KEY "+drag a line along a sofa or bench: a row of seats, one every 60 cm.");
             }
             {   // what it draws (B cycles)
                 ImGui::SetCursorScreenPos(ImVec2(at.x + w + 16 * scale, at.y + 4 * scale));
@@ -8212,8 +9994,24 @@ struct Studio {
                     if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s (B cycles)", drawWhatName(static_cast<DrawWhat>(k)));
                 }
             }
+            if (drawWhat == DrawWhat::Floor) {   // its shapes (Q cycles), and clearing what's painted
+                const ImVec2 row(at.x, at.y + ImGui::GetFrameHeight() + 10 * scale);
+                const float rowW = ImGui::CalcTextSize("RoundSquareRectanglePolygon").x + ImGui::GetStyle().FramePadding.x * 8 + 6 * scale + 8 * scale +
+                                   (scene->world.walkPaint.empty() ? 0 : ImGui::CalcTextSize("Clear Painted Floor").x + ImGui::GetStyle().FramePadding.x * 2 + 10 * scale);
+                dl->AddRectFilled(row, ImVec2(row.x + rowW, row.y + ImGui::GetFrameHeight() + 8 * scale), col(kBar, 0.85f), 6 * scale);
+                ImGui::SetCursorScreenPos(ImVec2(row.x + 4 * scale, row.y + 4 * scale));
+                for (int k = 0; k < static_cast<int>(FloorShape::kCount); ++k) {
+                    if (k) ImGui::SameLine(0, 2 * scale);
+                    const FloorShape f = static_cast<FloorShape>(k);
+                    ImGui::PushStyleColor(ImGuiCol_Button, floorShape == f ? hex(kGo) : hex(kWidget, 0.55f));
+                    if (ImGui::Button(floorShapeName(f))) { floorShape = f; shapeCorners.clear(); }
+                    ImGui::PopStyleColor();
+                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s (Q cycles)", f == FloorShape::Round ? "Round brush" : f == FloorShape::Square ? "Square brush"
+                                                                              : f == FloorShape::Rect ? "Rectangle: drag corner to corner" : "Polygon: click its corners");
+                }
+            }
             if (drawWhat == DrawWhat::Floor && !scene->world.walkPaint.empty()) {
-                ImGui::SetCursorScreenPos(ImVec2(at.x + 4 * scale, at.y + ImGui::GetFrameHeight() + 14 * scale));
+                ImGui::SameLine(0, 10 * scale);
                 if (ImGui::Button("Clear Painted Floor")) clearPaint();
                 if (ImGui::IsItemHovered()) ImGui::SetTooltip("Take back everything painted or erased with the brush (Ctrl+Z undoes it)");
             }
@@ -8383,7 +10181,7 @@ struct Studio {
             timeline = ImGui::DockBuilderSplitNode(main, ImGuiDir_Down, timelineFrac, nullptr, &view);
             ImGui::DockBuilderDockWindow(kEditorWindow[2], right);
             ImGui::DockBuilderDockWindow(kEditorWindow[1], right);
-            showInspectorTab(InspectorTab::World);
+            showInspectorTab(InspectorTab::Navmesh);
             showWorld = true;
         } else if (workspace == 2) {              // Headset: Properties (Headset) wide, the Outliner under it
             right = ImGui::DockBuilderSplitNode(id, ImGuiDir_Right, 0.40f, nullptr, &main);
@@ -8391,7 +10189,7 @@ struct Studio {
             timeline = ImGui::DockBuilderSplitNode(main, ImGuiDir_Down, timelineFrac, nullptr, &view);
             ImGui::DockBuilderDockWindow(kEditorWindow[2], top);
             ImGui::DockBuilderDockWindow(kEditorWindow[1], bottom);
-            showInspectorTab(InspectorTab::Headset);
+            showInspectorTab(InspectorTab::Output, "Headset");
         } else {                                  // Layout
             right = ImGui::DockBuilderSplitNode(id, ImGuiDir_Right, 0.25f, nullptr, &main);
             top = ImGui::DockBuilderSplitNode(right, ImGuiDir_Up, 0.38f, nullptr, &bottom);
@@ -8515,18 +10313,24 @@ struct Studio {
         if (ImGui::MenuItem("Revert", nullptr, false, scene != nullptr)) revertAll();
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("Back to the home as it shipped, without your changes");
         ImGui::Separator();
-        if (ImGui::MenuItem(envFile.empty() ? "Save to My Environments" : "Save", "Ctrl+S", false, scene != nullptr && !saving && !uploading)) saveToLibrary();
+        if (ImGui::MenuItem("Save", "Ctrl+S", false, scene != nullptr && !saving && !uploading)) saveToLibrary();
         if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("%s", envFile.empty() ? "A new environment: saved into My Environments (Documents\\Frame Studio\\Environments) under its name"
-                                                    : ("Into " + envFile).c_str());
-        if (ImGui::MenuItem("Save As\u2026", "Ctrl+Shift+S", false, scene != nullptr && !saving && !uploading)) saveEnvironmentDialog();
+            ImGui::SetTooltip("%s", envFile.empty() ? "All of it, into My Environments (Documents\\Frame Studio\\Environments) as a new environment under its name"
+                                                    : ("All of it, into My Environments: " + narrow(fs::path(widen(envFile)).filename().wstring())).c_str());
+        if (ImGui::MenuItem("Export\u2026", "Ctrl+E", false, scene != nullptr && !saving && !uploading)) exportEnvironmentDialog();
+        if (ImGui::MenuItem("Export for Blender (.glb)\u2026", nullptr, false, scene != nullptr && !saving && !uploading && !blenderBusy)) exportBlenderDialog();
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("The environment as glTF (.glb) for Blender and other 3D tools: every object with its textures, and the sky.\n"
+                              "Beside it, <name>_navmesh.glb: the navmesh alone, with the colliders and the spawns, seats and\n"
+                              "hotspots, to delete or edit apart.");
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("A copy of all of it as a .fenv anywhere you choose (Save still keeps it in My Environments)");
         if (ImGui::BeginMenu("Auto-saved Versions", scene != nullptr)) {
             const std::vector<fs::path> v = versions();
             if (v.empty()) ImGui::TextDisabled("None yet: every 5 minutes with unsaved changes, one is kept (the last 10)");
             for (size_t i = 0; i < v.size(); ++i) {
                 ImGui::PushID(static_cast<int>(i) + 8000);
                 if (ImGui::MenuItem(narrow(v[i].stem().wstring()).c_str())) open({narrow(v[i].wstring())});
-                if (ImGui::IsItemHovered()) ImGui::SetTooltip("Opens this version on its own (Save As to make it the one you keep)");
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("Opens this version on its own (Save keeps it as an environment of its own)");
                 ImGui::PopID();
             }
             ImGui::EndMenu();
@@ -8569,7 +10373,7 @@ struct Studio {
         if (ImGui::MenuItem("Save Bundle As\u2026", nullptr, false, !bundleMembers.empty() && !bundleBusy)) saveBundleDialog();
         if (ImGui::MenuItem("Install on Steam Frame\u2026", nullptr, false, !bundleFile.empty() && !bundleDirty)) installBundle();
         ImGui::Separator();
-        if (ImGui::MenuItem("Bundle Panel")) showInspectorTab(InspectorTab::Bundle);
+        if (ImGui::MenuItem("Bundle Panel")) showInspectorTab(InspectorTab::Output, "Bundle");
     }
 
     void editMenu() {
@@ -8589,7 +10393,7 @@ struct Studio {
         if (ImGui::MenuItem("Send to Frame", nullptr, false, scene != nullptr && !sending)) sendToFrame();
         ImGui::Separator();
         if (ImGui::MenuItem("Install on Steam Frame\u2026")) openInstall();
-        if (ImGui::MenuItem("Headset Panel")) showInspectorTab(InspectorTab::Headset);
+        if (ImGui::MenuItem("Headset Panel")) showInspectorTab(InspectorTab::Output, "Headset");
         ImGui::Separator();
         if (ImGui::MenuItem("Headset Debug\u2026", nullptr, showHeadsetDebug)) {
             showHeadsetDebug = !showHeadsetDebug;
@@ -8627,6 +10431,17 @@ struct Studio {
         if (ImGui::MenuItem("Frame All", "Home", false, scene != nullptr)) frameAll();
         ImGui::Separator();
         if (ImGui::MenuItem("Player View", "Numpad 0")) cam.playerView();
+        if (ImGui::MenuItem("Copy Camera Position")) {   // (where the view is, "x,y,z,yaw,pitch" in metres and degrees: to report a spot)
+            float e[3];
+            cam.eye(e);
+            char b[128];
+            std::snprintf(b, sizeof b, "%.2f,%.2f,%.2f,%.1f,%.1f", e[0], e[1], e[2], cam.yaw * 57.29578f, cam.pitch * 57.29578f);
+            ImGui::SetClipboardText(b);
+            note(std::string("Camera position copied: ") + b);
+        }
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Copies where the view is (x,y,z,yaw,pitch) to paste when reporting a spot.");
+        if (ImGui::MenuItem("Walk Around", "V", walking, scene != nullptr)) { if (walking) stopWalking(); else startWalking(); }
+        if (ImGui::MenuItem("Take the Picture from the View", "F12", framingPicture, scene != nullptr)) { if (framingPicture) pictureWanted = true; else framePicture(true); }
         if (ImGui::BeginMenu("Viewpoint")) {
             if (ImGui::MenuItem("Top", "Numpad 7")) viewFrom(0, kPi * 0.5f - 0.001f);
             if (ImGui::MenuItem("Bottom", "Ctrl+Numpad 7")) viewFrom(0, -kPi * 0.5f + 0.001f);
@@ -8643,6 +10458,7 @@ struct Studio {
         if (ImGui::MenuItem("Show Everything")) {
             showMeshes = showWorld = true;
             for (bool& b : showCat) b = true;
+            showCat[kShowUnreached] = false;               // (floors nobody can get to: never shown)
             isolating = false;
             refreshVisibility();
         }
@@ -8657,7 +10473,7 @@ struct Studio {
     }
 
     void selectMenu() {
-        if (ImGui::MenuItem("None", "Alt+A", false, selected >= 0 || wKind >= 0 || splatSel >= 0)) { selected = splatSel = -1; wKind = wIndex = -1; }
+        if (ImGui::MenuItem("None", "Alt+A", false, selected >= 0 || wKind >= 0 || splatSel >= 0)) { selected = splatSel = -1; wKind = wIndex = -1; alsoSelected.clear(); }
         if (ImGui::MenuItem("Hide Selected", "H", false, selected >= 0 || splatSel >= 0)) { if (selected >= 0) toggleHidden(selected); else toggleSplatHidden(splatSel); }
         if (ImGui::MenuItem("Reveal Hidden", "Alt+H", false, scene != nullptr)) unhideAll();
     }
@@ -8692,7 +10508,7 @@ struct Studio {
             if (ImGui::MenuItem("Scale", "S", tool == Tool::Scale)) tool = Tool::Scale;
             ImGui::EndMenu();
         }
-        const bool objSel = on && selected >= 0 && canBeSurface(objects[selected]);
+        const bool objSel = on && selected >= 0 && canHaveCollision(objects[selected]);
         if (ImGui::BeginMenu("Surface", objSel)) {
             const int mode = surfaceMode(objects[selected]);
             for (int m = 0; m < kSurfModes; ++m) {
@@ -8715,8 +10531,19 @@ struct Studio {
             }
             ImGui::EndMenu();
         }
-        if (ImGui::MenuItem("Auto-generate Walkable Surfaces", nullptr, false, on)) autoGenerate();
+        if (ImGui::MenuItem("Auto-generate Navmesh", nullptr, false, on)) autoGenerate();
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("Bakes where you can walk from everything solid in the home and saves it with it:\nfloors with headroom you can reach from the start; furniture, plants and walls block; seams are bridged.\nObject Surfaces (Surface, Walk through) override it. Settings: Properties \u203a World.");
+        if (ImGui::MenuItem("Delete Navmesh", nullptr, false, on)) resetWalk();
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", kResetWalkTip);
+        ImGui::Separator();
+        if (ImGui::MenuItem("Edit Navmesh", "Tab", false, on)) editNavmesh();
+        if (ImGui::MenuItem("Draw Navmesh", nullptr, navDrawing, on)) { if (navDrawing) stopNavDraw(); else startNavDraw(); }
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Draw a piece of navmesh by points: click corner by corner on the floor, the first one again to close it");
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", kMakeNavmeshTip);
+        if (ImGui::MenuItem("Use Meta's Navmesh", nullptr, false, on && hasMetaNavmesh(*scene, scene->world))) useMetaNavmesh();
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Back to the navmesh this home's makers shipped (Meta's floor), in place of yours");
+        if (ImGui::MenuItem("Add Navmesh", nullptr, false, on)) addNavmesh();
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("A new 2 m square of navmesh on the floor where you're looking: Tab edits its corners");
         ImGui::Separator();
         if (ImGui::BeginMenu("Show/Hide", on)) {
             if (ImGui::MenuItem("Hide Selected", "H", false, selected >= 0)) toggleHidden(selected);
@@ -8751,7 +10578,7 @@ struct Studio {
         };
         ImDrawList* dl = ImGui::GetWindowDrawList();
         (void)dl;
-        if (iconToggle("##ovl", showWorld, "World layer (W): spawns, seats, surfaces, walls and the walkable area over the view\nRight-click: which kinds",
+        if (iconToggle("##ovl", showWorld, "World layer (W): spawns, seats, surfaces, walls and the navmesh over the view\nRight-click: which kinds",
                        [&](ImDrawList* d, ImVec2 c, float r) {   // stacked layers
                            for (int k = 1; k >= -1; --k) {
                                const float y = c.y + k * r * 0.45f;
@@ -8763,6 +10590,7 @@ struct Studio {
             ImGui::TextDisabled("Overlays");
             ImGui::Separator();
             for (int k = 0; k < kShowCats; ++k) {
+                if (k == kShowUnreached) continue;
                 ImGui::PushStyleColor(ImGuiCol_Text, hex(kShowColors[k]));
                 ImGui::MenuItem(kShowNames[k], nullptr, &showCat[k]);
                 ImGui::PopStyleColor();
@@ -8952,9 +10780,20 @@ struct Studio {
         ImGui::PopStyleColor();
     }
 
+    // Properties' header: the open tab's name and, as Blender's, a search field (panels and settings by name).
     void propertiesHeader() {
-        static const char* names[] = {"Object", "World", "Environment", "Bundle", "Headset"};
-        ImGui::TextDisabled("%s", names[static_cast<int>(inspectorTab)]);
+        ImGui::TextDisabled("%s", tabName(inspectorTab));
+        ImGui::SameLine(0, 10 * scale);
+        ImGui::SetNextItemWidth(std::clamp(ImGui::GetContentRegionAvail().x - (searching() ? ImGui::GetFrameHeight() + 8 * scale : 4 * scale), 40 * scale, 240 * scale));
+        ImGui::PushStyleColor(ImGuiCol_FrameBg, hex(kBar));
+        ImGui::InputTextWithHint("##propsearch", "⌕  Search", propSearch, sizeof propSearch);
+        ImGui::PopStyleColor();
+        tip("Find a panel or a setting by its name in the open tab");
+        if (searching()) {
+            ImGui::SameLine(0, 2 * scale);
+            if (ImGui::Button("✕##clearsearch", ImVec2(ImGui::GetFrameHeight(), 0))) propSearch[0] = 0;
+            tip("Clear the search");
+        }
     }
 
     void timelineHeader() {
@@ -9073,8 +10912,8 @@ struct Studio {
         ImGui::SetCursorScreenPos(ImVec2(a.x + pad, ImGui::GetCursorScreenPos().y + 6 * scale));
         {   // Draw: what it draws now (B again: floor, wall, seats)
             const char* help = drawWhat == DrawWhat::Wall ? " (B) \u00b7 drag a line on the floor: an invisible wall stands along it\nB again: Draw Seats"
-                             : drawWhat == DrawWhat::Seat ? " (B) \u00b7 click a cushion for a seat, drag along a sofa for a row\nB again: Draw Floor"
-                                                          : " (B) \u00b7 drag over any surface to paint walkable floor on it\nShift+drag erases floor \u00b7 [ and ] size the brush \u00b7 B again: Draw Wall";
+                             : drawWhat == DrawWhat::Seat ? " (B) \u00b7 press where the seat goes and drag the way it faces (a click faces you)\n" FS_MOD_KEY "+drag: a row of seats along a line \u00b7 B again: Draw Floor"
+                                                          : " (B) \u00b7 paint walkable floor on any surface, through grass and plants\nShapes (Q): round or square brush, rectangle, polygon \u00b7 Shift erases \u00b7 B again: Draw Wall";
             const std::string tip = std::string(drawWhatName(drawWhat)) + help;
             if (toolbarButton("##tFloor", ToolIcon::DrawFloor, tool == Tool::DrawFloor, tip.c_str(), side, kGo)) tool = Tool::DrawFloor;
         }
@@ -9173,20 +11012,8 @@ struct Studio {
         ImGui::BeginChild("##sidebar", ImVec2(w - tabW - 16 * scale, b.y - a.y - 16 * scale), ImGuiChildFlags_None);
         ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(4 * scale, 3 * scale));
         if (sidebarTab == 0) selectionTab();
-        else if (sidebarTab == 1) {
-            section("ACTIVE TOOL");
-            static const char* names[] = {"Move", "Rotate", "Scale", "Draw"};
-            fieldLabel("Tool");
-            ImGui::TextUnformatted(tool == Tool::DrawFloor ? drawWhatName(drawWhat) : names[static_cast<int>(tool)]);
-            fieldLabel("Orientation");
-            ImGui::TextUnformatted(localSpace ? "Local" : "Global");
-            fieldLabel("Snap");
-            ImGui::TextDisabled("hold Ctrl");
-            if (tool == Tool::DrawFloor) {
-                fieldLabel("Brush");
-                ImGui::SliderFloat("##sbBrush", &floorBrush, 0.05f, 3.0f, "%.2f m", ImGuiSliderFlags_Logarithmic);
-            }
-        } else {
+        else if (sidebarTab == 1) toolTab();   // (the same as Properties' Tool tab)
+        else {
             section("VIEW");
             fieldLabel("Fly speed");
             ImGui::DragFloat("##sbFly", &flySpeed, 0.05f, 0.1f, 100.0f, "%.1f m/s");
@@ -9210,7 +11037,11 @@ struct Studio {
         }
         if (ImGui::BeginPopup("##deleteAsk")) {
             ImGui::TextDisabled("OK?");
-            if (ImGui::MenuItem("Delete")) { if (wKind >= 0) deleteWorld(); else deleteSelected(); }
+            if (ImGui::MenuItem("Delete")) {
+                if (walkAreaPicked && selected < 0 && wKind < 0 && splatSel < 0) resetWalk();
+                else if (wKind >= 0) deleteWorld();
+                else deleteSelected();
+            }
             ImGui::EndPopup();
         }
     }
@@ -9221,7 +11052,7 @@ struct Studio {
         std::vector<Command> c = {
             {"Open", "Ctrl+O", true, [this] { openDialog(); }},
             {"Save", "Ctrl+S", on && !saving, [this] { saveToLibrary(); }},
-            {"Save As", "Ctrl+Shift+S", on && !saving, [this] { saveEnvironmentDialog(); }},
+            {"Export", "Ctrl+E", on && !saving, [this] { exportEnvironmentDialog(); }},
             {"Undo", "Ctrl+Z", !undo.empty(), [this] { step(undo, redo); }},
             {"Redo", "Ctrl+Shift+Z", !redo.empty(), [this] { step(redo, undo); }},
             {"Add Spawn Point", "", on, [this] { addWorld(kSpawn); }},
@@ -9232,7 +11063,13 @@ struct Studio {
             {"Add Gravity Zone", "", on, [this] { addGravity(WorldGravity::Direction); }},
             {"Import Models", "", on && !uploading, [this] { importModelDialog(); }},
             {"Add Vista", "", on && homePaths.size() == 1, [this] { addVistaDialog(); }},
-            {"Auto-generate Walkable Surfaces", "", on, [this] { autoGenerate(); }},
+            {"Auto-generate Navmesh", "", on, [this] { autoGenerate(); }},
+            {"Delete Navmesh", "", on, [this] { resetWalk(); }},
+            {"Edit Navmesh", "", on, [this] { editNavmesh(); }},
+            {"Draw Navmesh", "", on, [this] { startNavDraw(); }},
+            {"Use Meta's Navmesh", "", on && hasMetaNavmesh(*scene, scene->world), [this] { useMetaNavmesh(); }},
+            {"Add Navmesh", "", on, [this] { addNavmesh(); }},
+            {"Edit Mesh", "Tab", wKind == kCollider, [this] { toggleMeshEdit(); }},
             {"Delete", "X", sel, [this] { if (wKind >= 0) deleteWorld(); else deleteSelected(); }},
             {"Hide Selected", "H", selected >= 0, [this] { toggleHidden(selected); }},
             {"Reveal Hidden", "Alt+H", on, [this] { unhideAll(); }},
@@ -9343,7 +11180,7 @@ struct Studio {
         };
         ImGui::TextDisabled("Frame Studio %s", FRAME_VERSION);   // which build this is, bottom left
         ImGui::SameLine(0, 20 * scale);
-        if (scene && tool == Tool::DrawFloor) { mouseHint(0, drawWhat == DrawWhat::Floor ? "Draw floor (Shift: erase)" : drawWhat == DrawWhat::Wall ? "Draw a wall" : "Place seats"); mouseHint(2, "Rotate View"); mouseHint(1, "Fly"); }
+        if (scene && tool == Tool::DrawFloor) { mouseHint(0, drawWhat == DrawWhat::Floor ? "Draw floor (Shift: erase)" : drawWhat == DrawWhat::Wall ? "Draw a wall" : "Place a seat, drag to aim it (Ctrl: a row)"); mouseHint(2, "Rotate View"); mouseHint(1, "Fly"); }
         else if (scene) { mouseHint(0, "Select (drag a selected item to move it)"); mouseHint(2, "Rotate View"); mouseHint(1, "Context Menu / Fly"); }
         std::string right;
         {
@@ -9437,7 +11274,7 @@ struct Studio {
     // no game is running (in place of the default environment, not as a game or an extra app), plus the chosen
     // environments. The headset side is frame\install.sh beside this exe, with Frame Home's arm64 binaries.
 
-    void openInstall() { showInspectorTab(InspectorTab::Headset); }
+    void openInstall() { showInspectorTab(InspectorTab::Output, "Headset", "Install Frame Home"); }
 
     // The install list starts from the environments saved recently (once: after that it's yours).
     bool installEnvsSeeded = false;
@@ -9552,46 +11389,41 @@ struct Studio {
     }
 
     // The Headset tab's install part: Frame Home onto the headset, with environments.
+    // Output > Headset > Install Frame Home: what goes with it, and installing (or giving SteamVR its own back).
     void installPanel() {
         seedInstallEnvs();
-        ImGui::PushTextWrapPos(0);
-        ImGui::TextWrapped("Installs Frame Home on the headset as its environment. SteamVR runs it natively in place of the default "
-                           "environment whenever no game is running, and brings it back when a game quits. It is not a game or an extra app.");
-        ImGui::Spacing();
         ImGui::BeginDisabled(installing);
-        fieldLabel("Headset");
-        ImGui::InputText("##installHost", frameHost, sizeof frameHost);
-        ImGui::TextDisabled("an ssh alias, or steamos@<address>");
-        ImGui::Spacing();
-        ImGui::SeparatorText("Environments to install");
         if (scene) {
-            const std::string label = "The open home (" + homeName + ")" + (openHomeIsFenv() ? "" : ", saved as .fenv");
-            ImGui::Checkbox(label.c_str(), &installOpenHome);
+            const std::string t = "The open home (" + homeName + ")" + (openHomeIsFenv() ? "" : ", saved as .fenv");
+            fieldCheck("Open Home", &installOpenHome, t.c_str());
         }
         int remove = -1;
         for (size_t i = 0; i < installEnvs.size(); ++i) {
             ImGui::PushID(static_cast<int>(i));
-            if (ImGui::SmallButton("\u2715")) remove = static_cast<int>(i);
-            ImGui::SameLine();
+            fieldLabel(i ? "" : "With");
+            const float x = ImGui::GetCursorPosX(), w = ImGui::GetContentRegionAvail().x, bw = ImGui::GetFrameHeight();
             ImGui::TextUnformatted(narrow(fs::path(widen(installEnvs[i])).filename().wstring()).c_str());
+            tip(installEnvs[i].c_str());
+            ImGui::SameLine(x + w - bw);
+            if (listButton("x", "✕", "Leave it out")) remove = static_cast<int>(i);
             ImGui::PopID();
         }
         if (remove >= 0) installEnvs.erase(installEnvs.begin() + remove);
-        if (installEnvs.empty() && !scene) ImGui::TextDisabled("None yet: Frame Home alone (it keeps the environments already on the headset).");
-        if (ImGui::Button("Add .fenv or .fbundle\u2026")) addInstallEnvDialog();
-        ImGui::Spacing();
-        ImGui::Separator();
-        pushPrimary();
-        if (rowButton(installing ? "Installing\u2026###install" : "Install Frame Home###install", true)) startInstall(false);
-        ImGui::PopStyleColor(3);
-        if (rowButton("Restore SteamVR's Environment")) startInstall(true);
+        buttonRow(3);
+        if (rowButton("Add…", "A .fenv or .fbundle to install with it (none: Frame Home alone; it keeps the environments already on the headset)"))
+            addInstallEnvDialog();
+        if (rowButton(installing ? "Installing…###install" : "Install###install",
+                      "Installs Frame Home on the headset as its environment. SteamVR runs it natively in place of the default\n"
+                      "environment whenever no game is running, and brings it back when a game quits. It is not a game or an extra app.",
+                      true, Look::Primary))
+            startInstall(false);
+        if (rowButton("Restore", "Give SteamVR its own environment back on the headset")) startInstall(true);
         ImGui::EndDisabled();
-        ImGui::Spacing();
-        ImGui::TextWrapped("%s", getInstallStatus().c_str());
-        ImGui::PopTextWrapPos();
+        const std::string st = getInstallStatus();
+        if (!st.empty()) hint(st.c_str());
     }
 
-    // ── Bundles (Inspector › Bundle, the Bundle menu): several environments packed into one .fbundle ──
+    // ── Bundles (Properties › Output › Bundle, the Bundle menu): several environments packed into one .fbundle ──
     // Each member stays its own environment; on the headset Frame Home unpacks a bundle into them. A member is a .fenv
     // on disk, or one inside the bundle that was opened (unpacked when it's needed: opened, saved into another bundle).
     struct BundleMember {
@@ -9688,7 +11520,7 @@ struct Studio {
         bundleName.clear();
         bundleDirty = false;
         setBundleStatus("");
-        showInspectorTab(InspectorTab::Bundle);
+        showInspectorTab(InspectorTab::Output, "Bundle");
     }
 
     void openBundle(const std::string& path) {
@@ -9714,7 +11546,7 @@ struct Studio {
         bundleName = bm.name.empty() ? narrow(fs::path(widen(path)).stem().wstring()) : bm.name;
         bundleDirty = false;
         setBundleStatus("");
-        showInspectorTab(InspectorTab::Bundle);
+        showInspectorTab(InspectorTab::Output, "Bundle");
     }
 
     void openBundleDialog() {
@@ -9742,7 +11574,7 @@ struct Studio {
             bundleMembers.push_back(std::move(m));
             bundleDirty = true;
         }
-        showInspectorTab(InspectorTab::Bundle);
+        showInspectorTab(InspectorTab::Output, "Bundle");
     }
 
     void addToBundleDialog() {
@@ -9875,12 +11707,12 @@ struct Studio {
         });
     }
 
-    // The saved bundle goes onto the install list, and the Headset tab opens to install it.
+    // The saved bundle goes onto the install list, and Output › Headset › Install Frame Home opens to install it.
     void installBundle() {
         if (bundleFile.empty() || bundleDirty) return;
         seedInstallEnvs();
         if (std::find(installEnvs.begin(), installEnvs.end(), bundleFile) == installEnvs.end()) installEnvs.push_back(bundleFile);
-        showInspectorTab(InspectorTab::Headset);
+        showInspectorTab(InspectorTab::Output, "Headset", "Install Frame Home");
     }
 
     // What the background work left for the UI thread: a member to open, a bundle file saved.
@@ -9900,30 +11732,16 @@ struct Studio {
         if (!openNow.empty()) open(openNow);
     }
 
-    // Inspector › Bundle.
-    void bundleTab() {
-        section("BUNDLE");
-        ImGui::PushTextWrapPos(0);
-        ImGui::TextDisabled("Several environments in one file, to share or install together. Each stays its own environment on the headset.");
-        ImGui::PopTextWrapPos();
-        ImGui::Spacing();
+    // Output > Bundle: several environments in one file, to share or install together (each stays its own
+    // environment on the headset).
+    void bundlePanel() {
         ImGui::BeginDisabled(bundleBusy);
         fieldLabel("Name");
         {
             char nb[128];
             std::snprintf(nb, sizeof nb, "%s", bundleName.c_str());
             if (ImGui::InputTextWithHint("##bundlename", "New bundle", nb, sizeof nb)) { bundleName = nb; bundleDirty = true; }
-        }
-        if (!bundleFile.empty()) {
-            ImGui::TextDisabled("%s%s", narrow(fs::path(widen(bundleFile)).filename().wstring()).c_str(), bundleDirty ? " (changed)" : "");
-            if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", bundleFile.c_str());
-        }
-
-        ImGui::SeparatorText("Environments");
-        if (bundleMembers.empty()) {
-            ImGui::PushTextWrapPos(0);
-            ImGui::TextDisabled("None yet. Add the open environment, environments from My Environments, or any .fenv.");
-            ImGui::PopTextWrapPos();
+            tip(bundleFile.empty() ? "Not saved yet" : (bundleFile + (bundleDirty ? " (changed)" : "")).c_str());
         }
         const float thumbW = 64 * scale, rowH = std::max(thumbW * 9 / 16, ImGui::GetTextLineHeight() * 2 + 4 * scale);
         int remove = -1, openIt = -1, moveUp = -1;
@@ -9940,46 +11758,46 @@ struct Studio {
                 const float h = std::min(rowH, thumbW * m.thumbAspect), w = h / m.thumbAspect;
                 const ImVec2 p((a.x + t1.x - w) * 0.5f, (a.y + t1.y - h) * 0.5f);
                 dl->AddImage((ImTextureID)m.thumb, p, ImVec2(p.x + w, p.y + h));
-            } else dl->AddRectFilled(a, t1, col(0x3f9a5c, 0.22f), 4 * scale);
+            } else dl->AddRectFilled(a, t1, col(kWidget), 4 * scale);
             const float tx = t1.x + 8 * scale, lh = ImGui::GetTextLineHeight();
             const float right = ImGui::GetContentRegionMax().x + ImGui::GetWindowPos().x;
             dl->PushClipRect(ImVec2(tx, a.y), ImVec2(right - 52 * scale, a.y + rowH), true);
             dl->AddText(ImVec2(tx, a.y + rowH * 0.5f - lh - 1 * scale), col(kText), m.name.c_str());
             char sub[64];
-            std::snprintf(sub, sizeof sub, "%.0f MB%s", static_cast<double>(m.size) / 1048576.0, m.member.empty() ? "" : " \u00b7 in the bundle");
+            std::snprintf(sub, sizeof sub, "%.0f MB%s", static_cast<double>(m.size) / 1048576.0, m.member.empty() ? "" : " · in the bundle");
             dl->AddText(ImVec2(tx, a.y + rowH * 0.5f + 1 * scale), col(kDim), sub);
             dl->PopClipRect();
-            if (ImGui::InvisibleButton("##row", ImVec2(std::max(1.0f, right - a.x - 52 * scale), rowH)) ) {}
+            ImGui::InvisibleButton("##row", ImVec2(std::max(1.0f, right - a.x - 52 * scale), rowH));
             if (ImGui::IsItemHovered()) {
-                ImGui::SetTooltip("%s\n%s\nDouble-click to open it", m.name.c_str(), m.member.empty() ? m.path.c_str() : (m.path + " \u203a " + m.member).c_str());
+                ImGui::SetTooltip("%s\n%s\nDouble-click to open it", m.name.c_str(), m.member.empty() ? m.path.c_str() : (m.path + " › " + m.member).c_str());
                 if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) openIt = static_cast<int>(i);
             }
             ImGui::SameLine(0, 4 * scale);
             ImGui::BeginGroup();
             ImGui::BeginDisabled(i == 0);
-            if (ImGui::SmallButton("\u25b2")) moveUp = static_cast<int>(i);
+            if (ImGui::SmallButton("▲")) moveUp = static_cast<int>(i);
             ImGui::EndDisabled();
-            if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("Move up: the first one is the one shown after installing");
-            if (ImGui::SmallButton("\u2715")) remove = static_cast<int>(i);
-            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Take it out of the bundle (the file itself stays)");
+            tip("Move up: the first one is the one shown after installing");
+            if (ImGui::SmallButton("✕")) remove = static_cast<int>(i);
+            tip("Take it out of the bundle (the file itself stays)");
             ImGui::EndGroup();
             ImGui::PopID();
-            ImGui::Dummy(ImVec2(0, 2 * scale));
         }
         if (moveUp > 0) { std::swap(bundleMembers[static_cast<size_t>(moveUp)], bundleMembers[static_cast<size_t>(moveUp) - 1]); bundleDirty = true; }
         if (remove >= 0) removeFromBundle(static_cast<size_t>(remove));
         if (openIt >= 0) openBundleMember(static_cast<size_t>(openIt));
-        if (!bundleMembers.empty()) ImGui::TextDisabled("%zu environment%s \u00b7 %.0f MB", bundleMembers.size(), bundleMembers.size() == 1 ? "" : "s", static_cast<double>(total) / 1048576.0);
-
-        ImGui::Spacing();
+        if (bundleMembers.empty()) hint("No environments in it yet.");
+        else {
+            char t[80];
+            std::snprintf(t, sizeof t, "%zu environment%s · %.0f MB", bundleMembers.size(), bundleMembers.size() == 1 ? "" : "s", static_cast<double>(total) / 1048576.0);
+            hint(t);
+        }
         const std::string here = openEnvFile();
-        ImGui::BeginDisabled(here.empty());
-        if (rowButton("Add the Open Environment", true)) addToBundle({here});
-        ImGui::EndDisabled();
-        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-            ImGui::SetTooltip("%s", here.empty() ? "Save it first (Ctrl+S): a bundle holds saved environments"
-                                                 : dirty ? "As it was last saved: save first (Ctrl+S) to include your latest changes" : here.c_str());
-        if (rowButton("My Environments \u25be")) ImGui::OpenPopup("##mine");
+        buttonRow(3);
+        if (rowButton("Add Open", here.empty() ? "Save it first (Ctrl+S): a bundle holds saved environments"
+                                               : dirty ? "As it was last saved: save first (Ctrl+S) to include your latest changes" : here.c_str(), !here.empty()))
+            addToBundle({here});
+        if (rowButton("Add Mine ▾", "One of My Environments")) ImGui::OpenPopup("##mine");
         if (ImGui::BeginPopup("##mine")) {
             const std::vector<std::string> mine = libraryEnvs();
             if (mine.empty()) ImGui::TextDisabled("None yet: Save (Ctrl+S) puts what you make here");
@@ -9990,35 +11808,21 @@ struct Studio {
             }
             ImGui::EndPopup();
         }
-        if (rowButton("Add .fenv\u2026")) addToBundleDialog();
-
-        ImGui::Spacing();
-        ImGui::Separator();
-        ImGui::BeginDisabled(bundleMembers.empty());
-        pushPrimary();
-        if (rowButton(bundleFile.empty() ? "Save Bundle\u2026###savebundle" : "Save Bundle###savebundle", true)) {
+        if (rowButton("Add .fenv…", "Any saved environment file")) addToBundleDialog();
+        const bool saved = !bundleFile.empty() && !bundleDirty, any = !bundleMembers.empty();
+        buttonRow(4);
+        if (rowButton("Save###savebundle", bundleFile.empty() ? "Save the bundle as a .fbundle" : bundleFile.c_str(), any, Look::Primary)) {
             if (bundleFile.empty()) saveBundleDialog(); else saveBundle(bundleFile);
         }
-        ImGui::PopStyleColor(3);
-        if (rowButton("Save Bundle As\u2026")) saveBundleDialog();
-        ImGui::EndDisabled();
-        const bool saved = !bundleFile.empty() && !bundleDirty;
-        ImGui::BeginDisabled(!saved);
-        if (rowButton("Install on Steam Frame\u2026", true)) installBundle();
-        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-            ImGui::SetTooltip("%s", saved ? "Adds it to the Headset tab's install list: Frame Home unpacks it there into its environments"
-                                          : "Save the bundle first");
-        if (rowButton("Unpack into My Environments")) unpackBundle();
-        ImGui::EndDisabled();
+        if (rowButton("Save As…", "Save the bundle as another .fbundle", any)) saveBundleDialog();
+        if (rowButton("Install…", saved ? "Adds it to Headset › Install Frame Home: Frame Home unpacks it there into its environments" : "Save the bundle first",
+                      any && saved))
+            installBundle();
+        if (rowButton("Unpack", saved ? "Unpack it into My Environments" : "Save the bundle first", any && saved)) unpackBundle();
         ImGui::EndDisabled();
         std::string st;
         { std::lock_guard<std::mutex> l(statusMutex); st = bundleStatus; }
-        if (!st.empty()) {
-            ImGui::Spacing();
-            ImGui::PushTextWrapPos(0);
-            ImGui::TextUnformatted(st.c_str());
-            ImGui::PopTextWrapPos();
-        }
+        if (!st.empty()) hint(st.c_str());
     }
 
     // A world point on the viewport (false behind the camera).
@@ -10045,13 +11849,15 @@ struct Studio {
         static const char* rows[][2] = {
             {"Orbit", "Middle drag, or Alt + left drag"}, {"Pan", "Shift + middle drag"}, {"Zoom", "Wheel, or Ctrl + middle drag"},
             {"Fly", "Hold right mouse + W A S D, Q / E down / up"}, {"Fly speed", "Wheel while flying, Shift = 4x"},
+            {"Walk around (as on the headset)", "V: W A S D, drag to look, Shift to run, V or Esc back"},
+            {"The environment's picture", "F12: frame it, Enter: take it, Esc: cancel"},
             {"Select", "Left click (viewport or explorer)"}, {"Move / Rotate / Scale", "G / R / S, hold Ctrl to snap"},
             {"Frame selected / all", "F / Home (or double-click a row)"}, {"Player view", "Numpad 0 or P"},
             {"Hide / reveal hidden", "H / Alt + H"}, {"Delete", "X (asks) or Delete"}, {"Undo / redo", "Ctrl + Z / Ctrl + Shift + Z"},
             {"Open / save edits", "Ctrl + O / Ctrl + S"}, {"Show only selected", "I (I or Esc shows everything)"},
             {"Show / hide world layer", "W (each kind: View \u203a Show, or the eyes in the explorer)"},
             {"Floor / wall from a mesh", "Properties \u203a Object \u203a Surface, or right-click it"},
-            {"Every mesh walkable where flat, blocking where steep", "Object \u203a Auto-generate Walkable Surfaces"},
+            {"Every mesh walkable where flat, blocking where steep", "Object \u203a Auto-generate Navmesh"},
             {"Add at the view's centre", "Shift + A"}, {"Find any command", "F3"},
             {"Toolbar / sidebar", "T / N"}, {"Front / right / top view", "Numpad 1 / 3 / 7"},
             {"Maximize the 3D Viewport", "Ctrl + Space"}, {"Play / pause", "Space"},
@@ -10153,12 +11959,18 @@ struct SelfTest {
     float wallAt[3] = {};
     std::shared_ptr<HomeWorld> worldBefore;
 
-    SelfTest(Studio& app, std::vector<std::string> p) : a(app), paths(std::move(p)) {
+    bool autoCheck = false;                 // --autocheck: only what Studio does by itself, home after home
+    SelfTest(Studio& app, std::vector<std::string> p, bool autoCheckOnly = false) : a(app), paths(std::move(p)), autoCheck(autoCheckOnly) {
         dir = dataDir() / L"selftest";
         std::error_code ec;
         fs::create_directories(dir, ec);
-        report = platform::openFile((dir / L"report.txt").c_str(), "wb");
+        report = platform::openFile((dir / (autoCheck ? L"autocheck.txt" : L"report.txt")).c_str(), "wb");
         a.testing = true;
+        if (autoCheck) {
+            log("Frame Studio: what it does by itself, checked");
+            buildAutoCheck();
+            return;
+        }
         log("Frame Studio self-test");
         for (const auto& h : paths) log("home: %s", h.c_str());
         // A .fenv saves back into itself (Save Edits, Ctrl+S): the test works on a copy in its scratch library, so
@@ -10237,13 +12049,13 @@ struct SelfTest {
         if (!queue.empty()) return;                      // input still playing
         if (wait > 0) { --wait; return; }
         if (stage >= stages.size()) return;
-        if (std::chrono::steady_clock::now() - started > std::chrono::minutes(6)) { check(false, "finished in time"); stage = stages.size(); finish(); return; }
+        if (!autoCheck && std::chrono::steady_clock::now() - started > std::chrono::minutes(6)) { check(false, "finished in time"); stage = stages.size(); finish(); return; }
         const int w = stages[stage]();
         if (w < 0) {   // still waiting: a minute, but at least 3000 frames (a software GPU draws ~30 a second, and a gizmo
                        // probe takes a frame a step); 5 minutes at most whatever the frame rate
             if (polls++ == 0) pollStart = std::chrono::steady_clock::now();
             const auto waited = std::chrono::steady_clock::now() - pollStart;
-            if ((waited > std::chrono::seconds(60) && polls > 3000) || waited > std::chrono::minutes(5)) {
+            if (autoCheck ? waited > std::chrono::minutes(20) : ((waited > std::chrono::seconds(60) && polls > 3000) || waited > std::chrono::minutes(5))) {
                 check(false, "a stage timed out", std::to_string(stage)); polls = 0; ++stage;
             }
             return;
@@ -10352,6 +12164,710 @@ struct SelfTest {
         return m;
     }
 
+    // ── --autocheck <home...>: each home opened as Studio opens it, then Auto-generate, checked: the walkable area,
+    //    the spawn (on the area, room round it, facing a view), every seat standing you up on the area, and Draw
+    //    Seats' snapping against the seats the home's makers placed. Pictures from each spawn and from above. ──
+    bool homeOpen = false, wallDrawn = false;
+    // Plants (trees, bushes, grass) stay yours to edit: each one's collision set by hand changes how you walk, and
+    // it copies in place.
+    std::vector<int> plantTargets;
+    std::shared_ptr<HomeWorld> plantWorld;
+    float plantAreaBlocked = 0;
+    std::shared_ptr<const WalkGrid> plantAsCollider;
+    // The plant as a Collider against walked through, where its own surface is: floor you walk through it to
+    // (stopped as a Collider), floor that was its own top (stood on as a Collider), and floor within a body's height
+    // of it at all (none: it hangs or stands where nobody walks, and the setting changes nothing there)
+    struct PlantDiff { int through = 0, stoodOn = 0, reach = 0; };
+    static bool okAt(const WalkGrid& g, float x, float z, float y) {
+        int cx, cz;
+        if (!g.cellOf(x, z, cx, cz)) return false;
+        for (const WalkSpan* q = g.begin(cx, cz); q != g.end(cx, cz); ++q)
+            if ((q->flags & kWalkOk) && std::fabs(q->hi - y) < 0.1f) return true;
+        return false;
+    }
+    PlantDiff plantDiff(const Object& o, const WalkGrid& collider, const WalkGrid& through) {
+        // the plant's own surface, sampled about a cell apart: where it's within a body's height over walkable floor
+        // (walked through), that floor against the Collider's; where the Collider had floor at its height, its top
+        PlantDiff d;
+        const float cell = through.p.cell;
+        std::set<std::tuple<int, int, int>> reach, stood;   // (cell x, cell z, floor height in cm)
+        a.worldTris(o, [&](size_t, const float* p0, const float* p1, const float* p2, const float*, float) {
+            const float L = std::max({dist3(p0, p1), dist3(p1, p2), dist3(p2, p0)});
+            const int n = std::clamp(static_cast<int>(std::ceil(L / cell)), 1, 24);
+            for (int i = 0; i <= n; ++i)
+                for (int j = 0; i + j <= n; ++j) {
+                    const float u = static_cast<float>(i) / n, v = static_cast<float>(j) / n, w = 1 - u - v;
+                    const float x = p0[0] * w + p1[0] * u + p2[0] * v, y = p0[1] * w + p1[1] * u + p2[1] * v, z = p0[2] * w + p1[2] * u + p2[2] * v;
+                    int cx, cz;
+                    if (through.cellOf(x, z, cx, cz))
+                        for (const WalkSpan* q = through.begin(cx, cz); q != through.end(cx, cz); ++q)
+                            if ((q->flags & kWalkOk) && y >= q->hi - 0.05f && y <= q->hi + 1.8f &&
+                                reach.insert({cx, cz, static_cast<int>(std::lround(q->hi * 100))}).second)
+                                d.through += !okAt(collider, x, z, q->hi);
+                    if (collider.cellOf(x, z, cx, cz))
+                        for (const WalkSpan* q = collider.begin(cx, cz); q != collider.end(cx, cz); ++q)
+                            if ((q->flags & kWalkOk) && std::fabs(q->hi - y) < 0.1f && !okAt(through, x, z, q->hi) &&
+                                stood.insert({cx, cz, static_cast<int>(std::lround(q->hi * 100))}).second)
+                                ++d.stoodOn;
+                }
+        });
+        d.reach = static_cast<int>(reach.size());
+        return d;
+    }
+    // Saved and opened again: what was set by hand before the save
+    struct HandSet {
+        fs::path file;
+        std::vector<WorldPoint> seats;
+        size_t spawns = 0, colliders = 0;
+        std::string plant, moved;   // (object names)
+        float movedAt[3] = {0, 0, 0};
+    } handSet;
+    void objectMiddle(const Object& o, float* c) {
+        float mn[3], mx[3];
+        a.worldBounds(o, mn, mx);
+        for (int k = 0; k < 3; ++k) c[k] = (mn[k] + mx[k]) * 0.5f;
+    }
+    void listPlants() {
+        plantTargets.clear();
+        std::vector<std::pair<float, int>> plants;
+        for (size_t i = 0; i < a.objects.size(); ++i) {
+            const Object& o = a.objects[i];
+            if (o.deleted || o.category != kPlants) continue;
+            float mn[3], mx[3];
+            a.worldBounds(o, mn, mx);
+            plants.push_back({mx[1] - mn[1], static_cast<int>(i)});
+        }
+        if (plants.empty()) { log("  plants: none"); return; }
+        std::sort(plants.rbegin(), plants.rend());
+        log("  plants: %zu", plants.size());
+        for (size_t k = 0; k < plants.size() && k < 8; ++k) {
+            const Object& o = a.objects[plants[k].second];
+            float mn[3], mx[3];
+            a.worldBounds(o, mn, mx);
+            log("    %-50s %5.1f x %4.1f x %5.1f m  %s%s%s", o.label.substr(0, 50).c_str(), mx[0] - mn[0], mx[1] - mn[1], mx[2] - mn[2],
+                a.canHaveCollision(o) ? "collision settable" : "NO COLLISION SETTING", a.objectCopyable(o) ? ", copies" : ", DOESN'T COPY",
+                a.renderer.meshDynamic(o.mesh) ? " (moves: wind)" : "");
+        }
+        plantTargets.push_back(plants.front().second);                  // the tallest (a tree)...
+        if (plants.size() > 1) plantTargets.push_back(plants.back().second);   // ...and the lowest (grass)
+    }
+    void plantCopies(int i) {
+        const Object& o = a.objects[i];
+        if (!a.objectCopyable(o)) { log("  %s: not copied (%s)", o.label.c_str(), "an animated object: Studio can't copy those yet"); return; }
+        a.selected = i; a.wKind = a.wIndex = -1; a.splatSel = -1;
+        const size_t n = a.objects.size();
+        const bool ok = a.duplicateSelection() && a.objects.size() == n + 1;
+        check(ok, "a plant duplicates in place", o.label + (ok ? "" : ": " + a.clipNote));
+        if (ok) a.deleteSelected();
+    }
+    static std::string stemOf(const std::string& path) { return narrow(fs::path(widen(path)).stem().wstring()); }
+    void saveRendered(const std::vector<u8>& png, const std::string& name) {
+        if (png.empty()) { log("  (no picture %s)", name.c_str()); return; }
+        const fs::path file = dir / widen(name + ".png");
+        if (FILE* f = platform::openFile(file.c_str(), "wb")) { std::fwrite(png.data(), 1, png.size(), f); std::fclose(f); log("  picture %s", narrow(file.wstring()).c_str()); }
+    }
+    // The area, spawns and seats as they stand now.
+    void reportWorld(const char* when) {
+        const WalkGrid* g = a.walkShown.get();
+        const HomeWorld& w = a.scene->world;
+        log("  %s: walkable %.1f m\u00b2 in %d area(s) (%.1f m\u00b2 out of reach), %zu spawns, %zu seats, %zu surfaces", when,
+            a.walkReport.walkArea, a.walkReport.areas, a.walkReport.unreachedArea, w.spawns.size(), w.seats.size(), w.colliders.size());
+        if (!g) { check(false, "there's a walkable area", when); return; }
+        check(g->any(), "there's a walkable area", when);
+        for (size_t i = 0; i < w.spawns.size(); ++i) {
+            const WorldPoint& sp = w.spawns[i];
+            float h = sp.pos[1];
+            const bool floor = g->floorAt(sp.pos[0], sp.pos[2], sp.pos[1] + 0.5f, 0.6f, 3.0f, h);
+            const bool on = floor && g->walkable(sp.pos[0], sp.pos[2], h);
+            int cx = 0, cz = 0;
+            const WalkSpan* span = g->cellOf(sp.pos[0], sp.pos[2], cx, cz) ? g->walkNear(cx, cz, h, 0.1f, kWalkOk) : nullptr;
+            const float clear = span ? span->dist * 0.01f : 0;
+            const float view = spawnpick::sightline(*g, sp.pos[0], h + spawnpick::kEyeHeight, sp.pos[2], -std::sin(sp.yaw), -std::cos(sp.yaw));
+            const float best = spawnpick::bestFacing(*g, sp.pos[0], h, sp.pos[2]);
+            const float bestView = spawnpick::sightline(*g, sp.pos[0], h + spawnpick::kEyeHeight, sp.pos[2], -std::sin(best), -std::cos(best));
+            char d[256];
+            std::snprintf(d, sizeof d, "%s at (%.2f %.2f %.2f) facing %.0f\u00b0: %.2f m of room, %.1f m of view ahead (best way %.1f m)", sp.name.c_str(),
+                          sp.pos[0], h, sp.pos[2], sp.yaw * 57.2958f, clear, view, bestView);
+            const bool floatingAtOrigin = !floor && std::hypot(sp.pos[0], sp.pos[2]) < 0.01f && std::fabs(sp.pos[1]) < 0.01f;
+            check(on || floatingAtOrigin, floatingAtOrigin ? "a spawn floats at the origin (no floor there: seen from where it's made to be)"
+                                                          : "a spawn stands on the walkable area", d);
+            if (floatingAtOrigin) continue;
+            if (sp.name == "Auto spawn") {
+                check(clear >= 0.5f || a.walkReport.walkArea < 6, "...the Auto spawn has room round it", d);
+                check(view >= std::min(4.0f, bestView * 0.6f), "...and faces a view, not a wall", d);
+            }
+        }
+        int exitsOk = 0;
+        std::string bad;
+        for (const WorldPoint& st : w.seats) {
+            float spot[3];
+            bool own = false;
+            const bool ok = g->seatExit(st, spot, &own) && own;
+            exitsOk += ok;
+            if (!ok && bad.size() < 300) bad += (bad.empty() ? "" : ", ") + st.name;
+        }
+        if (!w.seats.empty()) check(exitsOk == static_cast<int>(w.seats.size()), "every seat stands you up on the walkable area",
+                                    std::to_string(exitsOk) + " of " + std::to_string(w.seats.size()) + (bad.empty() ? "" : "; not: " + bad));
+    }
+    // The walkable area from above, one pixel a cell (scaled up to ~1200 px): walkable green, out of reach grey,
+    // things standing (furniture, walls, rocks) brown, nothing black; spawns red with their facing, seats yellow.
+    void saveAreaMap(const std::string& name) {
+        const WalkGrid* g = a.walkShown.get();
+        if (!g || g->nx < 2 || g->nz < 2) return;
+        // just the part with floor in it (a home's grid runs out to its far scenery)
+        int x0 = g->nx, x1 = -1, z0 = g->nz, z1 = -1;
+        for (int z = 0; z < g->nz; ++z)
+            for (int x = 0; x < g->nx; ++x)
+                for (const WalkSpan* q = g->begin(x, z); q != g->end(x, z); ++q)
+                    if (q->flags & (kWalkOk | kWalkUnreached)) { x0 = std::min(x0, x); x1 = std::max(x1, x); z0 = std::min(z0, z); z1 = std::max(z1, z); }
+        if (x1 < x0) return;
+        x0 = std::max(0, x0 - 10); z0 = std::max(0, z0 - 10); x1 = std::min(g->nx - 1, x1 + 10); z1 = std::min(g->nz - 1, z1 + 10);
+        const int w = x1 - x0 + 1, h = z1 - z0 + 1, k = std::max(1, std::min(8, 1200 / std::max(w, h)));
+        std::vector<u8> img(static_cast<size_t>(w) * k * h * k * 4, 0);
+        auto put = [&](int px, int py, uint32_t c) {
+            if (px < 0 || py < 0 || px >= w * k || py >= h * k) return;
+            u8* d = &img[(static_cast<size_t>(py) * w * k + px) * 4];
+            d[0] = c >> 16 & 255; d[1] = c >> 8 & 255; d[2] = c & 255; d[3] = 255;
+        };
+        for (int z = z0; z <= z1; ++z)
+            for (int x = x0; x <= x1; ++x) {
+                uint32_t c = 0x101010;
+                for (const WalkSpan* q = g->begin(x, z); q != g->end(x, z); ++q) {
+                    if (q->flags & kWalkOk) { c = 0x3fbf5a; break; }
+                    if (q->flags & kWalkUnreached) c = 0x7a7a7a;
+                    else if (c == 0x101010) c = 0x5a4632;
+                }
+                for (int j = 0; j < k; ++j) for (int i = 0; i < k; ++i) put((x - x0) * k + i, (z - z0) * k + j, c);
+            }
+        auto mark = [&](const WorldPoint& p, uint32_t c, int r, bool arrow) {
+            const float fx = ((p.pos[0] - g->ox) / g->p.cell - x0) * k, fz = ((p.pos[2] - g->oz) / g->p.cell - z0) * k;
+            for (int j = -r; j <= r; ++j) for (int i = -r; i <= r; ++i) if (i * i + j * j <= r * r) put(static_cast<int>(fx) + i, static_cast<int>(fz) + j, c);
+            if (arrow) for (int t = 0; t < r * 5; ++t) put(static_cast<int>(fx - std::sin(p.yaw) * t), static_cast<int>(fz - std::cos(p.yaw) * t), c);
+        };
+        for (const WorldPoint& st : a.scene->world.seats) mark(st, 0xffd23c, std::max(2, k), true);
+        for (const WorldPoint& sp : a.scene->world.spawns) mark(sp, 0xff3c3c, std::max(3, k * 2), true);
+        std::vector<u8> png;
+        stbi_write_png_to_func([](void* ctx, void* data, int size) {
+            auto* v = static_cast<std::vector<u8>*>(ctx);
+            v->insert(v->end(), static_cast<u8*>(data), static_cast<u8*>(data) + size);
+        }, &png, w * k, h * k, 4, img.data(), w * k * 4);
+        log("  area map: %.1f x %.1f m shown, %d px a cell (green walkable, grey out of reach, brown things standing)", w * g->p.cell, h * g->p.cell, k);
+        saveRendered(png, name);
+    }
+
+    // ── The trim, checked: the home from spots spread over the walkable area (the spawn first), four ways each, and
+    //    from outside it, before and after World > Trim What Can't Be Seen. From where you can stand nothing may
+    //    change; outside, what was trimmed shows (expected: the backs of things). ──
+    struct View { float eye[3]; float yaw, pitch; bool inside; std::string name; };
+    struct Shot { std::vector<u8> rgba; uint32_t w = 0, h = 0; };
+    std::vector<View> trimViews;
+    std::vector<Shot> trimBefore;
+    size_t trisBefore = 0;
+    std::vector<size_t> meshTrisBefore;
+    void chooseTrimViews() {
+        trimViews.clear();
+        const WalkGrid* g = a.walkShown.get();
+        std::vector<std::array<float, 3>> spots;
+        if (!a.scene->world.spawns.empty()) {
+            const WorldPoint& sp = a.scene->world.spawns[0];
+            float f = sp.pos[1];
+            if (g) g->floorAt(sp.pos[0], sp.pos[2], sp.pos[1] + 0.5f, 0.6f, 3.0f, f);
+            spots.push_back({sp.pos[0], f, sp.pos[2]});
+        }
+        if (g) {                                         // three more, each as far as can be from the ones before
+            std::vector<std::array<float, 3>> cells;
+            for (int z = 0; z < g->nz; z += 2)
+                for (int x = 0; x < g->nx; x += 2)
+                    for (const WalkSpan* q = g->begin(x, z); q != g->end(x, z); ++q)
+                        if ((q->flags & kWalkOk) && q->dist >= 40) cells.push_back({g->centerX(x), q->hi, g->centerZ(z)});
+            for (int k = 0; k < 3 && !cells.empty(); ++k) {
+                float best = -1;
+                size_t bi = 0;
+                for (size_t i = 0; i < cells.size(); ++i) {
+                    float dmin = 1e30f;
+                    for (const auto& s : spots) dmin = std::min(dmin, std::hypot(cells[i][0] - s[0], cells[i][2] - s[2]) + 3 * std::fabs(cells[i][1] - s[1]));
+                    if (spots.empty()) dmin = 0;
+                    if (dmin > best) { best = dmin; bi = i; }
+                }
+                if (best < 2.0f && !spots.empty()) break;   // (a small area: the spots there are)
+                spots.push_back(cells[bi]);
+            }
+        }
+        for (size_t i = 0; i < spots.size(); ++i)
+            for (int k = 0; k < 4; ++k) {
+                View v;
+                v.eye[0] = spots[i][0]; v.eye[1] = spots[i][1] + spawnpick::kEyeHeight; v.eye[2] = spots[i][2];
+                v.yaw = (a.scene->world.spawns.empty() ? 0.0f : a.scene->world.spawns[0].yaw) + k * 1.5707963f;
+                v.pitch = -0.09f;
+                v.inside = true;
+                v.name = "spot" + std::to_string(i) + "_" + std::to_string(k * 90);
+                trimViews.push_back(v);
+            }
+        // outside: from four sides of the walkable area, up high, looking at its middle
+        if (g) {
+            float lo[3] = {1e30f, 1e30f, 1e30f}, hi[3] = {-1e30f, -1e30f, -1e30f};
+            for (int z = 0; z < g->nz; ++z)
+                for (int x = 0; x < g->nx; ++x)
+                    for (const WalkSpan* q = g->begin(x, z); q != g->end(x, z); ++q)
+                        if (q->flags & kWalkOk) {
+                            lo[0] = std::min(lo[0], g->centerX(x)); hi[0] = std::max(hi[0], g->centerX(x));
+                            lo[1] = std::min(lo[1], q->hi); hi[1] = std::max(hi[1], q->hi);
+                            lo[2] = std::min(lo[2], g->centerZ(z)); hi[2] = std::max(hi[2], g->centerZ(z));
+                        }
+            if (lo[0] < hi[0]) {
+                const float c[3] = {(lo[0] + hi[0]) * 0.5f, (lo[1] + hi[1]) * 0.5f, (lo[2] + hi[2]) * 0.5f};
+                const float r = std::max(6.0f, 0.5f * std::hypot(hi[0] - lo[0], hi[2] - lo[2]));
+                for (int k = 0; k < 4; ++k) {
+                    const float yaw = k * 1.5707963f + 0.785398f, fx = -std::sin(yaw), fz = -std::cos(yaw);   // facing the middle
+                    View v;
+                    v.eye[0] = c[0] - fx * r * 1.6f; v.eye[1] = c[1] + r * 0.9f; v.eye[2] = c[2] - fz * r * 1.6f;
+                    v.yaw = yaw;
+                    v.pitch = -std::atan2(r * 0.9f, r * 1.6f);
+                    v.inside = false;
+                    v.name = "outside_" + std::to_string(k * 90 + 45);
+                    trimViews.push_back(v);
+                }
+            }
+        }
+    }
+    std::vector<Shot> shootTrimViews() {
+        std::vector<Shot> shots;
+        for (const View& v : trimViews) { Shot s; s.rgba = a.viewPicture(v.eye, v.yaw, v.pitch, s.w, s.h); shots.push_back(std::move(s)); }
+        return shots;
+    }
+    // Two shots side by side (each at half size), as PNG.
+    void savePair(const Shot& x, const Shot& y, const std::string& name) {
+        if (x.rgba.empty() || y.rgba.empty() || x.w != y.w || x.h != y.h) return;
+        const uint32_t hw = x.w / 2, hh = x.h / 2, W = hw * 2 + 6;
+        std::vector<u8> out(static_cast<size_t>(W) * hh * 4, 255);
+        for (uint32_t r = 0; r < hh; ++r)
+            for (uint32_t c = 0; c < hw; ++c)
+                for (int k = 0; k < 2; ++k) {
+                    const Shot& s = k ? y : x;
+                    const u8* src = &s.rgba[(static_cast<size_t>(r * 2) * s.w + c * 2) * 4];
+                    u8* dst = &out[(static_cast<size_t>(r) * W + c + k * (hw + 6)) * 4];
+                    dst[0] = src[0]; dst[1] = src[1]; dst[2] = src[2]; dst[3] = 255;
+                }
+        std::vector<u8> png;
+        stbi_write_png_to_func([](void* ctx, void* data, int size) {
+            auto* v = static_cast<std::vector<u8>*>(ctx);
+            v->insert(v->end(), static_cast<u8*>(data), static_cast<u8*>(data) + size);
+        }, &png, W, hh, 4, out.data(), W * 4);
+        saveRendered(png, name);
+    }
+    // How much of a shot changed: the share of pixels off by more than 40 in any colour.
+    static double changedShare(const Shot& x, const Shot& y) {
+        if (x.rgba.empty() || x.rgba.size() != y.rgba.size()) return 1;
+        size_t changed = 0, n = x.rgba.size() / 4;
+        for (size_t i = 0; i < n; ++i) {
+            int d = 0;
+            for (int k = 0; k < 3; ++k) d = std::max(d, std::abs(static_cast<int>(x.rgba[i * 4 + k]) - static_cast<int>(y.rgba[i * 4 + k])));
+            changed += d > 40;
+        }
+        return static_cast<double>(changed) / std::max<size_t>(1, n);
+    }
+
+    // Draw Wall, as someone would: a line across the floor 2 m in front of the spawn, 6 m long. Then walking straight at
+    // it (from the spawn, and from 1.5 m either side) must stop on this side of it.
+    float wallLine[2][3] = {};
+    size_t wallsBefore = 0;
+    bool drawWallAcross() {
+        const WalkGrid* g = a.walkShown.get();
+        if (!g || a.scene->world.spawns.empty()) return false;
+        const WorldPoint& sp = a.scene->world.spawns[0];
+        float f;
+        if (!g->floorAt(sp.pos[0], sp.pos[2], sp.pos[1] + 0.5f, 0.6f, 3.0f, f)) return false;
+        const float fx = -std::sin(sp.yaw), fz = -std::cos(sp.yaw), tx = -fz, tz = fx;
+        const float c[3] = {sp.pos[0] + fx * 2, f, sp.pos[2] + fz * 2};
+        float h;
+        if (!g->floorAt(c[0], c[2], f + 0.3f, 0.4f, 1.0f, h) || !g->walkable(c[0], c[2], h)) return false;   // (no floor 2 m ahead)
+        a.strokePath.clear();
+        for (int k = -30; k <= 30; ++k) {                  // a hand's line: a little wobble along it
+            const float t = k * 0.1f, wob = 0.03f * std::sin(k * 1.7f);
+            a.extendStroke(std::array<float, 3>{c[0] + tx * t + fx * wob, h, c[2] + tz * t + fz * wob}.data());
+        }
+        wallsBefore = a.scene->world.colliders.size();
+        a.pushWorldUndo();
+        const int made = a.commitDrawnWall();
+        a.strokePath.clear();
+        const std::vector<std::array<float, 3>> runs = a.wallRuns({{c[0] - tx * 3, h, c[2] - tz * 3}, {c[0] + tx * 3, h, c[2] + tz * 3}});
+        log("  Draw Wall: a 6 m line 2 m in front of the spawn made %d wall%s; its ends %s", made, made == 1 ? "" : "s",
+            runs.size() >= 2 && std::hypot(runs.front()[0] - (c[0] - tx * 3), runs.front()[2] - (c[2] - tz * 3)) + std::hypot(runs.back()[0] - (c[0] + tx * 3), runs.back()[2] - (c[2] + tz * 3)) > 0.01f
+                ? "reached on to what they were drawn up to" : "stayed where drawn");
+        std::copy_n(c, 3, wallLine[0]);
+        wallLine[1][0] = fx; wallLine[1][1] = 0; wallLine[1][2] = fz;
+        return made > 0;
+    }
+    void walkIntoWall() {
+        const WalkGrid* g = a.walkShown.get();
+        const WorldPoint& sp = a.scene->world.spawns[0];
+        const float fx = wallLine[1][0], fz = wallLine[1][2], tx = -fz, tz = fx;
+        int stopped = 0, tries = 0;
+        for (float side : {0.0f, -1.5f, 1.5f}) {
+            float x = sp.pos[0] + tx * side, z = sp.pos[2] + tz * side, y;
+            if (!g->floorAt(x, z, sp.pos[1] + 0.5f, 0.6f, 3.0f, y) || !g->walkable(x, z, y)) continue;
+            ++tries;
+            for (int k = 0; k < 400; ++k) {                // 4 m straight at it, a stick's steps
+                g->move(x, z, y, fx * 0.01f, fz * 0.01f);
+                float h;
+                if (g->floorAt(x, z, y + 0.3f, 0.4f, 1.0f, h)) y = h;
+            }
+            const float past = (x - wallLine[0][0]) * fx + (z - wallLine[0][2]) * fz;   // > 0: through it
+            stopped += past < -0.05f;
+            if (past >= -0.05f) log("    walking at it from %.1f m to the side got %.2f m past it", side, past);
+        }
+        if (tries) check(stopped == tries, "a drawn wall stops you walking through it", std::to_string(stopped) + " of " + std::to_string(tries) + " walks stopped");
+    }
+
+    void buildAutoCheck() {
+        for (const std::string& home : paths) {
+            stages.push_back([this, home] {
+                log("");
+                log("== %s", home.c_str());
+                a.loadPromptAfter = 1e9f;
+                a.dirty = false;                             // (the last home's Auto-generate is thrown away, never asked about)
+                a.open({home}, false);
+                return 5;
+            });
+            stages.push_back([this, home] {
+                if (a.isLoading() || a.uploading || a.texLoading) return -1;
+                homeOpen = a.scene && !a.objects.empty() && !a.homePaths.empty() && a.homePaths.front() == home;
+                if (!homeOpen && polls < 600) return -1;     // (not started yet: ten seconds before it counts as failed)
+                if (!homeOpen) check(false, "it opens", home);
+                return 1;
+            });
+            stages.push_back([this] {
+                if (!homeOpen) return 1;
+                if (a.walkJob || a.walkPending || !a.walkShown) return -1;
+                check(true, "it opens", std::to_string(a.objects.size()) + " objects");
+                reportWorld("as opened");
+                saveAreaMap("auto_" + stemOf(a.homePaths.front()) + "_area_opened");
+                return 1;
+            });
+            stages.push_back([this] {
+                if (!homeOpen) return 1;
+                a.autoGenerate();
+                a.autoSummaryOpen = false;                   // (its summary would cover the view from above)
+                return 2;
+            });
+            stages.push_back([this, home] {
+                if (!homeOpen) return 1;
+                if (a.walkJob || a.walkPending) return -1;
+                const auto& r = a.autoReport;
+                log("  Auto-generate: %s in %.1f s: %d surfaces, %d colliders%s", r.ok ? "done" : "nothing to stand on", r.ms / 1000,
+                    r.objects, r.colliders, r.spawnAdded ? ", a spawn added" : "");
+                const bool floating = !a.scene->world.spawns.empty() && std::hypot(a.scene->world.spawns[0].pos[0], a.scene->world.spawns[0].pos[2]) < 0.01f &&
+                                      !(a.walkShown && a.walkShown->any());
+                check(r.ok || floating, r.ok ? "Auto-generate finds somewhere to stand" : "Auto-generate leaves a floating home as it is (nowhere to stand)");
+                reportWorld("after Auto-generate");
+                {   // what stops you at the area's edges, most first: a mesh that shouldn't (grass, a light shaft) shows here
+                    int shown = 0;
+                    for (const auto& bl : a.walkReport.blockers) {
+                        if (shown >= 10) break;
+                        if (bl.first < 0 || static_cast<size_t>(bl.first) >= a.scene->meshes.size()) continue;
+                        const MeshData& md = a.scene->meshes[bl.first];
+                        float lo = 1e30f, hi = -1e30f;
+                        float m[16];
+                        if (md.hasWorldMatrix) std::memcpy(m, md.worldMatrix, sizeof m); else trsToMat4(md.transform, m);
+                        for (size_t v = 0; v + 2 < md.positions.size(); v += 3) {
+                            const float y = m[1] * md.positions[v] + m[5] * md.positions[v + 1] + m[9] * md.positions[v + 2] + m[13];
+                            lo = std::min(lo, y); hi = std::max(hi, y);
+                        }
+                        log("    blocks %4d edge cells: %-60s %s%s %.1f m tall", bl.second, md.name.substr(0, 60).c_str(), md.useBlend ? "blended" : "opaque",
+                            md.alphaTest ? " cut-out" : "", hi - lo);
+                        if (shown < 4 && !a.scene->world.spawns.empty() && a.walkShown) {   // the nearest piece of it, seen from 2.5 m
+                            const float* sp = a.scene->world.spawns[0].pos;
+                            float best = 1e30f, at[3] = {0, 0, 0};
+                            for (size_t v = 0; v + 2 < md.positions.size(); v += 3) {
+                                float q[3];
+                                for (int k = 0; k < 3; ++k) q[k] = m[k] * md.positions[v] + m[4 + k] * md.positions[v + 1] + m[8 + k] * md.positions[v + 2] + m[12 + k];
+                                const float d = std::hypot(q[0] - sp[0], q[2] - sp[2]);
+                                if (d > 3 && d < best) { best = d; std::copy_n(q, 3, at); }
+                            }
+                            if (best < 1e29f) {
+                                const float dx = at[0] - sp[0], dz = at[2] - sp[2], L = std::hypot(dx, dz);
+                                float f = at[1];
+                                a.walkShown->floorAt(at[0] - dx / L * 2.5f, at[2] - dz / L * 2.5f, at[1] + 1.0f, 1.0f, 3.0f, f);
+                                const float eye[3] = {at[0] - dx / L * 2.5f, f + spawnpick::kEyeHeight, at[2] - dz / L * 2.5f};
+                                uint32_t w = 0, h = 0;
+                                std::vector<u8> rgba = a.viewPicture(eye, std::atan2(-dx, -dz), -0.35f, w, h);
+                                if (!rgba.empty()) {
+                                    for (size_t i = 3; i < rgba.size(); i += 4) rgba[i] = 255;
+                                    std::vector<u8> png;
+                                    stbi_write_png_to_func([](void* ctx, void* data, int size) {
+                                        auto* vv = static_cast<std::vector<u8>*>(ctx);
+                                        vv->insert(vv->end(), static_cast<u8*>(data), static_cast<u8*>(data) + size);
+                                    }, &png, w, h, 4, rgba.data(), w * 4);
+                                    saveRendered(png, "auto_" + stemOf(home) + "_blocker" + std::to_string(shown));
+                                }
+                            }
+                        }
+                        ++shown;
+                    }
+                }
+                saveAreaMap("auto_" + stemOf(home) + "_area");
+                saveRendered(a.spawnThumb(), "auto_" + stemOf(home) + "_spawn");
+                if (!a.scene->world.spawns.empty()) {            // all round from the spawn: what's walkable out there
+                    const float yaw = a.scene->world.spawns[0].yaw;
+                    for (int k = 1; k < 4; ++k) {
+                        a.scene->world.spawns[0].yaw = yaw + k * 1.5707963f;
+                        saveRendered(a.spawnThumb(), "auto_" + stemOf(home) + "_spawn_" + std::to_string(k * 90));
+                    }
+                    a.scene->world.spawns[0].yaw = yaw;
+                }
+                // from above: the area and the world items over it (the whole window)
+                a.viewFrom(0, 3.14159265f * 0.5f - 0.001f);
+                a.frameAll();
+                return 10;
+            });
+            stages.push_back([this, home] { if (homeOpen) screenshot(("auto_" + stemOf(home) + "_above").c_str()); return 1; });
+            // plants: Collider stops you, Walk through lets you through, and they copy (the tallest and the lowest)
+            stages.push_back([this] { if (homeOpen) listPlants(); return 1; });
+            for (int t = 0; t < 2; ++t) {
+                stages.push_back([this, t] {
+                    if (!homeOpen || t >= static_cast<int>(plantTargets.size())) return 1;
+                    plantWorld = std::make_shared<HomeWorld>(a.scene->world);
+                    a.setSurfaces({static_cast<size_t>(plantTargets[t])}, kSurfObject);
+                    a.walkPending = true;
+                    return 2;
+                });
+                stages.push_back([this, t] {
+                    if (!homeOpen || t >= static_cast<int>(plantTargets.size())) return 1;
+                    if (a.walkJob || a.walkPending) return -1;
+                    plantAreaBlocked = a.walkReport.walkArea;
+                    plantAsCollider = a.walkShown;
+                    a.setSurfaces({static_cast<size_t>(plantTargets[t])}, kSurfTrigger);
+                    a.walkPending = true;
+                    return 2;
+                });
+                stages.push_back([this, t] {
+                    if (!homeOpen || t >= static_cast<int>(plantTargets.size())) return 1;
+                    if (a.walkJob || a.walkPending) return -1;
+                    const float through = a.walkReport.walkArea;
+                    const Object& plant = a.objects[plantTargets[t]];
+                    const PlantDiff pd = plantAsCollider && a.walkShown ? plantDiff(plant, *plantAsCollider, *a.walkShown) : PlantDiff{};
+                    const float c2 = a.walkShown ? a.walkShown->p.cell * a.walkShown->p.cell : 0;
+                    char d[300];
+                    std::snprintf(d, sizeof d, "%s: %.1f m\u00b2 walkable as a Collider, %.1f m\u00b2 walked through; over its footprint "
+                                  "%.2f m\u00b2 you walk through it to, %.2f m\u00b2 you stood on as a Collider, %.2f m\u00b2 within reach of it",
+                                  plant.label.c_str(), plantAreaBlocked, through, pd.through * c2, pd.stoodOn * c2, pd.reach * c2);
+                    if (!pd.reach) log("  %s (it's nowhere you walk: the setting changes nothing there)", d);
+                    else check(pd.through + pd.stoodOn > 0, "a plant's Collision setting is what you walk by (a Collider stops you or holds you up, Walk through lets you through)", d);
+                    plantAsCollider.reset();
+                    a.scene->world = *plantWorld;
+                    a.worldReplaced();
+                    a.walkPending = true;
+                    plantCopies(plantTargets[t]);
+                    return 2;
+                });
+                stages.push_back([this] { return homeOpen && (a.walkJob || a.walkPending) ? -1 : 1; });
+            }
+            // the trim: textures all in and the clock stopped first (a frame differs only by what the trim took)
+            stages.push_back([this] {
+                if (!homeOpen) return 1;
+                a.animPlaying = false;
+                if (a.renderer.texturesPending()) return -1;
+                chooseTrimViews();
+                return 3;
+            });
+            stages.push_back([this] {
+                if (!homeOpen) return 1;
+                trimBefore = shootTrimViews();
+                trisBefore = 0;
+                meshTrisBefore.clear();
+                for (const MeshData& md : a.scene->meshes) { trisBefore += md.indices.size() / 3; meshTrisBefore.push_back(md.indices.size() / 3); }
+                a.showTrimmed = false;
+                a.startTrim();
+                return 2;
+            });
+            stages.push_back([this, home] {
+                if (!homeOpen) return 1;
+                if (a.trimJob) return -1;
+                size_t trisAfter = 0;
+                for (const MeshData& md : a.scene->meshes) trisAfter += md.indices.size() / 3;
+                log("  %s", a.trimStatus.c_str());
+                log("  triangles: %zu before, %zu after (%+.1f%%)", trisBefore, trisAfter, trisBefore ? 100.0 * (static_cast<double>(trisAfter) - trisBefore) / trisBefore : 0.0);
+                std::vector<std::pair<long, size_t>> grew;   // meshes with more triangles after it than before (shouldn't be)
+                for (size_t m = 0; m < a.scene->meshes.size() && m < meshTrisBefore.size(); ++m) {
+                    const long d = static_cast<long>(a.scene->meshes[m].indices.size() / 3) - static_cast<long>(meshTrisBefore[m]);
+                    if (d > 0) grew.push_back({d, m});
+                }
+                std::sort(grew.rbegin(), grew.rend());
+                for (size_t k = 0; k < grew.size() && k < 6; ++k)
+                    log("    GREW: %s %zu -> %zu triangles%s", a.scene->meshes[grew[k].second].name.c_str(), meshTrisBefore[grew[k].second],
+                        a.scene->meshes[grew[k].second].indices.size() / 3, a.scene->meshes[grew[k].second].cullBack ? " (one side)" : "");
+                return 3;
+            });
+            stages.push_back([this, home] {
+                if (!homeOpen) return 1;
+                const std::vector<Shot> after = shootTrimViews();
+                double worst = 0;
+                size_t worstAt = 0;
+                int insideViews = 0, insideClean = 0;
+                for (size_t i = 0; i < trimViews.size() && i < after.size() && i < trimBefore.size(); ++i) {
+                    const double share = changedShare(trimBefore[i], after[i]);
+                    if (trimViews[i].inside) {
+                        ++insideViews;
+                        insideClean += share < 0.005;
+                        if (share >= 0.005) log("    from %s: %.2f%% of the picture changed", trimViews[i].name.c_str(), share * 100);
+                        if (share >= worst) { worst = share; worstAt = i; }
+                    } else {
+                        log("    %s: %.1f%% of the picture changed (what was trimmed, seen from where nobody stands)", trimViews[i].name.c_str(), share * 100);
+                        savePair(trimBefore[i], after[i], "trim_" + stemOf(home) + "_" + trimViews[i].name);
+                    }
+                }
+                if (insideViews) {
+                    savePair(trimBefore[worstAt], after[worstAt], "trim_" + stemOf(home) + "_worst_" + trimViews[worstAt].name);
+                    char d[160];
+                    std::snprintf(d, sizeof d, "%d of %d views the same (worst %s: %.2f%% changed)", insideClean, insideViews, trimViews[worstAt].name.c_str(), worst * 100);
+                    check(insideClean == insideViews, "the trim changes nothing seen from where you can stand", d);
+                }
+                trimBefore.clear();
+                return 1;
+            });
+            // Draw Wall: drawn, walked into, pictured, taken away again
+            stages.push_back([this] {
+                if (!homeOpen) return 1;
+                wallDrawn = drawWallAcross();
+                if (!wallDrawn) log("  Draw Wall: no floor 2 m in front of the spawn to draw one across");
+                return 2;
+            });
+            stages.push_back([this, home] {
+                if (!homeOpen || !wallDrawn) return 1;
+                if (a.walkJob || a.walkPending) return -1;
+                walkIntoWall();
+                const WorldPoint& sp = a.scene->world.spawns[0];
+                a.wKind = kCollider; a.wIndex = static_cast<int>(a.scene->world.colliders.size()) - 1;
+                a.cam.yaw = sp.yaw + 0.5f; a.cam.pitch = -0.5f; a.cam.dist = 7;
+                std::copy_n(wallLine[0], 3, a.cam.pivot);
+                return 6;
+            });
+            stages.push_back([this, home] {
+                if (!homeOpen || !wallDrawn) return 1;
+                screenshot(("auto_" + stemOf(home) + "_wall").c_str());
+                a.scene->world.colliders.resize(wallsBefore);
+                a.wKind = a.wIndex = -1;
+                a.walkPending = true;
+                return 2;
+            });
+            // ── Saved and opened again: seats drawn (a click and a row), one turned, a plant made a Collider and an
+            //    object moved, all as they were set
+            stages.push_back([this, home] {
+                if (!homeOpen) return 1;
+                if (a.walkJob || a.walkPending || a.saving) return -1;
+                handSet = HandSet();
+                HomeWorld& w = a.scene->world;
+                if (w.spawns.empty()) { log("  saved and opened again: no spawn to draw seats beside"); return 1; }
+                const WorldPoint sp = w.spawns[0];
+                const float fx = -std::sin(sp.yaw), fz = -std::cos(sp.yaw), rx = -fz, rz = fx;
+                a.pushWorldUndo();
+                a.strokePath.clear();
+                const float click[3] = {sp.pos[0] + fx, sp.pos[1], sp.pos[2] + fz};
+                a.extendStroke(click);
+                a.seatRow = false;
+                a.seatAimed = true;                                        // dragged towards the spawn's right
+                a.seatAim[0] = click[0] + rx; a.seatAim[1] = click[1]; a.seatAim[2] = click[2] + rz;
+                const int one = a.commitDrawnSeats();
+                a.seatAimed = false;
+                a.strokePath.clear();
+                for (int k = 0; k <= 18; ++k) {
+                    const float t = -0.9f + 0.1f * k, q[3] = {sp.pos[0] + fx * 2 + rx * t, sp.pos[1], sp.pos[2] + fz * 2 + rz * t};
+                    a.extendStroke(q);
+                }
+                a.seatRow = true;
+                const int row = a.commitDrawnSeats();
+                a.seatRow = false;
+                a.strokePath.clear();
+                check(one == 1 && row == 3, "a click draws a seat right there, a line a row of them", std::to_string(one) + " + " + std::to_string(row));
+                if (one == 1 && row == 3) {
+                    check(std::fabs(w.seats[w.seats.size() - 4].pos[0] - click[0]) < 1e-4f && std::fabs(w.seats[w.seats.size() - 4].pos[2] - click[2]) < 1e-4f,
+                          "...the clicked one exactly where it was clicked", f3(w.seats[w.seats.size() - 4].pos));
+                    const float yawAimed = std::atan2(-rx, -rz), dy = std::fabs(std::remainder(w.seats[w.seats.size() - 4].yaw - yawAimed, 6.2831853f));
+                    check(dy < 1e-3f, "...facing the way it was dragged", std::to_string(dy * 57.2958f) + "\u00b0 off");
+                    w.seats.back().yaw += 0.7f;                                    // one turned by hand
+                }
+                if (!plantTargets.empty()) {
+                    a.setSurfaces({static_cast<size_t>(plantTargets[0])}, kSurfObject);
+                    handSet.plant = a.objects[plantTargets[0]].name;
+                }
+                for (size_t i = 0; i < a.objects.size(); ++i) {           // the first thing that isn't a plant, moved 0.5 m
+                    Object& o = a.objects[i];
+                    if (o.deleted || o.hidden || o.skybox || o.category == kPlants) continue;
+                    a.pushUndo(i);
+                    o.pivot[12] += 0.5f;
+                    a.apply(o);
+                    handSet.moved = o.name;
+                    objectMiddle(o, handSet.movedAt);
+                    break;
+                }
+                handSet.seats = w.seats;
+                handSet.spawns = w.spawns.size();
+                handSet.colliders = w.colliders.size();
+                handSet.file = dir / (L"saved again " + widen(stemOf(home)) + L".fenv");
+                std::error_code ec;
+                fs::remove(handSet.file, ec);
+                check(a.saveEnvironment(narrow(handSet.file.wstring()), false, false), "it saves", narrow(handSet.file.filename().wstring()));
+                return 2;
+            });
+            stages.push_back([this] {
+                if (!homeOpen || handSet.file.empty()) return 1;
+                if (a.saving) return -1;
+                std::string status;
+                { std::lock_guard<std::mutex> l(a.statusMutex); status = a.saveStatus; }
+                check(status.rfind("Saved", 0) == 0, "...and it's written", status);
+                a.dirty = false;
+                a.open({narrow(handSet.file.wstring())}, false);
+                return 2;
+            });
+            stages.push_back([this, home] {
+                if (!homeOpen || handSet.file.empty()) return 1;
+                if (a.loadState != 0 || a.isLoading() || !a.scene || a.uploading || a.texLoading || a.walkJob || a.walkPending) return -1;
+                const HomeWorld& w = a.scene->world;
+                int same = 0;
+                std::string off;
+                for (const WorldPoint& was : handSet.seats) {
+                    bool found = false;
+                    for (const WorldPoint& now : w.seats)
+                        if (now.name == was.name && dist3(now.pos, was.pos) < 1e-3f && std::fabs(now.yaw - was.yaw) < 1e-3f && dist3(now.exit, was.exit) < 1e-3f) found = true;
+                    same += found;
+                    if (!found && off.size() < 200) off += (off.empty() ? "; not: " : ", ") + was.name;
+                }
+                check(same == static_cast<int>(handSet.seats.size()) && w.seats.size() == handSet.seats.size(),
+                      "opened again, every seat is where it was put, facing the way it was turned",
+                      std::to_string(same) + " of " + std::to_string(handSet.seats.size()) + " (" + std::to_string(w.seats.size()) + " there)" + off);
+                check(w.spawns.size() == handSet.spawns && w.colliders.size() == handSet.colliders, "...the spawns and the surfaces",
+                      std::to_string(w.spawns.size()) + " spawns, " + std::to_string(w.colliders.size()) + " surfaces (saved " +
+                      std::to_string(handSet.spawns) + ", " + std::to_string(handSet.colliders) + ")");
+                if (!handSet.plant.empty()) {
+                    int named = 0, colliders = 0;   // (several objects can share a name: the one set is among them)
+                    for (const Object& o : a.objects) if (!o.deleted && o.name == handSet.plant) { ++named; colliders += a.surfaceMode(o) == kSurfObject; }
+                    check(colliders > 0, "...the plant set to Collider", handSet.plant + ": " + std::to_string(colliders) + " of " + std::to_string(named) + " so named");
+                }
+                if (!handSet.moved.empty()) {
+                    float best = 1e30f;
+                    for (const Object& o : a.objects) {
+                        if (o.deleted || o.name != handSet.moved) continue;
+                        float c[3];
+                        objectMiddle(o, c);
+                        best = std::min(best, dist3(c, handSet.movedAt));
+                    }
+                    check(best < 1e-3f, "...the object moved, where it was moved", handSet.moved + (best < 1e29f ? ", " + std::to_string(best) + " m off" : ": not there"));
+                }
+                screenshot(("auto_" + stemOf(home) + "_saved_again").c_str());
+                a.dirty = false;
+                std::error_code ec;
+                fs::remove(handSet.file, ec);
+                return 1;
+            });
+        }
+        stages.push_back([this] {
+            log("");
+            log("done: %d passed, %d failed", passes, fails);
+            finish();
+            return 1;
+        });
+    }
+
     void build() {
         // ── A slow load asks; Stop Loading stops it, and the stopped load's result never shows up
         stages.push_back([this] { a.open(paths, false); a.loadPromptAfter = 0.05f; return 1; });
@@ -10444,7 +12960,7 @@ struct SelfTest {
             return 3;
         });
         stages.push_back([this] {
-            check(a.workspace == 1 && a.inspectorTab == Studio::InspectorTab::World, "the Walking workspace shows Properties \u203a World");
+            check(a.workspace == 1 && a.inspectorTab == Studio::InspectorTab::Navmesh, "the Walking workspace shows Properties \u203a Navmesh");
             screenshot("01_walking_workspace");
             a.setWorkspace(0);
             key(ImGuiKey_F3);
@@ -10691,12 +13207,13 @@ struct SelfTest {
             a.cam.dist *= 1.6f;
             a.cam.pitch = -0.6f;            // from above: the floor part shows
             for (ImVec2& p : a.surfButtonAt) p = ImVec2(-1, -1);
+            a.showInspectorTab(Studio::InspectorTab::Physics);   // (the Collision panel)
             a.surfScroll = true;                           // in view, however small the window
             return 10;
         });
         stages.push_back([this] {
             a.setSurfaces({static_cast<size_t>(obj)}, kSurfNone);
-            if (a.surfButtonAt[kSurfSolid].x < 0) { check(false, "the object panel shows the Surface buttons"); return 0; }
+            if (a.surfButtonAt[kSurfSolid].x < 0) { check(false, "Physics shows the Collision choices"); return 0; }
             click(a.surfButtonAt[kSurfSolid]);
             return 4;
         });
@@ -10913,6 +13430,35 @@ struct SelfTest {
             a.rebakeWalk();
             return 2;
         });
+        // ── Draw Floor's other shapes where you stand: a rectangle erased from a corner (the floor inside goes, beside
+        //    it stays), a polygon round the same spot painted back, both saved, each one undo step
+        stages.push_back([this] {
+            if (paintAt[1] < -1e29f) return 1;
+            paintsBefore = a.scene->world.walkPaint.size();
+            const float c0[3] = {paintAt[0] - 0.6f, paintAt[1], paintAt[2] - 0.6f}, c1[3] = {paintAt[0] + 0.6f, paintAt[1], paintAt[2] + 0.6f};
+            a.pushWorldUndo(); a.strokeFrom = a.scene->world.walkPaint.size();
+            check(a.addShape(Studio::rectStroke(c0, c1, 0), true), "a rectangle dragged corner to corner is drawn");
+            a.rebakeWalk();
+            check(a.walkShown && !a.walkShown->walkable(paintAt[0], paintAt[2], paintAt[1]) && !a.walkShown->walkable(paintAt[0] + 0.45f, paintAt[2] - 0.45f, paintAt[1]),
+                  "Shift+rectangle erases the floor inside it, out to its corners");
+            const float tooSmall[3] = {c0[0] + 0.02f, c0[1], c0[2] + 0.02f};
+            check(!a.addShape(Studio::rectStroke(c0, tooSmall, 0), false), "a click (no drag) makes no rectangle");
+            a.shapeCorners = {{paintAt[0] - 1, paintAt[1], paintAt[2] - 1}, {paintAt[0] + 1, paintAt[1], paintAt[2] - 1}, {paintAt[0], paintAt[1], paintAt[2] + 1.2f}};
+            check(a.closePolygon(false) && a.shapeCorners.empty(), "a polygon's corners close into one");
+            a.rebakeWalk();
+            check(a.walkShown && a.walkShown->walkable(paintAt[0], paintAt[2], paintAt[1]), "...and paint the floor back inside it");
+            HomeWorld r;
+            check(worldFromJson(worldToJson(a.scene->world), r) && r.walkPaint.size() == paintsBefore + 2 && r.walkPaint.back().shape == WalkStroke::Polygon &&
+                  r.walkPaint[paintsBefore].shape == WalkStroke::Rect && r.walkPaint[paintsBefore].erase, "the rectangle and the polygon are saved with the world");
+            key(ImGuiKey_Z, true); queue.push_back(In{}); key(ImGuiKey_Z, true); queue.push_back(In{});
+            return 5;
+        });
+        stages.push_back([this] {
+            if (paintAt[1] < -1e29f) return 1;
+            check(a.scene->world.walkPaint.size() == paintsBefore, "Ctrl+Z takes back each shape");
+            a.rebakeWalk();
+            return 2;
+        });
         // ── Import Video (FS_TEST_VIDEO: a video or GIF to import): made into a clip, put on a screen in front of the view,
         //    played (new pictures reach the renderer), heard near it and not far off, kept by a bake, one Ctrl+Z
         stages.push_back([this] {
@@ -10985,7 +13531,9 @@ struct SelfTest {
                   "the drawn wall takes the walkable area along it, not beside it");
             a.strokePath.clear();
             for (int k = 0; k <= 18; ++k) { const float q[3] = {p[0] - 0.9f + 0.1f * k, p[1], p[2] - 0.5f}; a.extendStroke(q); }
+            a.seatRow = true;
             const int seats = a.commitDrawnSeats();
+            a.seatRow = false;
             check(seats == 3 && a.scene->world.seats.size() == sBefore + 3, "a 1.8 m line draws a row of 3 seats", std::to_string(seats));
             a.strokePath.clear();
             a.extendStroke(p);
@@ -11025,7 +13573,12 @@ struct SelfTest {
             std::snprintf(d, sizeof d, "%.1f m2 in %d areas, %d out of reach (%.0f m2), %.1f m2 bridged, %zu blockers, %d ledge cells, %.0f ms, spawn %s",
                           r.walk.walkArea, r.walk.areas, r.walk.unreached, r.walk.unreachedArea, r.walk.bridgedArea, r.walk.blockers.size(), r.walk.ledgeCells, r.ms,
                           r.spawnAdded ? "added" : "kept");
-            check(r.ok && r.walk.walkArea > 1 && a.walkSaved() && autos == r.objects + r.colliders && r.objects > 0 && r.colliders > 0, "Auto-generate bakes the walkable area and saves it with the home", d);
+            // (a home with its own collision, Meta's colliders, is walked on that: nothing is added to its objects)
+            const bool own = a.scene->world.hasHomeCollision();
+            const bool made = own ? r.homeColliders > 0 && r.objects == 0 && r.colliders == 0 : r.objects > 0 && r.colliders > 0;
+            check(r.ok && r.walk.walkArea > 1 && a.walkSaved() && autos == r.objects + r.colliders && made,
+                  own ? "Auto-generate bakes the walkable area on the home's own collision and saves it with the home"
+                      : "Auto-generate bakes the walkable area and saves it with the home", d);
             check(a.surfaceMode(a.objects[obj]) == kSurfSolid && !a.autoMade(a.objects[obj]), "...and keeps the surface set by hand");
             {   // the world items: walls (Wall-role boxes) and objects' collision (meshes); no seats or hotspots
                 int walls = 0, objs = 0, seats = 0, hots = 0;
@@ -11035,8 +13588,9 @@ struct SelfTest {
                 }
                 for (const WorldPoint& p : a.scene->world.seats) seats += p.name == "Auto seat";
                 for (const WorldPoint& p : a.scene->world.hotspots) hots += p.name == "Auto hotspot";
-                check(walls == 0 && r.walls == 0 && objs == r.objects + r.colliders && r.objects > 0 && seats == 0 && hots == 0,
-                      "...and makes floor meshes surfaces and the other objects colliders (no walls, seats or hotspots)",
+                check(walls == 0 && r.walls == 0 && objs == r.objects + r.colliders && (own || r.objects > 0) && seats == 0 && hots == 0,
+                      own ? "...and adds no surfaces, colliders, walls, seats or hotspots to its objects"
+                          : "...and makes floor meshes surfaces and the other objects colliders (no walls, seats or hotspots)",
                       std::to_string(r.objects) + " surfaces, " + std::to_string(r.colliders) + " colliders, " + std::to_string(seats) +
                           " seats, " + std::to_string(hots) + " hotspots");
                 genCounts = {walls, objs, seats + hots};   // (objs: surfaces + colliders)
@@ -11608,7 +14162,7 @@ struct SelfTest {
             a.newBundle();
             libraryBefore = a.libraryEnvs().size();
             a.addToBundle({a.envFile, a.envFile});
-            check(a.bundleMembers.size() == 1 && a.bundleDirty && a.inspectorTab == Studio::InspectorTab::Bundle,
+            check(a.bundleMembers.size() == 1 && a.bundleDirty && a.inspectorTab == Studio::InspectorTab::Output,
                   "Bundle \u203a Add the Open Environment lists it once", std::to_string(a.bundleMembers.size()) + " listed");
             a.bundleName = "Self-test bundle";
             return 3;   // the tab draws it, reading its picture
@@ -11658,7 +14212,9 @@ struct SelfTest {
         stages.push_back([this] {
             if (a.saving) return -1;
             // The home saved earlier has no splats: its scene stays the version older Frame Homes read
-            check(sceneVersionOf(a.envFile) == kSceneBakeVersionNoSplats, "an environment without splats is saved as before (scene version 14)",
+            // (14; 19 for a home with see-through surfaces that write depth, as Del Mar's and Vista's floors are)
+            const u32 plain = sceneNeedsV19(*a.scene) ? kSceneBakeVersion : kSceneBakeVersionNoSplats;
+            check(sceneVersionOf(a.envFile) == plain, "an environment without splats is saved as before (scene version 14, or what its surfaces need)",
                   std::to_string(sceneVersionOf(a.envFile)));
             // a sphere of 2000 splats, 0.4 m across, 2.5 m in front of where you start: a 3DGS .ply in its training axes
             splatPly = dir / L"selftest splats.ply";
@@ -11695,7 +14251,7 @@ struct SelfTest {
             return 3;
         });
         stages.push_back([this] {
-            check(a.splatSel == 0 && a.inspectorTab == Studio::InspectorTab::Selection, "clicking the splats selects them", a.splatSel == 0 ? a.scene->splats[0].name : "nothing");
+            check(a.splatSel == 0 && a.inspectorTab == Studio::InspectorTab::Object, "clicking the splats selects them", a.splatSel == 0 ? a.scene->splats[0].name : "nothing");
             a.splatSel = 0;
             return 2;
         });
@@ -11824,7 +14380,7 @@ struct SelfTest {
             check(sky == 6 && !a.skyPanorama().empty() && a.renderer.meshCount() == 7, "the panorama becomes the six faces of a sky cube, drawn with the model",
                   std::to_string(sky) + " sky faces, " + std::to_string(a.renderer.meshCount()) + " drawn");
             a.cam.playerView();
-            a.showInspectorTab(Studio::InspectorTab::Environment);
+            a.showInspectorTab(Studio::InspectorTab::Scene);
             return 5;
         });
         stages.push_back([this] {
@@ -11849,7 +14405,8 @@ struct SelfTest {
         });
         stages.push_back([this] {
             if (a.saving) return -1;
-            check(sceneVersionOf(narrow(skyFenv.wstring())) == kSceneBakeVersionNoSplats, "...as a scene older Frame Homes read (no new requirement)",
+            check(sceneVersionOf(narrow(skyFenv.wstring())) == (sceneNeedsV19(*a.scene) ? kSceneBakeVersion : kSceneBakeVersionNoSplats),
+                  "...as a scene older Frame Homes read (no new requirement)",
                   std::to_string(sceneVersionOf(narrow(skyFenv.wstring()))));
             a.dirty = false;
             a.open({narrow(skyFenv.wstring())}, false);
@@ -12332,8 +14889,8 @@ struct FrameBench {
         switch (phase) {
             case 0: done(600); break;
             case 1: case 2: case 3: case 4: case 5:
-                if (phaseFrame == 1) a.showInspectorTab(phase == 1 ? Studio::InspectorTab::World : phase == 2 ? Studio::InspectorTab::Environment
-                                                        : phase == 3 ? Studio::InspectorTab::Bundle : phase == 4 ? Studio::InspectorTab::Headset : Studio::InspectorTab::Selection);
+                if (phaseFrame == 1) a.showInspectorTab(phase == 1 ? Studio::InspectorTab::Navmesh : phase == 2 ? Studio::InspectorTab::Scene
+                                                        : phase == 3 ? Studio::InspectorTab::Output : phase == 4 ? Studio::InspectorTab::Tool : Studio::InspectorTab::Object);
                 done(150);
                 break;
             case 6: {   // select objects one after another (the highlight and the Inspector rebuild for each)
@@ -12390,7 +14947,7 @@ int runStudio(StudioWindow& window, const std::vector<std::string>& args) {
     const fs::path data = dataDir();
     const float scale = window.uiScale();
     platform::setDialogOwner(window.nativeHandle());
-    g_selfTestRun = !args.empty() && args[0] == "--selftest";   // (before anything saves)
+    g_selfTestRun = !args.empty() && (args[0] == "--selftest" || args[0] == "--autocheck");   // (before anything saves)
     updater::cleanUp();                                          // what the last update set aside
     auto app = std::make_unique<Studio>();
     g_app = app.get();
@@ -12406,7 +14963,10 @@ int runStudio(StudioWindow& window, const std::vector<std::string>& args) {
     r.viewCount = 1;                                                 // the editor shows one view: draw it once, not per eye
     r.msaa = app->studioPerf.msaa;                                   // Edit > Settings
     r.anisotropy = static_cast<float>(app->studioPerf.anisotropy);
-    if (!r.init(64, 64)) return fail("Couldn't start Vulkan on this GPU. See " + narrow((data / L"studio.log").wstring()) + ".");
+    if (!r.init(64, 64)) {
+        const std::string seeLog = "See " + narrow((data / L"studio.log").wstring()) + ".";
+        return fail(r.initError.empty() ? "Couldn't start Vulkan on this GPU. " + seeLog : r.initError + "\n\n" + seeLog);
+    }
     r.costScaleMs = 0.05f;                     // Debug > GPU Cost: a desktop GPU is several times the Frame's
 
     VkSurfaceKHR surface = window.createSurface(r.instance());
@@ -12481,13 +15041,15 @@ int runStudio(StudioWindow& window, const std::vector<std::string>& args) {
     if (std::getenv("FS_TRIM")) app->trimWanted = true;   // diagnostics / screenshots: trim once the home is up, show what went
     if (const char* tab = std::getenv("FS_INSPECTOR_TAB")) {   // diagnostics / screenshots: start on this Inspector tab
         const std::string t = tab;
-        app->showInspectorTab(t == "world" ? Studio::InspectorTab::World : t == "environment" ? Studio::InspectorTab::Environment
-                              : t == "sound" ? Studio::InspectorTab::Environment : t == "bundle" ? Studio::InspectorTab::Bundle : t == "headset" ? Studio::InspectorTab::Headset
-                                                                                            : Studio::InspectorTab::Selection);
+        // (the tabs by name; the old names too: world, environment, sound, bundle, headset)
+        using IT = Studio::InspectorTab;
+        const IT it = t == "tool" ? IT::Tool : t == "scene" || t == "environment" || t == "sound" ? IT::Scene : t == "navmesh" || t == "world" ? IT::Navmesh
+                    : t == "physics" ? IT::Physics : t == "data" ? IT::Data : t == "output" || t == "bundle" || t == "headset" ? IT::Output : IT::Object;
+        app->showInspectorTab(it, t == "bundle" ? "Bundle" : t == "headset" ? "Headset" : nullptr);
     }
     std::unique_ptr<SelfTest> selftest;
-    if (args.size() > 1 && args[0] == "--selftest") {
-        selftest = std::make_unique<SelfTest>(*app, std::vector<std::string>(args.begin() + 1, args.end()));
+    if (args.size() > 1 && (args[0] == "--selftest" || args[0] == "--autocheck")) {
+        selftest = std::make_unique<SelfTest>(*app, std::vector<std::string>(args.begin() + 1, args.end()), args[0] == "--autocheck");
         g_test = selftest.get();
     } else if (!args.empty()) {
         app->open(args);
@@ -12543,6 +15105,7 @@ int runStudio(StudioWindow& window, const std::vector<std::string>& args) {
         app->updateTrim();
         app->updateWalk();
         app->updateVideos();
+        app->takeRequestedPicture();
         app->sizeViewport();
         const auto f1 = clk::now();
 
@@ -12596,6 +15159,7 @@ int runStudio(StudioWindow& window, const std::vector<std::string>& args) {
     vkDeviceWaitIdle(r.device());
     window.stopHangWatchdog();
     if (app->saver.joinable()) app->saver.join();
+    if (app->blenderJob.joinable()) app->blenderJob.join();   // (an export still writing)
     if (app->saveFailed) {   // the Save asked for on the way out didn't make it: say so (the window's already gone)
         std::string why;
         { std::lock_guard<std::mutex> l(app->statusMutex); why = app->saveStatus; }

@@ -97,6 +97,77 @@ inline std::vector<u32> alphaOnly(const std::vector<u32>& code) {
     return out;
 }
 
+// Alpha-to-coverage for a single-sample target: the fragment shader also writes gl_SampleMask[0] = (alpha >= 0.5 ? ~0
+// : 0) wherever it stores its whole Location 0 colour. With one sample the GPU's alpha-to-coverage mask has one bit,
+// and the spec leaves its threshold (or a dither) to the driver; the written mask makes it a plain alpha test on
+// every GPU, so a cut-out (Del Mar's balloon cards, a fern's fronds) keeps its shape with anti-aliasing off instead
+// of drawing its whole card. Empty when the output is written any other way, or the shader writes a mask already.
+inline std::vector<u32> coverageFromAlpha(const std::vector<u32>& code) {
+    if (code.size() < 5 || code[0] != 0x07230203u) return {};
+    u32 outVar = 0, bound = code[3], boolT = 0, intT = 0;
+    std::map<u32, u32> vec4Of, ptrPointee, varType, floatWidth;
+    std::set<u32> loc0;
+    size_t firstDecorate = 0, firstFunction = 0;
+    for (size_t i = 5; i < code.size();) {
+        const u32 words = code[i] >> 16, op = code[i] & 0xFFFF;
+        if (!words || i + words > code.size()) return {};
+        if (op == 71 && !firstDecorate) firstDecorate = i;
+        if (op == 54 && !firstFunction) firstFunction = i;
+        if (op == 71 && words == 4 && code[i + 2] == 30 && code[i + 3] == 0) loc0.insert(code[i + 1]);   // Location 0
+        if (op == 71 && words == 4 && code[i + 2] == 11 && code[i + 3] == 20) return {};                 // BuiltIn SampleMask
+        if (op == 20 && words == 2) boolT = code[i + 1];                                                  // OpTypeBool
+        if (op == 21 && words == 4 && code[i + 2] == 32 && (!intT || code[i + 3] == 1)) intT = code[i + 1];   // OpTypeInt 32
+        if (op == 22 && words >= 3) floatWidth[code[i + 1]] = code[i + 2];                                // OpTypeFloat
+        if (op == 23 && words == 4 && code[i + 3] == 4) vec4Of[code[i + 1]] = code[i + 2];
+        if (op == 32 && words == 4 && code[i + 2] == 3) ptrPointee[code[i + 1]] = code[i + 3];
+        if (op == 59 && words >= 4 && code[i + 3] == 3 && loc0.count(code[i + 2])) { outVar = code[i + 2]; varType[outVar] = code[i + 1]; }
+        i += words;
+    }
+    if (!outVar || !firstDecorate || !firstFunction || !ptrPointee.count(varType[outVar]) || !vec4Of.count(ptrPointee[varType[outVar]])) return {};
+    const u32 vecT = ptrPointee[varType[outVar]], floatT = vec4Of[vecT];
+    const u32 width = floatWidth.count(floatT) ? floatWidth[floatT] : 0;
+    if (width != 32 && width != 16) return {};
+    std::vector<u32> globals;                       // the declarations, put just before the first function
+    if (!boolT) { boolT = bound++; globals.insert(globals.end(), {(2u << 16) | 20u, boolT}); }
+    if (!intT) { intT = bound++; globals.insert(globals.end(), {(4u << 16) | 21u, intT, 32u, 1u}); }
+    const u32 half = bound++, zero = bound++, ones = bound++, one = bound++, arrT = bound++, arrPtr = bound++, elemPtr = bound++, mask = bound++;
+    globals.insert(globals.end(), {(4u << 16) | 43u, floatT, half, width == 32 ? 0x3F000000u : 0x3800u});   // 0.5
+    globals.insert(globals.end(), {(4u << 16) | 43u, intT, zero, 0u});
+    globals.insert(globals.end(), {(4u << 16) | 43u, intT, ones, 0xFFFFFFFFu});
+    globals.insert(globals.end(), {(4u << 16) | 43u, intT, one, 1u});
+    globals.insert(globals.end(), {(4u << 16) | 28u, arrT, intT, one});              // int[1]
+    globals.insert(globals.end(), {(4u << 16) | 32u, arrPtr, 3u, arrT});             // Output int[1]*
+    globals.insert(globals.end(), {(4u << 16) | 32u, elemPtr, 3u, intT});            // Output int*
+    globals.insert(globals.end(), {(4u << 16) | 59u, arrPtr, mask, 3u});             // OpVariable Output
+    std::vector<u32> out(code.begin(), code.begin() + 5);
+    out.reserve(code.size() + globals.size() + 64);
+    for (size_t i = 5; i < code.size();) {
+        const u32 words = code[i] >> 16, op = code[i] & 0xFFFF;
+        if (i == firstDecorate) out.insert(out.end(), {(4u << 16) | 71u, mask, 11u, 20u});   // OpDecorate mask BuiltIn SampleMask
+        if (i == firstFunction) out.insert(out.end(), globals.begin(), globals.end());
+        if (op == 15 && words >= 3 && code[i + 1] == 4) {                                     // OpEntryPoint Fragment: + the mask
+            out.push_back(((words + 1) << 16) | 15u);
+            out.insert(out.end(), code.begin() + i + 1, code.begin() + i + words);
+            out.push_back(mask);
+            i += words;
+            continue;
+        }
+        if ((op == 65 || op == 66) && words >= 4 && code[i + 3] == outVar) return {};       // OpAccessChain into the colour
+        out.insert(out.end(), code.begin() + i, code.begin() + i + words);
+        if (op == 62 && words >= 3 && code[i + 1] == outVar) {                               // OpStore colour, v: then the mask
+            const u32 a = bound++, c = bound++, m = bound++, p = bound++;
+            out.insert(out.end(), {(5u << 16) | 81u, floatT, a, code[i + 2], 3u});           // a = v.w
+            out.insert(out.end(), {(5u << 16) | 190u, boolT, c, a, half});                   // c = a >= 0.5
+            out.insert(out.end(), {(6u << 16) | 169u, intT, m, c, ones, zero});              // m = c ? ~0 : 0
+            out.insert(out.end(), {(5u << 16) | 65u, elemPtr, p, mask, zero});               // p = &mask[0]
+            out.insert(out.end(), {(3u << 16) | 62u, p, m});
+        }
+        i += words;
+    }
+    out[3] = bound;
+    return out;
+}
+
 // A program's descriptor sets as the renderer lays them out: the union of both stages, the larger declaration of a
 // block winning, sorted by binding.
 inline void mergedSets(const spv::Module& vr, const spv::Module& fr, std::vector<spv::Resource> sets[3]) {

@@ -51,7 +51,7 @@ A home with a room and its vista is usually larger than either alone.
 
 1. Open a home: **File > Open...**.
 2. Edit it if you like.
-3. **File > Save to My Environments** (Ctrl+S) or **File > Save As...**.
+3. **File > Save** (Ctrl+S) puts it in My Environments, or **File > Export...** (Ctrl+E) writes a copy anywhere.
 
 Two options in the **File** menu change how Studio saves:
 

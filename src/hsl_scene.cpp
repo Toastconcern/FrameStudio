@@ -25,6 +25,7 @@
 #include <array>
 #include <unordered_map>
 #include <memory>
+#include <mutex>
 #include <set>
 #include <thread>
 
@@ -694,6 +695,144 @@ std::vector<WorldCollider> geometryColliders(const HslScene& scene) {
     return out;
 }
 
+// A see-through mesh that's plants, not glass: named grass, ferns, leaves, flowers, reeds, moss, a plant or a tree
+// (walkNameHint's nature takes in rocks too, so not that). (Not by "alpha" in the name: Meta merges rocks and fallen logs
+// whose edges fade into the ground as "Plane145_dblsided_alpha" too, and those block.)
+// The mesh's own name: a Clay mesh is "<file>.fbx.<material>", and the file's name ("treehouse_world") isn't it.
+static std::string ownMeshName(const std::string& name) {
+    for (const char* ext : {".fbx.", ".FBX.", ".gltf.", ".glb."})
+        if (const size_t f = name.rfind(ext); f != std::string::npos) return name.substr(f + std::strlen(ext));
+    return name;
+}
+static bool looksLikeFoliage(const std::string& name) {
+    return walkNameIsPlant(walkNameWords(ownMeshName(name)));   // ("street" has no tree in it, "ravine" no vine: walkgrid.h)
+}
+
+// The base texture: the one bound as the colour, else its biggest colour texture that isn't light.
+static const TexSource* lookTexture(const MeshData& md) {
+    auto usable = [](const TexSource* t) { return t && t->faces == 1 && !t->hdr && t->w >= 16 && t->h >= 16; };
+    if (usable(md.texSrc.get())) return md.texSrc.get();
+    const TexSource* best = nullptr;
+    for (const auto& nt : md.namedTex) {
+        const TexSource* t = nt.second.get();
+        if (!usable(t) || t == md.lmLdrSrc.get() || t == md.lmSrc.get()) continue;
+        if (!best || static_cast<size_t>(t->w) * t->h > static_cast<size_t>(best->w) * best->h) best = t;
+    }
+    return best;
+}
+
+// The texture's level at most 128 across, decoded (RGBA8), kept per texture (a bake asks each time).
+static bool lookLevel(const TexSource& t, std::vector<uint8_t>& px, uint32_t& w, uint32_t& h) {
+    static std::mutex mutex;
+    struct Small { std::vector<uint8_t> px; uint32_t w = 0, h = 0; bool ok = false; size_t bytes = 0; };
+    static std::unordered_map<const TexSource*, Small> kept;
+    std::lock_guard<std::mutex> lock(mutex);
+    auto it = kept.find(&t);
+    if (it != kept.end() && it->second.bytes == t.astc.size()) { px = it->second.px; w = it->second.w; h = it->second.h; return it->second.ok; }
+    Small s;
+    s.bytes = t.astc.size();
+    size_t offset = 0;
+    uint32_t lw = t.w, lh = t.h, level = 0;
+    auto bytes = [&](uint32_t a, uint32_t b) { return static_cast<size_t>((a + t.bw - 1) / t.bw) * ((b + t.bh - 1) / t.bh) * 16; };
+    for (; level + 1 < t.mips && std::max(lw, lh) > 128; ++level) { offset += bytes(lw, lh); lw = std::max(1u, lw / 2); lh = std::max(1u, lh / 2); }
+    size_t n = bytes(lw, lh);
+    if (level == 0 && t.astc.size() == static_cast<size_t>(lw) * lh * 4) n = t.astc.size();   // (a raw RGBA8 payload)
+    if (offset + n <= t.astc.size() && t.bw && t.bh && astc::decodeASTC(t.astc.data() + offset, static_cast<u32>(n), lw, lh, t.bw, t.bh, s.px, false, 0) &&
+        s.px.size() >= static_cast<size_t>(lw) * lh * 4) { s.w = lw; s.h = lh; s.ok = true; }
+    if (kept.size() > 4096) kept.clear();
+    kept[&t] = s;
+    px = s.px; w = s.w; h = s.h;
+    return s.ok;
+}
+
+MeshLook meshLook(const MeshData& md, const float* world) {
+    MeshLook L;
+    const size_t nv = md.positions.size() / 3;
+    if (!nv || md.indices.size() < 3) return L;
+    std::vector<float> wp(nv * 3);
+    for (size_t v = 0; v < nv; ++v)
+        for (int k = 0; k < 3; ++k) wp[v * 3 + k] = world[k] * md.positions[v * 3] + world[4 + k] * md.positions[v * 3 + 1] + world[8 + k] * md.positions[v * 3 + 2] + world[12 + k];
+    std::vector<uint32_t> parent(nv);
+    for (size_t v = 0; v < nv; ++v) parent[v] = static_cast<uint32_t>(v);
+    auto root = [&](uint32_t x) { while (parent[x] != x) { parent[x] = parent[parent[x]]; x = parent[x]; } return x; };
+    std::vector<double> triArea(md.indices.size() / 3, 0);
+    double up = 0;
+    for (size_t t = 0; t + 2 < md.indices.size(); t += 3) {
+        const uint32_t a = md.indices[t], b = md.indices[t + 1], c = md.indices[t + 2];
+        if (a >= nv || b >= nv || c >= nv) continue;
+        parent[root(b)] = root(a);
+        parent[root(c)] = root(a);
+        const float* p = &wp[a * 3]; const float* q = &wp[b * 3]; const float* r = &wp[c * 3];
+        const double e1[3] = {q[0] - p[0], q[1] - p[1], q[2] - p[2]}, e2[3] = {r[0] - p[0], r[1] - p[1], r[2] - p[2]};
+        const double n[3] = {e1[1] * e2[2] - e1[2] * e2[1], e1[2] * e2[0] - e1[0] * e2[2], e1[0] * e2[1] - e1[1] * e2[0]};
+        const double len = std::sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
+        triArea[t / 3] = len * 0.5;
+        L.area += len * 0.5;
+        if (len > 0 && std::fabs(n[1]) / len > 0.9) up += len * 0.5;
+    }
+    if (L.area <= 0) return L;
+    L.up = static_cast<float>(up / L.area);
+    std::vector<float> lo(nv, 1e30f), hi(nv, -1e30f);
+    for (size_t v = 0; v < nv; ++v) { const uint32_t r0 = root(static_cast<uint32_t>(v)); lo[r0] = std::min(lo[r0], wp[v * 3 + 1]); hi[r0] = std::max(hi[r0], wp[v * 3 + 1]); }
+    std::vector<float> heights;
+    for (size_t v = 0; v < nv; ++v) if (parent[v] == v && hi[v] >= lo[v]) heights.push_back(hi[v] - lo[v]);
+    L.pieces = heights.size();
+    if (!heights.empty()) { std::nth_element(heights.begin(), heights.begin() + heights.size() / 2, heights.end()); L.pieceHeight = heights[heights.size() / 2]; }
+    // the texture where the faces are: 600 points over them, by area (always the same ones: the look doesn't flicker)
+    if (const TexSource* tex = lookTexture(md); tex && md.uvs.size() >= nv * 2) {
+        std::vector<uint8_t> px;
+        uint32_t w = 0, h = 0;
+        if (lookLevel(*tex, px, w, h)) {
+            std::vector<double> cum(triArea.size());
+            double acc = 0;
+            for (size_t i = 0; i < triArea.size(); ++i) cum[i] = acc += triArea[i];
+            uint32_t seed = 12345;
+            auto rnd = [&]() { seed = seed * 1664525u + 1013904223u; return (seed >> 8) / 16777216.0f; };
+            int cut = 0, seen = 0, leafy = 0;
+            constexpr int kPoints = 600;
+            for (int i = 0; i < kPoints; ++i) {
+                const size_t tri = std::min(cum.size() - 1, static_cast<size_t>(std::lower_bound(cum.begin(), cum.end(), rnd() * acc) - cum.begin()));
+                float a = rnd(), b = rnd();
+                if (a + b > 1) { a = 1 - a; b = 1 - b; }
+                const uint32_t i0 = md.indices[tri * 3], i1 = md.indices[tri * 3 + 1], i2 = md.indices[tri * 3 + 2];
+                if (i0 >= nv || i1 >= nv || i2 >= nv) continue;
+                float u = md.uvs[i0 * 2] + a * (md.uvs[i1 * 2] - md.uvs[i0 * 2]) + b * (md.uvs[i2 * 2] - md.uvs[i0 * 2]);
+                float v = md.uvs[i0 * 2 + 1] + a * (md.uvs[i1 * 2 + 1] - md.uvs[i0 * 2 + 1]) + b * (md.uvs[i2 * 2 + 1] - md.uvs[i0 * 2 + 1]);
+                if (!std::isfinite(u) || !std::isfinite(v)) continue;
+                u -= std::floor(u); v -= std::floor(v);
+                const uint8_t* c = &px[(static_cast<size_t>(std::min(h - 1, static_cast<uint32_t>(v * h))) * w + std::min(w - 1, static_cast<uint32_t>(u * w))) * 4];
+                if (c[3] < 128) { ++cut; continue; }
+                ++seen;
+                const int r = c[0], g = c[1], bl = c[2], mx = std::max({r, g, bl}), mn = std::min({r, g, bl});
+                if (g == mx && mx > 30 && (mx - mn) > 0.18f * mx && g > r + 4) ++leafy;   // (green to yellow-green, not grey)
+            }
+            L.holes = static_cast<float>(cut) / kPoints;
+            L.green = seen ? static_cast<float>(leafy) / seen : 0;
+        }
+    }
+    // Grass by its look: standing up (not lying flat), its pieces low (under 1.2 m: blades, cards, tufts, ferns), and
+    // its texture cut away round leaves: leafy green, or many small pieces (flowers, a bed of them)
+    const bool upright = L.up < 0.6f, low = L.pieceHeight > 0 && L.pieceHeight <= 1.2f;
+    const bool cutAway = L.holes >= 0.4f;
+    L.grass = upright && low && cutAway && (L.green >= 0.2f || L.pieces >= 20);
+    L.flat = L.up >= 0.8f && L.area >= 4.0;
+    return L;
+}
+
+std::vector<size_t> metaNavmeshMeshes(const HslScene& scene) {
+    std::vector<size_t> out;
+    for (size_t m = 0; m < scene.meshes.size(); ++m)
+        if (scene.meshes[m].overlayKind == 1 && !scene.meshes[m].indices.empty() && !scene.meshes[m].positions.empty() &&
+            (scene.apkPaths.size() <= 1 || m >= scene.meshSource.size() || scene.meshSource[m] == 0))   // (not a vista's)
+            out.push_back(m);
+    return out;
+}
+bool hasMetaNavmesh(const HslScene& scene, const HomeWorld& world) {
+    if (!metaNavmeshMeshes(scene).empty()) return true;
+    for (const WorldCollider& c : world.colliders) if (c.home && c.role != WorldCollider::Trigger) return true;
+    return false;
+}
+
 int walkMeshUse(const MeshData& md) {
     if (md.isSkybox || md.additive || md.overlayKind || md.indices.empty() || md.positions.empty()) return 0;
     if (!md.useBlend) return 1;
@@ -706,18 +845,23 @@ int walkMeshUse(const MeshData& md) {
     return 2;
 }
 
+// The drawn mesh a collider was made from (Studio's surfaces: "<mesh index>:<name>"), or -1: none (a drawn floor,
+// "<mesh index>:<name>#floor", is its own collider: the mesh still counts as it is).
+static long linkedMesh(const WorldCollider& c, size_t meshes) {
+    if (c.mesh.empty() || c.mesh.find("#floor") != std::string::npos) return -1;
+    const size_t colon = c.mesh.find(':');
+    char* endp = nullptr;
+    const long i = std::strtol(c.mesh.c_str(), &endp, 10);
+    return colon != std::string::npos && endp == c.mesh.c_str() + colon && i >= 0 && static_cast<size_t>(i) < meshes ? i : -1;
+}
+
 std::vector<WalkSource> drawnWalkSources(const HslScene& scene, const HomeWorld& world, const std::vector<const float*>* meshWorld,
                                          const std::vector<char>* removed, bool leaveLinked) {
     // meshes a collider stands for (Studio's surfaces: "<mesh index>:<name>") are left to it (the bake)
     std::vector<char> linked(scene.meshes.size(), 0);
     if (leaveLinked)
-        for (const WorldCollider& c : world.colliders) {
-            if (c.mesh.empty() || c.mesh.find("#floor") != std::string::npos) continue;   // (a drawn floor: the mesh still counts)
-            const size_t colon = c.mesh.find(':');
-            char* endp = nullptr;
-            const long i = std::strtol(c.mesh.c_str(), &endp, 10);
-            if (colon != std::string::npos && endp == c.mesh.c_str() + colon && i >= 0 && static_cast<size_t>(i) < linked.size()) linked[i] = 1;
-        }
+        for (const WorldCollider& c : world.colliders)
+            if (const long i = linkedMesh(c, linked.size()); i >= 0) linked[i] = 1;
     // skinned creatures (birds, butterflies) move about: not something to bump into. (Clay's animatedMeshes also
     // lists floors whose tint or UVs animate, so it isn't used.)
     for (const HslAnimGroup& a : scene.anims) for (int m : a.meshes) if (m >= 0 && static_cast<size_t>(m) < linked.size()) linked[m] = 1;
@@ -737,6 +881,11 @@ std::vector<WalkSource> drawnWalkSources(const HslScene& scene, const HomeWorld&
         else if (md.hasWorldMatrix) std::memcpy(s.world, md.worldMatrix, sizeof s.world);
         else trsToMat4(md.transform, s.world);
         s.noFloor = use == 2;
+        s.hint = walkNameHint(md.name, prefix);
+        // grass, ferns and leaves drawn blended (an alpha card, not glass): foliage, as cut-out foliage is
+        if (use == 2 && looksLikeFoliage(md.name)) s.cutout = true;
+        const bool seeThrough = use == 2 || md.alphaTest;
+        const MeshLook look = seeThrough || walkNameIsPlant(walkNameWords(ownMeshName(md.name))) ? meshLook(md, s.world) : MeshLook{};
         if (md.alphaTest) {   // cut-out: foliage (blocks; never floor) unless it's laid flat like ground (raked sand, a grass mat)
             double up = 0, all = 0;
             for (size_t t = 0; t + 2 < md.indices.size(); t += 3) {
@@ -756,9 +905,23 @@ std::vector<WalkSource> drawnWalkSources(const HslScene& scene, const HomeWorld&
             }
             s.cutout = !(up >= 4.0 && up >= all * 0.8);
         }
+        // What the home's makers named it decides over how it's drawn: their ground, terrain or floor is floor (its
+        // edges cut out or faded into the ground round it: still the ground), and grass, ferns, flowers or a bush
+        // drawn solid are plants: walked through when low, never floor.
+        // ...and the plants a name says nothing of, or something else of: grass, ferns, flowers drawn cut away
+        // ("Plane1093_dblsided_alpha"), standing low, are grown things whatever they're called (not a fence, a seat, a
+        // table or a wall by its name). A name with both a plant and a ground word ("gardenPath_leaves", "GrassGround")
+        // is what its shape says: lying flat, ground; standing up, plants. A lawn named grass, lying flat, is ground.
+        const std::string own = ownMeshName(md.name);
+        const std::vector<std::string> ownWords = walkNameWords(own);
+        const bool softName = walkNameIsPlant(ownWords, true);
+        const bool builtName = walkNameIsStructure(own) || s.hint == kHintSeat || s.hint == kHintFurniture || s.hint == kHintWall || s.hint == kHintBlocker;
+        if (look.grass && !builtName) s.cutout = s.noFloor = true;
+        if (walkNameIsGround(own) && !(softName && look.area > 0 && !look.flat && look.up < 0.6f)) s.cutout = s.noFloor = false;
+        else if (walkNameIsGround(own)) s.cutout = s.noFloor = true;                 // (plants along a path: leaves, not the path)
+        else if (use == 1 && softName && !look.flat) s.cutout = true;
         s.maxSize = 200;                                               // bigger: the vista's backdrop
         s.tag = static_cast<int>(m);
-        s.hint = walkNameHint(md.name, prefix);
         s.name = md.name;
         src.push_back(s);
     }
@@ -867,7 +1030,55 @@ std::vector<char> invisibleWalls(const HomeWorld& world, const std::vector<WalkS
 
 std::shared_ptr<const WalkGrid> bakeWalkGrid(const HslScene& scene, const HomeWorld& world, const WalkParams& params, WalkReport* report,
                                              const std::vector<const float*>* meshWorld, const std::vector<char>* removed) {
-    std::vector<WalkSource> src = drawnWalkSources(scene, world, meshWorld, removed, true);
+    // A home with navmeshes is walked on them alone: exactly their faces (no body radius taken off, no gaps bridged,
+    // every piece kept however small or far from the start), and the floor painted by hand
+    if (world.hasNavmesh()) {
+        std::vector<WalkSource> src;
+        for (const WorldCollider& c : world.colliders) {
+            if (c.role != WorldCollider::Navmesh || c.kind != WorldCollider::Mesh || c.positions.empty() || c.indices.empty()) continue;
+            WalkSource s;
+            s.role = WorldCollider::Navmesh;
+            s.pos = c.positions.data(); s.verts = c.positions.size() / 3; s.idx = c.indices.data(); s.indices = c.indices.size();
+            std::copy_n(c.world, 16, s.world);
+            s.name = c.name;
+            src.push_back(s);
+        }
+        WalkParams p = params;
+        p.minArea = 0;
+        return buildWalkGrid(src, walkSeeds(world), p, report, nullptr, &world.walkPaint, true);
+    }
+    // Meta's own navmesh, when the home ships one (and Meta's floor isn't switched off): walked on exactly
+    if (world.useHomeCollision) {
+        std::vector<WalkSource> src;
+        for (size_t m : metaNavmeshMeshes(scene)) {
+            const MeshData& md = scene.meshes[m];
+            WalkSource s;
+            s.role = WorldCollider::Navmesh;
+            s.pos = md.positions.data(); s.verts = md.positions.size() / 3; s.idx = md.indices.data(); s.indices = md.indices.size();
+            if (meshWorld && m < meshWorld->size() && (*meshWorld)[m]) std::memcpy(s.world, (*meshWorld)[m], sizeof s.world);
+            else if (md.hasWorldMatrix) std::memcpy(s.world, md.worldMatrix, sizeof s.world);
+            else trsToMat4(md.transform, s.world);
+            s.name = md.name;
+            src.push_back(s);
+        }
+        if (!src.empty() && !world.walkNone) {
+            WalkParams p = params;
+            p.minArea = 0;
+            return buildWalkGrid(src, walkSeeds(world), p, report, nullptr, &world.walkPaint, true);
+        }
+    }
+    if (world.walkNone) {   // (deleted: none; Frame Home then walks on the home's collision as it is)
+        auto g = std::make_shared<WalkGrid>();
+        g->p = params;
+        if (report) *report = WalkReport{};
+        return g;
+    }
+    // A home whose makers set up its collision (Meta's colliders) is walked on that: what they drew without any (a
+    // vase, leaves, a lamp, the rug's fringe) is walked through, never floor. Others walk on their drawn meshes.
+    // (walked on Meta's colliders, the area is exactly their floor: buildWalkGrid's homeFloor)
+    const bool homeFloor = world.hasHomeCollision();
+    std::vector<WalkSource> src;
+    if (!homeFloor) src = drawnWalkSources(scene, world, meshWorld, removed, true);
     std::vector<std::vector<float>> sp;
     std::vector<std::vector<uint32_t>> si;
     const size_t meshSources = src.size();
@@ -885,13 +1096,40 @@ std::shared_ptr<const WalkGrid> bakeWalkGrid(const HslScene& scene, const HomeWo
     };
     std::set<std::string> seen;
     for (size_t i = 0; i < meshSources; ++i) if (src[i].verts) seen.insert(keyOf(src[i].world, src[i].pos, src[i].verts, src[i].indices));
+    // What's walked through never shapes the area: an object you set to walk through (Studio's Walk through, a Trigger
+    // surface linked to it: its mesh is left to that above) is no drawn wall for invisibleWalls, nor are see-through
+    // plants; and a collider that's such an object's own collision (Meta's, or one an older Studio copied without a
+    // link: its own triangles, on its entity) is left out too.
+    std::vector<char> through(scene.meshes.size(), 0);
+    for (const WorldCollider& c : world.colliders)
+        if (const long m = linkedMesh(c, through.size()); m >= 0 && c.role == WorldCollider::Trigger) through[m] = 1;
+    std::vector<std::pair<size_t, std::array<float, 16>>> throughFrames;   // (mesh, where it's drawn as loaded: those colliders don't move)
+    for (size_t m = 0; m < through.size(); ++m)
+        if (through[m]) {
+            std::array<float, 16> f;
+            if (scene.meshes[m].hasWorldMatrix) std::memcpy(f.data(), scene.meshes[m].worldMatrix, sizeof(float) * 16); else trsToMat4(scene.meshes[m].transform, f.data());
+            throughFrames.emplace_back(m, f);
+        }
+    auto throughCollision = [&](const WorldCollider& c) {
+        for (const auto& [m, f] : throughFrames) if (walkColliderOfMesh(c, f.data(), scene.meshes[m].positions)) return true;
+        return false;
+    };
+    std::vector<char> invisible(world.colliders.size(), 0);
+    if (params.metaBounds < 0.5f) {
+        std::vector<WalkSource> drawn = drawnWalkSources(scene, world, meshWorld, removed, false);
+        drawn.erase(std::remove_if(drawn.begin(), drawn.end(), [&](const WalkSource& s) {
+            return walkSourceGrown(s) || (s.tag >= 0 && static_cast<size_t>(s.tag) < through.size() && through[s.tag]);
+        }), drawn.end());
+        invisible = invisibleWalls(world, drawn);
+    }
     HomeWorld cw;
     cw.colliders.reserve(world.colliders.size());
-    const std::vector<char> invisible = params.metaBounds < 0.5f ? invisibleWalls(world, drawnWalkSources(scene, world, meshWorld, removed, false))
-                                                                  : std::vector<char>(world.colliders.size(), 0);
     for (size_t ci = 0; ci < world.colliders.size(); ++ci) {
         const WorldCollider& c = world.colliders[ci];
-        if (invisible[ci]) {                                           // walked past: left out (keeps report tags)
+        // walked past: left out (keeps report tags); so are Meta's floor and walls when they're removed. Walked on them,
+        // every one of Meta's is kept (its walls stop you) but an object's you set to walk through.
+        if ((invisible[ci] && !(homeFloor && c.home)) || (c.home && !world.useHomeCollision) ||
+            (c.role != WorldCollider::Trigger && c.mesh.empty() && throughCollision(c))) {
             WorldCollider stub;
             stub.role = WorldCollider::Trigger;
             cw.colliders.push_back(std::move(stub));
@@ -907,9 +1145,31 @@ std::shared_ptr<const WalkGrid> bakeWalkGrid(const HslScene& scene, const HomeWo
         cw.colliders.push_back(c);
     }
     walkColliderSources(cw, src, sp, si, static_cast<int>(scene.meshes.size()));
+    if (homeFloor) {
+        // Meta's boxes are solid through (an invisible wall's middle is wall): see WalkSource::solidShape. And one of its
+        // colliders whose own name says nothing is what the drawn mesh it's the collision of is named (a sofa's, a
+        // table's: their tops are never walked on)
+        std::vector<std::string> names;
+        for (const MeshData& md : scene.meshes) names.push_back(md.name);
+        const std::string prefix = walkSharedPrefix(names);
+        for (size_t i = meshSources; i < src.size(); ++i) {
+            const size_t ci = static_cast<size_t>(src[i].tag) - scene.meshes.size();
+            if (ci >= cw.colliders.size()) continue;
+            const WorldCollider& c = cw.colliders[ci];
+            src[i].solidShape = c.home && c.kind != WorldCollider::Mesh;
+            if (!c.home || src[i].hint != kHintNone) continue;
+            for (size_t m = 0; m < scene.meshes.size(); ++m) {
+                float f[16];
+                if (scene.meshes[m].hasWorldMatrix) std::memcpy(f, scene.meshes[m].worldMatrix, sizeof f); else trsToMat4(scene.meshes[m].transform, f);
+                if (!walkColliderOfMesh(c, f, scene.meshes[m].positions)) continue;
+                src[i].hint = walkNameHint(scene.meshes[m].name, prefix);
+                break;
+            }
+        }
+    }
     // (a vista's meshes aren't sources, so the colliders' extent counts like the meshes': a home whose floor and
     // furniture are all Studio surfaces is all colliders)
-    return buildWalkGrid(src, walkSeeds(world), params, report, nullptr, &world.walkPaint);
+    return buildWalkGrid(src, walkSeeds(world), params, report, nullptr, &world.walkPaint, homeFloor);
 }
 
 // Baked walkable areas, kept between opens (a big home's bake is most of a second): keyed by this build, every file

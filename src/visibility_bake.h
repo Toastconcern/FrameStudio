@@ -1076,7 +1076,10 @@ inline bool bakeVisibility(const HslScene& scene, const HomeWorld& world, const 
             pairs += side == 3;
             back += side == 2;
         }
-        const bool cull = opt.cull && kept > 0 && (turnable[m] ? pairs * 2 <= kept : pairs == 0 && back == 0);
+        // drawn one side only, its triangles seen from both sides go in twice (back to back): only when that leaves it
+        // no bigger than it was (a double-sided triangle shades the same pixels drawn once; twice is only more work)
+        const bool cull = opt.cull && kept > 0 && (turnable[m] ? pairs * 2 <= kept : pairs == 0 && back == 0) &&
+                          kept + pairs <= md.indices.size() / 3;
         // the kept triangles by the side they're seen from: 0 the front (or only ever edge-on), 1 the back, 2 both (when
         // its back is drawn anyway, all in 0), and by how near an eye comes (band b: from 2^b m, the first from 0)
         static constexpr int kBands = 8;   // (static: the lambda below reads it without capturing it, as MSVC requires)

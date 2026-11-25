@@ -58,7 +58,7 @@ public:
         if (!w.walkIndices.empty()) addMesh(w.walkPositions, w.walkIndices, 0.01f, false, false);   // legacy walkable triangles
         for (const WorldCollider& c : w.colliders) {
             if (c.role == WorldCollider::Trigger) continue;
-            const float floorUp = c.role == WorldCollider::Solid ? 0.7f : c.role == WorldCollider::Floor || c.role == WorldCollider::Walkable ? 0.5f : 0.0f;
+            const float floorUp = c.role == WorldCollider::Solid ? 0.7f : c.role == WorldCollider::Floor || c.role == WorldCollider::Walkable || c.role == WorldCollider::Navmesh ? 0.5f : 0.0f;
             const bool blocks = c.role == WorldCollider::Solid || c.role == WorldCollider::Wall || c.role == WorldCollider::Object;
             if (c.kind == WorldCollider::Mesh) { addMesh(worldMeshPositions(c), c.indices, floorUp, blocks, blocks, c.role == WorldCollider::Wall || c.role == WorldCollider::Object); continue; }
             if (blocks) shapes_.push_back(c);

@@ -114,6 +114,24 @@ std::vector<WalkSource> drawnWalkSources(const HslScene& scene, const HomeWorld&
                                          const std::vector<char>* removed = nullptr, bool leaveLinked = true);
 // Is this mesh in the walkable-area bake: 0 no, 1 solid, 2 blocks but isn't floor (see-through).
 int walkMeshUse(const MeshData& md);
+// The home's own navmesh as its makers shipped it: the meshes it names as navmesh (the loader's overlayKind 1).
+std::vector<size_t> metaNavmeshMeshes(const HslScene& scene);
+// Whether the home has a navmesh of Meta's: its own navmesh meshes, or its collision (Meta's floor).
+bool hasMetaNavmesh(const HslScene& scene, const HomeWorld& world);
+
+// What a mesh looks like as plants: its shape in the world (world: its frame) and its base texture where its faces are.
+struct MeshLook {
+    double area = 0;            // m²
+    float up = 0;               // the share of its area facing up or down (lying flat: ground, a lawn)
+    float pieceHeight = 0;      // its separate pieces' typical height (m): blades, cards and tufts are low
+    size_t pieces = 0;
+    float holes = -1;           // the share of its texture (where its faces are) cut away; -1: no texture to read
+    float green = -1;           // the share of what's left that's leaf green to yellow-green
+    bool grass = false;         // grass, ferns, flowers, leaves on the ground by their look, whatever they're named:
+                                // cut away and leafy (or many small pieces), standing up, low
+    bool flat = false;          // lying flat over an area (ground: a lawn, a mat of grass)
+};
+MeshLook meshLook(const MeshData& md, const float* world);
 
 // Splat objects as .fenv members (splats/<name>.spz, stored: .spz is gzip already) and their manifest entries; the
 // manifest then says it needs "splats" (none: nothing added).

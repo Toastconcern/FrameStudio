@@ -158,6 +158,7 @@ add_executable(frame-studio WIN32 MACOSX_BUNDLE
     "${ROOT}/src/model_import.cpp"
     "${ROOT}/src/splat_import.cpp"
     "${ROOT}/src/spv_opt.cpp"
+    "${ROOT}/src/blender_export.cpp"
     "${TP}/ufbx/ufbx.c"
     "${ROOT}/src/hsl_renderer.cpp"
     "${ROOT}/src/hsl_renderer_splat.cpp"

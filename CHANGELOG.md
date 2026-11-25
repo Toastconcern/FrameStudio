@@ -4,6 +4,57 @@ Newest first. When this file changed since the last release, the next release's 
 and the notes post to the Discord's #releases channel: add a section at the top in the push you want announced.
 The version: VERSION (major.minor) and the commits since VERSION changed, so the commit that bumps VERSION is .0.
 
+## v0.2.3
+
+### Frame Studio and Frame Home
+- Properties is laid out as Blender's: its tabs down the left (Tool, Scene, Navmesh, Object, Physics, Data, Output),
+  panels that fold, a search field, and pick-one choices as joined buttons. Bundle and Headset are panels of Output,
+  trimming is in Scene, an object's collision is in Physics. Window › Theme › Blender gives Blender's own colours.
+- Draw Navmesh: click corners on the floor (each at the height you click) and close the shape: it's a new piece of
+  the navmesh. Backspace takes a point back, Esc stops.
+- Homes whose makers set up collision (Meta's older homes such as Vista and Del Mar) are walked on that collision:
+  anything drawn without collision (a vase, leaves, a lamp) is walked through. Untick **Use Meta's floor** in the Navmesh
+  tab to remove their floor and invisible walls and walk on the meshes instead; it's saved with the home.
+- Grass, ferns, flowers and bushes are never floor: you walk through them up to 1 m tall, and taller ones block.
+  Meshes named as ground, terrain or floor are always floor, even with see-through edges.
+- Auto-generate Navmesh first labels everything that's grass Walk through (as you'd set it by hand), so the navmesh
+  it makes leaves grass out. A home with a navmesh of Meta's (its own navmesh mesh, else Meta's floor) uses it first,
+  and Use Meta's Navmesh goes back to it from yours. Edit Navmesh goes straight into editing its corners.
+- Grass is found by its look too, whatever it's named: low, upright, cut-out pieces with a leafy green texture (or a
+  bed of small ones, like flowers) are walked through and listed under Plants. A mesh named both as a plant and as
+  ground ("gardenPath_leaves") is what its shape says: leaves standing up, or ground lying flat; a flat lawn named
+  grass is floor.
+- The navmesh (where you walk) is in the Outliner's World list (the Navmesh group), with one switch to show it. Tab on it makes it
+  pieces you edit (one per area you can walk apart), Add Navmesh adds a new square, and any mesh surface can be given
+  the Navmesh role. A home with pieces is walked on them alone, exactly on their faces.
+- Delete Navmesh (X or Delete on it, the group's right-click, the World menu or the Navmesh tab) deletes it: nothing is
+  walkable and it isn't made again by itself, only by Auto-generate or Add Navmesh. Deleting its last piece does the
+  same.
+- Edit mode (Tab) for the navmesh's pieces and every mesh surface, Meta's collision meshes too: click, Shift+click or drag a box
+  to select corners, move, turn or scale them with the gizmo, X deletes, F makes a face, E extrudes, M merges, L
+  selects a whole piece. Boxes, balls and capsules can be converted to meshes to edit them.
+- The World list shows every item (it used to stop at 300 a group). Ctrl+click or Shift+click selects several to
+  move or delete together, and a group's right-click has Select All and Delete All.
+- Steps and ledges you walk up show in pink on the navmesh (World layer, **Steps & ledges**).
+- A home with no spawn point gets one on open, level floor facing the widest view. **Find a Good Spot** and **Face the
+  Best View** do the same for any spawn, and the spawn is drawn as a standing figure with what it sees first.
+- Standing up from a seat always puts you on floor you can walk on.
+- Draw Seats: press and drag the way the seat should face; Ctrl+drag (Cmd+drag on a Mac) a line for a row of seats.
+- Draw Floor has shapes (Q cycles them): Round, Square, Rectangle and Polygon. The brush reaches the ground under
+  plants. Draw Wall straightens nearly straight lines and carries each end on to what you drew it up to.
+- V walks round the home as on the headset (W A S D, Shift runs); V or Esc goes back.
+- **Take from View** (F12) frames the environment's picture over the 3D view; Enter takes it.
+- **File › Save** always saves into My Environments, named after the environment. **File › Export...** (Ctrl+E)
+  writes a copy anywhere and replaces Save As.
+- **File › Export for Blender** writes the environment as a .glb, and its navmesh, colliders, spawns and seats as
+  a second .glb beside it.
+- Ctrl+click or Shift+click selects more than one object, in the view and in the Outliner.
+- **View › Copy Camera Position** copies where the view is, to paste with a screenshot when reporting a spot.
+- Fixed: palm trees and other things with more than one material drew with only the first one.
+- Fixed: black spots on Del Mar's see-through floors.
+- Fixed: Vista's sun drew as a black square.
+- When the graphics driver can't start Vulkan, Studio says why in plain words instead of an error number.
+
 ## v0.2.2
 
 ### Frame Studio and Frame Home
